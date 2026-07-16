@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Square × UniFi Protect</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>Square × UniFi Protect</h1>
+    <nav id="nav" hidden>
+      <button data-view="transactions" class="active">Transactions</button>
+      <button data-view="settings">Settings</button>
+      <button id="logout-btn">Log out</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- First-run setup -->
+    <section id="view-setup" hidden>
+      <h2>Create admin password</h2>
+      <p>This password protects the integration's settings and transaction feed.</p>
+      <form id="setup-form">
+        <label>Password (min 8 chars) <input type="password" id="setup-password" minlength="8" required></label>
+        <button type="submit">Create</button>
+      </form>
+    </section>
+
+    <!-- Login -->
+    <section id="view-login" hidden>
+      <h2>Log in</h2>
+      <form id="login-form">
+        <label>Password <input type="password" id="login-password" required></label>
+        <button type="submit">Log in</button>
+      </form>
+    </section>
+
+    <!-- Settings -->
+    <section id="view-settings" hidden>
+      <h2>UniFi Protect console</h2>
+      <form id="protect-form">
+        <label>Host / IP <input id="protect-host" placeholder="192.168.1.1" required></label>
+        <label>Username <input id="protect-username" autocomplete="off" required></label>
+        <label>Password <input type="password" id="protect-password" required></label>
+        <label class="check"><input type="checkbox" id="protect-verify-ssl"> Verify TLS certificate</label>
+        <button type="submit">Connect Protect</button>
+      </form>
+
+      <h2>Square account</h2>
+      <form id="square-form">
+        <label>Access token <input type="password" id="square-token" autocomplete="off" required></label>
+        <label>Environment
+          <select id="square-env">
+            <option value="production">Production</option>
+            <option value="sandbox">Sandbox</option>
+          </select>
+        </label>
+        <label>Webhook signature key (optional) <input type="password" id="square-webhook-key" autocomplete="off"></label>
+        <label>Webhook notification URL (optional) <input id="square-webhook-url" placeholder="https://example.com/webhooks/square"></label>
+        <button type="submit">Connect Square</button>
+      </form>
+
+      <h2>POS camera</h2>
+      <p>Choose which camera watches the POS at each Square location.</p>
+      <div id="mapping-rows"></div>
+      <button id="save-mapping">Save camera selection</button>
+      <div id="camera-preview-wrap" hidden>
+        <h3>Preview</h3>
+        <img id="camera-preview" alt="Camera preview">
+      </div>
+    </section>
+
+    <!-- Transactions -->
+    <section id="view-transactions" hidden>
+      <div class="toolbar">
+        <h2>Transactions</h2>
+        <button id="sync-now">Sync now</button>
+      </div>
+      <p class="hint">Click a thumbnail to open the UniFi Protect timeline at the moment of the transaction.</p>
+      <div id="txn-list"></div>
+    </section>
+
+    <p id="message" role="status"></p>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

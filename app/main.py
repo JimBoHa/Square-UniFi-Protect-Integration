@@ -1,0 +1,441 @@
+"""FastAPI application wiring the Square and UniFi Protect integrations together."""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+import time
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from . import deeplink, sync
+from .protect_client import (
+    ProtectAuthError,
+    ProtectClient,
+    ProtectError,
+    validate_camera_id,
+    validate_host,
+)
+from .security import hash_password, new_session_token, verify_password
+from .square_client import (
+    SquareAuthError,
+    SquareClient,
+    SquareError,
+    verify_webhook_signature,
+)
+from .store import Store
+
+logger = logging.getLogger("spi")
+
+SESSION_COOKIE = "spi_session"
+LOGIN_MAX_FAILURES = 5
+LOGIN_LOCKOUT_SECONDS = 60
+
+
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
+
+class SetupBody(BaseModel):
+    password: str = Field(min_length=8, max_length=256)
+
+class LoginBody(BaseModel):
+    password: str = Field(max_length=256)
+
+class ProtectSettingsBody(BaseModel):
+    host: str
+    username: str
+    password: str
+    verify_ssl: bool = False
+
+class SquareSettingsBody(BaseModel):
+    access_token: str
+    environment: str = "production"
+    webhook_signature_key: str = ""
+    webhook_url: str = ""
+
+class CameraMappingEntry(BaseModel):
+    location_id: str = Field(min_length=1, max_length=64)
+    camera_id: str = Field(min_length=1, max_length=64)
+    camera_name: str = Field(default="", max_length=128)
+
+class CameraMappingBody(BaseModel):
+    mappings: list[CameraMappingEntry]
+
+
+# ---------------------------------------------------------------------------
+# App factory
+# ---------------------------------------------------------------------------
+
+def create_app(
+    data_dir: str | Path | None = None,
+    protect_transport=None,
+    square_transport=None,
+    enable_poller: bool | None = None,
+) -> FastAPI:
+    data_dir = Path(data_dir or os.environ.get("SPI_DATA_DIR", "./data"))
+    store = Store(data_dir)
+    app = FastAPI(title="Square UniFi Protect Integration", docs_url=None, redoc_url=None)
+    app.state.store = store
+    app.state.login_failures: dict[str, list[float]] = {}
+    app.state.login_lock = threading.Lock()
+
+    cookie_secure = os.environ.get("SPI_COOKIE_SECURE", "0") == "1"
+    if enable_poller is None:
+        enable_poller = os.environ.get("SPI_DISABLE_POLLER", "0") != "1"
+
+    # -- client construction from stored settings ---------------------------
+
+    def build_protect() -> ProtectClient | None:
+        host = store.get_setting("protect.host")
+        username = store.get_setting("protect.username")
+        password = store.get_setting("protect.password")
+        if not (host and username and password):
+            return None
+        return ProtectClient(
+            host,
+            username,
+            password,
+            verify_ssl=store.get_setting("protect.verify_ssl") == "1",
+            transport=protect_transport,
+        )
+
+    def build_square() -> SquareClient | None:
+        token = store.get_setting("square.access_token")
+        if not token:
+            return None
+        return SquareClient(
+            token,
+            environment=store.get_setting("square.environment") or "production",
+            transport=square_transport,
+        )
+
+    def require_protect() -> ProtectClient:
+        client = build_protect()
+        if client is None:
+            raise HTTPException(status_code=409, detail="UniFi Protect is not configured")
+        return client
+
+    def require_square() -> SquareClient:
+        client = build_square()
+        if client is None:
+            raise HTTPException(status_code=409, detail="Square is not configured")
+        return client
+
+    # -- auth ----------------------------------------------------------------
+
+    def require_session(request: Request) -> None:
+        token = request.cookies.get(SESSION_COOKIE)
+        if not token or not store.session_valid(token):
+            raise HTTPException(status_code=401, detail="Authentication required")
+
+    authed = Depends(require_session)
+
+    def client_key(request: Request) -> str:
+        return request.client.host if request.client else "unknown"
+
+    def check_login_throttle(request: Request) -> None:
+        key = client_key(request)
+        now = time.time()
+        with app.state.login_lock:
+            attempts = [
+                t for t in app.state.login_failures.get(key, [])
+                if now - t < LOGIN_LOCKOUT_SECONDS
+            ]
+            app.state.login_failures[key] = attempts
+            if len(attempts) >= LOGIN_MAX_FAILURES:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many failed login attempts; try again shortly",
+                )
+
+    def record_login_failure(request: Request) -> None:
+        with app.state.login_lock:
+            app.state.login_failures.setdefault(client_key(request), []).append(time.time())
+
+    # -- setup & login -------------------------------------------------------
+
+    @app.get("/api/status")
+    def status() -> dict:
+        return {
+            "setup_complete": store.get_setting("admin.password_hash") is not None,
+            "protect_configured": store.get_setting("protect.host") is not None,
+            "square_configured": store.get_setting("square.access_token") is not None,
+            "cameras_mapped": len(store.get_camera_mappings()) > 0,
+        }
+
+    @app.post("/api/setup")
+    def setup(body: SetupBody) -> dict:
+        if store.get_setting("admin.password_hash") is not None:
+            raise HTTPException(status_code=409, detail="Setup already completed")
+        store.set_setting("admin.password_hash", hash_password(body.password))
+        return {"ok": True}
+
+    @app.post("/api/login")
+    def login(body: LoginBody, request: Request, response: Response) -> dict:
+        check_login_throttle(request)
+        stored = store.get_setting("admin.password_hash")
+        if stored is None:
+            raise HTTPException(status_code=409, detail="Run setup first")
+        if not verify_password(body.password, stored):
+            record_login_failure(request)
+            raise HTTPException(status_code=401, detail="Invalid password")
+        token = new_session_token()
+        store.create_session(token)
+        response.set_cookie(
+            SESSION_COOKIE,
+            token,
+            httponly=True,
+            samesite="lax",
+            secure=cookie_secure,
+            max_age=12 * 3600,
+        )
+        return {"ok": True}
+
+    @app.post("/api/logout")
+    def logout(request: Request, response: Response, _=authed) -> dict:
+        token = request.cookies.get(SESSION_COOKIE)
+        if token:
+            store.delete_session(token)
+        response.delete_cookie(SESSION_COOKIE)
+        return {"ok": True}
+
+    # -- settings --------------------------------------------------------------
+
+    @app.put("/api/settings/protect")
+    def set_protect(body: ProtectSettingsBody, _=authed) -> dict:
+        try:
+            host = validate_host(body.host)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        client = ProtectClient(
+            host,
+            body.username,
+            body.password,
+            verify_ssl=body.verify_ssl,
+            transport=protect_transport,
+        )
+        try:
+            client.login()
+            cameras = client.get_cameras()
+        except ProtectAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except (ProtectError, OSError) as exc:
+            raise HTTPException(status_code=502, detail=f"Could not reach UniFi Protect: {exc}")
+        finally:
+            client.close()
+        store.set_setting("protect.host", host)
+        store.set_setting("protect.username", body.username)
+        store.set_setting("protect.password", body.password, secret=True)
+        store.set_setting("protect.verify_ssl", "1" if body.verify_ssl else "0")
+        return {"ok": True, "cameras": len(cameras)}
+
+    @app.put("/api/settings/square")
+    def set_square(body: SquareSettingsBody, _=authed) -> dict:
+        if body.environment not in ("production", "sandbox"):
+            raise HTTPException(status_code=422, detail="Invalid environment")
+        client = SquareClient(
+            body.access_token, environment=body.environment, transport=square_transport
+        )
+        try:
+            locations = client.list_locations()
+        except SquareAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except (SquareError, OSError) as exc:
+            raise HTTPException(status_code=502, detail=f"Could not reach Square: {exc}")
+        finally:
+            client.close()
+        store.set_setting("square.access_token", body.access_token, secret=True)
+        store.set_setting("square.environment", body.environment)
+        if body.webhook_signature_key:
+            store.set_setting(
+                "square.webhook_signature_key", body.webhook_signature_key, secret=True
+            )
+        if body.webhook_url:
+            store.set_setting("square.webhook_url", body.webhook_url)
+        return {"ok": True, "locations": locations}
+
+    # -- cameras & mapping ------------------------------------------------------
+
+    @app.get("/api/cameras")
+    def cameras(_=authed) -> list[dict]:
+        client = require_protect()
+        try:
+            return client.get_cameras()
+        except ProtectError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        finally:
+            client.close()
+
+    @app.get("/api/locations")
+    def locations(_=authed) -> list[dict]:
+        client = require_square()
+        try:
+            return client.list_locations()
+        except SquareError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        finally:
+            client.close()
+
+    @app.get("/api/camera-preview/{camera_id}")
+    def camera_preview(camera_id: str, _=authed) -> Response:
+        try:
+            camera_id = validate_camera_id(camera_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        client = require_protect()
+        try:
+            image = client.get_snapshot(camera_id)
+        except ProtectError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        finally:
+            client.close()
+        return Response(content=image, media_type="image/jpeg")
+
+    @app.get("/api/camera-mapping")
+    def get_mapping(_=authed) -> list[dict]:
+        return store.get_camera_mappings()
+
+    @app.put("/api/camera-mapping")
+    def set_mapping(body: CameraMappingBody, _=authed) -> dict:
+        for entry in body.mappings:
+            if entry.location_id != "*":
+                try:
+                    validate_camera_id(entry.camera_id)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc))
+        store.clear_camera_mappings()
+        for entry in body.mappings:
+            store.set_camera_mapping(entry.location_id, entry.camera_id, entry.camera_name)
+        return {"ok": True, "count": len(body.mappings)}
+
+    # -- transactions -------------------------------------------------------------
+
+    def txn_response(txn: dict) -> dict:
+        host = store.get_setting("protect.host")
+        link = None
+        if host and txn.get("camera_id"):
+            try:
+                link = deeplink.build_deep_link(
+                    host,
+                    txn["camera_id"],
+                    txn["ts_ms"],
+                    template=store.get_setting("deep_link_template"),
+                )
+            except ValueError:
+                link = None
+        return {
+            "id": txn["id"],
+            "created_at": txn["created_at"],
+            "ts_ms": txn["ts_ms"],
+            "amount": txn["amount"],
+            "currency": txn["currency"],
+            "status": txn["status"],
+            "location_id": txn["location_id"],
+            "card_last4": txn["card_last4"],
+            "receipt_url": txn["receipt_url"],
+            "camera_id": txn.get("camera_id"),
+            "deep_link": link,
+            "thumbnail_url": (
+                f"/api/thumbnails/{txn['id']}" if txn.get("thumbnail_path") else None
+            ),
+        }
+
+    @app.get("/api/transactions")
+    def transactions(limit: int = 50, offset: int = 0, _=authed) -> list[dict]:
+        return [txn_response(t) for t in store.list_transactions(limit, offset)]
+
+    @app.get("/api/thumbnails/{txn_id}")
+    def thumbnail(txn_id: str, _=authed) -> FileResponse:
+        txn = store.get_transaction(txn_id)
+        if not txn or not txn.get("thumbnail_path"):
+            raise HTTPException(status_code=404, detail="No thumbnail for this transaction")
+        path = (store.thumbnail_dir / txn["thumbnail_path"]).resolve()
+        if store.thumbnail_dir.resolve() not in path.parents or not path.is_file():
+            raise HTTPException(status_code=404, detail="Thumbnail not found")
+        return FileResponse(path, media_type="image/jpeg")
+
+    def run_sync() -> int:
+        square = build_square()
+        if square is None:
+            return 0
+        protect = build_protect()
+        try:
+            return sync.sync_payments(store, square, protect)
+        finally:
+            square.close()
+            if protect:
+                protect.close()
+
+    @app.post("/api/sync")
+    def manual_sync(_=authed) -> dict:
+        try:
+            return {"ok": True, "ingested": run_sync()}
+        except (SquareError, ProtectError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    # -- Square webhook (unauthenticated; HMAC-verified) ---------------------------
+
+    @app.post("/webhooks/square")
+    async def square_webhook(request: Request) -> JSONResponse:
+        signature_key = store.get_setting("square.webhook_signature_key")
+        webhook_url = store.get_setting("square.webhook_url")
+        if not signature_key or not webhook_url:
+            raise HTTPException(status_code=403, detail="Webhook not configured")
+        body = await request.body()
+        signature = request.headers.get("x-square-hmacsha256-signature", "")
+        if not verify_webhook_signature(signature_key, webhook_url, body, signature):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        import json as _json
+
+        try:
+            event = _json.loads(body)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid JSON payload")
+        payment = (
+            event.get("data", {}).get("object", {}).get("payment")
+            if isinstance(event, dict)
+            else None
+        )
+        if not payment:
+            return JSONResponse({"ok": True, "ignored": True})
+        protect = build_protect()
+        try:
+            sync.ingest_payment(store, payment, protect)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        finally:
+            if protect:
+                protect.close()
+        return JSONResponse({"ok": True})
+
+    # -- static frontend ---------------------------------------------------------
+
+    static_dir = Path(__file__).parent / "static"
+    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+
+    # -- background poller ---------------------------------------------------------
+
+    if enable_poller:
+        interval = float(os.environ.get("SPI_POLL_INTERVAL", "60"))
+        poller = sync.Poller(run_sync, interval_seconds=interval)
+        app.state.poller = poller
+
+        @app.on_event("startup")
+        def _start_poller() -> None:
+            poller.start()
+
+        @app.on_event("shutdown")
+        def _stop_poller() -> None:
+            poller.stop()
+
+    return app
+
+
+def app() -> FastAPI:  # uvicorn factory entry point: `uvicorn app.main:app --factory`
+    return create_app()

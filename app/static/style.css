@@ -1,0 +1,60 @@
+:root {
+  color-scheme: light dark;
+  --accent: #006aff;
+  --border: color-mix(in srgb, currentColor 18%, transparent);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.5;
+}
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0.75rem 1.25rem; border-bottom: 1px solid var(--border);
+}
+header h1 { font-size: 1.1rem; margin: 0; }
+nav button {
+  margin-left: 0.5rem; padding: 0.4rem 0.9rem; border: 1px solid var(--border);
+  border-radius: 6px; background: transparent; color: inherit; cursor: pointer;
+}
+nav button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+main { max-width: 900px; margin: 0 auto; padding: 1.25rem; }
+form { display: grid; gap: 0.75rem; max-width: 420px; margin-bottom: 2rem; }
+label { display: grid; gap: 0.25rem; font-size: 0.9rem; }
+label.check { grid-auto-flow: column; justify-content: start; align-items: center; }
+input, select {
+  padding: 0.45rem 0.6rem; border: 1px solid var(--border); border-radius: 6px;
+  background: transparent; color: inherit; font-size: 1rem;
+}
+button[type="submit"], #save-mapping, #sync-now {
+  padding: 0.5rem 1rem; border: none; border-radius: 6px;
+  background: var(--accent); color: #fff; font-size: 0.95rem; cursor: pointer;
+  justify-self: start;
+}
+.toolbar { display: flex; align-items: center; justify-content: space-between; }
+.hint { opacity: 0.7; font-size: 0.85rem; }
+#message { min-height: 1.5rem; font-size: 0.9rem; }
+#message.error { color: #d33; }
+#message.ok { color: #2a9d3a; }
+
+.mapping-row { display: flex; gap: 0.75rem; align-items: center; margin: 0.4rem 0; }
+.mapping-row .loc { min-width: 180px; font-weight: 600; }
+#camera-preview { max-width: 480px; width: 100%; border-radius: 8px; border: 1px solid var(--border); }
+
+.txn {
+  display: flex; gap: 1rem; align-items: center;
+  padding: 0.75rem; border: 1px solid var(--border); border-radius: 10px;
+  margin-bottom: 0.6rem;
+}
+.txn .thumb {
+  width: 160px; height: 90px; object-fit: cover; border-radius: 6px;
+  cursor: pointer; background: var(--border); flex-shrink: 0;
+}
+.txn .thumb.placeholder {
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.75rem; opacity: 0.6; cursor: default;
+}
+.txn .amount { font-size: 1.15rem; font-weight: 700; min-width: 90px; }
+.txn .meta { font-size: 0.85rem; opacity: 0.8; }
+.txn .status { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }

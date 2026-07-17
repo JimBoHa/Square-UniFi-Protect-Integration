@@ -447,3 +447,14 @@ def test_pos_device_mapping_ui_wiring():
     assert "select.dataset.deviceName" in js
     assert "Other devices (fallback)" in js
     assert "observed Square POS device" in html
+
+
+def test_frontend_only_treats_session_401_as_logout():
+    """Upstream-credential 401s from settings endpoints must not bounce the
+    operator to the login view; only the app session's own 401 may."""
+    from pathlib import Path
+
+    js = (Path(__file__).parent.parent / "app" / "static" / "app.js").read_text()
+    assert 'data.detail === "Authentication required"' in js
+    # The redirect decision must consider the parsed body, not status alone.
+    assert 'resp.status === 401 && path !== "/api/login") {' not in js

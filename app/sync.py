@@ -44,13 +44,21 @@ def _ingest_payment_with_status(
     txn["thumbnail_path"] = None
 
     existing = store.get_transaction(txn["id"])
+    # A stale out-of-order event is ignored by the versioned upsert, so it must
+    # not overwrite the on-disk thumbnail with a wrong-time frame either.
+    stale_event = bool(existing and txn["updated_ts_ms"] < existing["updated_ts_ms"])
     already_has_current_thumb = bool(
         existing
         and existing.get("thumbnail_path")
         and existing.get("ts_ms") == txn["ts_ms"]
     )
 
-    if protect is not None and txn["camera_id"] and not already_has_current_thumb:
+    if (
+        protect is not None
+        and txn["camera_id"]
+        and not stale_event
+        and not already_has_current_thumb
+    ):
         try:
             image = protect.get_snapshot(txn["camera_id"], ts_ms=txn["ts_ms"])
             name = safe_thumbnail_name(txn["id"])

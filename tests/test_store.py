@@ -289,3 +289,48 @@ def test_store_migrates_legacy_transaction_schema_without_data_loss(tmp_path):
         "updated_at": created_at,
         "updated_ts_ms": ts_ms,
     }
+
+
+def test_stale_event_with_old_timestamp_cannot_overwrite_thumbnail_file(tmp_path):
+    """A delayed out-of-order event carries the uncorrected sale time. The
+    versioned upsert already ignores its row; the on-disk thumbnail must not
+    be recaptured at the stale timestamp either."""
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC_OLD", CAMERA_ID, "Front Counter")
+    corrected = _payment(
+        "2026-07-16T15:02:00.000Z",
+        amount=500,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/completed",
+    )
+    corrected["created_at"] = "2026-07-16T08:30:00.000Z"
+    stale = _payment(
+        "2026-07-16T15:01:00.000Z",
+        amount=500,
+        currency="USD",
+        status="PENDING",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/pending",
+    )
+    stale["created_at"] = "2026-07-16T16:00:00.000Z"
+
+    try:
+        ingest_payment(store, corrected, protect=_ProtectStub())
+        stored = store.get_transaction("PAY_VERSIONED")
+        image_path = store.thumbnail_dir / stored["thumbnail_path"]
+        image_before = image_path.read_bytes()
+
+        ingest_payment(store, stale, protect=_ProtectStub())
+        after = store.get_transaction("PAY_VERSIONED")
+        image_after = image_path.read_bytes()
+    finally:
+        store.close()
+
+    corrected_ts_ms = parse_ts_ms(corrected["created_at"])
+    assert after["ts_ms"] == corrected_ts_ms
+    assert image_after == image_before
+    assert image_after == f"snapshot:{CAMERA_ID}:{corrected_ts_ms}".encode()

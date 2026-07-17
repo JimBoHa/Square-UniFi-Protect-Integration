@@ -83,7 +83,10 @@ def test_old_failure_retries_after_square_window_advances(tmp_path):
     class Square:
         returned: list[list[str]] = []
 
-        def list_payments(self, begin_time=None):
+        def list_locations(self):
+            return [{"id": "LOC1"}]
+
+        def list_payments(self, **params):
             self.returned.append([new["id"]])
             return [new]
 
@@ -125,7 +128,10 @@ def test_square_failure_still_processes_retry_queue(tmp_path):
     store.upsert_transaction(_stored_txn("OLD", 1000))
 
     class Square:
-        def list_payments(self, begin_time=None):
+        def list_locations(self):
+            return [{"id": "LOC1"}]
+
+        def list_payments(self, **params):
             raise SquareError("Square unavailable")
 
     class Protect:
@@ -144,7 +150,10 @@ def test_retry_error_does_not_mask_square_failure(tmp_path, monkeypatch, caplog)
     store = Store(tmp_path / "data")
 
     class Square:
-        def list_payments(self, begin_time=None):
+        def list_locations(self):
+            return [{"id": "LOC1"}]
+
+        def list_payments(self, **params):
             raise SquareError("original Square failure")
 
     def fail_retry(*_args, **_kwargs):
@@ -201,12 +210,16 @@ def test_camera_change_resets_retry_backoff(tmp_path):
         store.close()
 
 
-def test_reingest_keeps_original_transaction_timestamp(tmp_path):
+def test_stale_reingest_cannot_move_transaction_timestamp(tmp_path):
     store = Store(tmp_path / "data")
     original = _stored_txn("P", 1000)
     original["created_at"] = "2026-07-16T15:30:00.000Z"
+    original["updated_at"] = "2026-07-16T17:00:00.000Z"
+    original["updated_ts_ms"] = 1784224800000
     stale = _stored_txn("P", 2000)
     stale["created_at"] = "2026-07-16T16:30:00.000Z"
+    stale["updated_at"] = "2026-07-16T16:30:00.000Z"
+    stale["updated_ts_ms"] = 1784219400000
     try:
         store.upsert_transaction(original)
         store.upsert_transaction(stale)

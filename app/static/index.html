@@ -51,7 +51,11 @@
         <button type="button" id="protect-disable-alarm">Disable alarm trigger</button>
       </form>
 
-      <h2>Square account</h2>
+      <h2>Square account
+        <span id="square-status" class="conn-status" role="status" hidden>
+          <span class="conn-dot"></span><span class="conn-text"></span>
+        </span>
+      </h2>
       <form id="square-form">
         <label>Access token <input type="password" id="square-token" autocomplete="off" required></label>
         <label>Environment

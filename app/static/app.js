@@ -170,12 +170,37 @@ $("#square-form").addEventListener("submit", async (e) => {
     $("#square-webhook-key").value = "";
     message(`Connected to Square (${result.locations.length} locations).`, "ok");
     loadSettingsView();
+    void refreshSquareStatus();
   } catch (err) {
     message(err.message, "error");
   }
 });
 
+function setConnStatus(id, state, text) {
+  const el = $(id);
+  el.hidden = false;
+  el.className = `conn-status ${state}`;
+  el.querySelector(".conn-text").textContent = text;
+}
+
+async function refreshSquareStatus() {
+  setConnStatus("#square-status", "checking", "Checking…");
+  try {
+    const health = await api("/api/health/square");
+    if (!health.configured) {
+      setConnStatus("#square-status", "", "Not connected");
+    } else if (health.ok) {
+      setConnStatus("#square-status", "ok", health.detail);
+    } else {
+      setConnStatus("#square-status", "bad", health.detail);
+    }
+  } catch (err) {
+    setConnStatus("#square-status", "bad", err.message);
+  }
+}
+
 async function loadSettingsView() {
+  void refreshSquareStatus();
   const rows = $("#mapping-rows");
   rows.textContent = "";
   let cameras = [], locations = [], mappings = [], devices = [];

@@ -2,6 +2,9 @@
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from app.store import Store
 from app.sync import ingest_payment, parse_ts_ms, sync_payments
@@ -172,12 +175,105 @@ def test_sync_polls_old_payment_by_updated_at(tmp_path):
     assert square.params == {
         "updated_at_begin_time": "2026-07-16T14:55:00Z",
         "sort_field": "UPDATED_AT",
+        "sort_order": "ASC",
         "location_id": "LOC_OLD",
     }
     assert stored["created_at"] == "2026-06-01T12:00:00.000Z"
     assert stored["updated_at"] == "2026-07-16T15:05:00.000Z"
     assert stored["status"] == "COMPLETED"
     assert stored["receipt_url"] == "https://square.example/completed"
+
+
+def test_sync_restart_does_not_skip_older_updates_after_mid_batch_failure(
+    tmp_path, monkeypatch
+):
+    base = datetime.now(tz=timezone.utc).replace(microsecond=0) - timedelta(hours=1)
+
+    def payment(payment_id: str, minutes: int) -> dict:
+        timestamp = (base + timedelta(minutes=minutes)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        return {
+            "id": payment_id,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "amount_money": {"amount": 100, "currency": "USD"},
+            "status": "COMPLETED",
+            "location_id": "LOC_OLD",
+        }
+
+    payments = [
+        payment("PAY_OLDEST", 0),
+        payment("PAY_MIDDLE", 10),
+        payment("PAY_NEWEST", 20),
+    ]
+
+    class FilteringSquare:
+        def __init__(self):
+            self.calls = []
+
+        def list_locations(self):
+            return [{"id": "LOC_OLD"}]
+
+        def list_payments(
+            self,
+            *,
+            updated_at_begin_time,
+            sort_field,
+            sort_order,
+            location_id,
+        ):
+            self.calls.append(
+                {
+                    "updated_at_begin_time": updated_at_begin_time,
+                    "sort_field": sort_field,
+                    "sort_order": sort_order,
+                    "location_id": location_id,
+                }
+            )
+            begin_ms = parse_ts_ms(updated_at_begin_time)
+            matching = [
+                item
+                for item in payments
+                if parse_ts_ms(item["updated_at"]) >= begin_ms
+            ]
+            return sorted(
+                matching,
+                key=lambda item: parse_ts_ms(item["updated_at"]),
+                reverse=sort_order == "DESC",
+            )
+
+    data_dir = tmp_path / "data"
+    square = FilteringSquare()
+    store = Store(data_dir)
+    original_upsert = store.upsert_transaction
+
+    def fail_on_middle(txn):
+        if txn["id"] == "PAY_MIDDLE":
+            raise RuntimeError("simulated database interruption")
+        return original_upsert(txn)
+
+    monkeypatch.setattr(store, "upsert_transaction", fail_on_middle)
+    try:
+        with pytest.raises(RuntimeError, match="simulated database interruption"):
+            sync_payments(store, square, protect=None)
+        assert store.get_transaction("PAY_OLDEST") is not None
+        assert store.get_transaction("PAY_MIDDLE") is None
+        assert store.get_transaction("PAY_NEWEST") is None
+    finally:
+        store.close()
+
+    restarted_store = Store(data_dir)
+    try:
+        assert sync_payments(restarted_store, square, protect=None) == 2
+        assert all(
+            restarted_store.get_transaction(item["id"]) is not None
+            for item in payments
+        )
+    finally:
+        restarted_store.close()
+
+    assert [call["sort_order"] for call in square.calls] == ["ASC", "ASC"]
 
 
 def test_newer_timestamp_recaptures_camera_evidence(tmp_path):

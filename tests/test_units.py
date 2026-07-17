@@ -230,8 +230,15 @@ def test_sync_queries_every_location_with_its_own_watermark(tmp_path):
         def list_locations(self):
             return [{"id": "LOC1"}, {"id": "LOC2"}]
 
-        def list_payments(self, updated_at_begin_time=None, sort_field=None, location_id=None):
+        def list_payments(
+            self,
+            updated_at_begin_time=None,
+            sort_field=None,
+            sort_order=None,
+            location_id=None,
+        ):
             assert sort_field == "UPDATED_AT"
+            assert sort_order == "ASC"
             self.calls.append((location_id, updated_at_begin_time))
             if location_id == "LOC1":
                 return [first_payment]
@@ -845,25 +852,34 @@ def test_square_payment_update_filters_persist_across_pages():
     payments = client.list_payments(
         updated_at_begin_time="2026-07-16T14:59:00Z",
         sort_field="UPDATED_AT",
+        sort_order="ASC",
     )
     client.close()
 
     assert [p["id"] for p in payments] == ["P1", "P2"]
     assert requests == [
         {
-            "sort_order": "DESC",
+            "sort_order": "ASC",
             "limit": "100",
             "updated_at_begin_time": "2026-07-16T14:59:00Z",
             "sort_field": "UPDATED_AT",
         },
         {
-            "sort_order": "DESC",
+            "sort_order": "ASC",
             "limit": "100",
             "updated_at_begin_time": "2026-07-16T14:59:00Z",
             "sort_field": "UPDATED_AT",
             "cursor": "next1",
         },
     ]
+
+def test_square_rejects_bad_sort_order():
+    client = SquareClient("tok")
+    try:
+        with pytest.raises(ValueError, match="sort_order"):
+            client.list_payments(sort_order="SIDEWAYS")
+    finally:
+        client.close()
 
 def test_square_rejects_bad_environment():
     with pytest.raises(ValueError):

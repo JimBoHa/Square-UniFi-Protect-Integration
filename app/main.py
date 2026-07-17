@@ -304,11 +304,10 @@ def create_app(
     @app.put("/api/camera-mapping")
     def set_mapping(body: CameraMappingBody, _=authed) -> dict:
         for entry in body.mappings:
-            if entry.location_id != "*":
-                try:
-                    validate_camera_id(entry.camera_id)
-                except ValueError as exc:
-                    raise HTTPException(status_code=422, detail=str(exc))
+            try:
+                validate_camera_id(entry.camera_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
         store.clear_camera_mappings()
         for entry in body.mappings:
             store.set_camera_mapping(entry.location_id, entry.camera_id, entry.camera_name)

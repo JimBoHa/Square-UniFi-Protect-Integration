@@ -173,7 +173,9 @@ def create_app(
     def setup(body: SetupBody) -> dict:
         if store.get_setting("admin.password_hash") is not None:
             raise HTTPException(status_code=409, detail="Setup already completed")
-        store.set_setting("admin.password_hash", hash_password(body.password))
+        password_hash = hash_password(body.password)
+        if not store.set_setting_if_absent("admin.password_hash", password_hash):
+            raise HTTPException(status_code=409, detail="Setup already completed")
         return {"ok": True}
 
     @app.post("/api/login")

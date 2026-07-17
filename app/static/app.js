@@ -39,7 +39,11 @@ async function api(path, options = {}) {
     throw new Error("Please log in");
   }
   const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data.detail || `Request failed (${resp.status})`);
+  if (!resp.ok) {
+    const error = new Error(data.detail || `Request failed (${resp.status})`);
+    error.status = resp.status;
+    throw error;
+  }
   return includeResponse ? { data, response: resp } : data;
 }
 
@@ -403,7 +407,15 @@ async function loadTransactions({ reset = false, offset = transactionOffset } = 
     page = result.data;
     pageSnapshot = result.response.headers.get("x-transaction-snapshot");
   } catch (err) {
-    message(err.message, "error");
+    if (err.status === 409 && requestedOffset > 0) {
+      // Durable ordering snapshots are bounded. An expired page restarts at
+      // the newest chronological view instead of mixing two generations.
+      transactionSnapshot = null;
+      transactionPendingOffset = 0;
+      message("Transaction page refreshed to the newest results.", "");
+    } else {
+      message(err.message, "error");
+    }
   } finally {
     transactionLoadInFlight = false;
   }

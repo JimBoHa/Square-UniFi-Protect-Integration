@@ -32,7 +32,7 @@ from .square_client import (
     SquarePermissionError,
     verify_webhook_signature,
 )
-from .store import ALARM_ENABLED_AFTER_SETTING, Store
+from .store import ALARM_ENABLED_AFTER_SETTING, Store, TransactionSnapshotExpired
 
 logger = logging.getLogger("spi")
 
@@ -627,10 +627,18 @@ def create_app(
         snapshot: int | None = None,
         _=authed,
     ) -> list[dict]:
-        rows, snapshot_rowid = store.list_transactions_page(limit, offset, snapshot)
+        try:
+            rows, transaction_snapshot = store.list_transactions_page(
+                limit, offset, snapshot
+            )
+        except TransactionSnapshotExpired as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Transaction page expired; return to the newest page",
+            ) from exc
         # Preserve the existing list response while issuing an optional
-        # snapshot boundary for clients that paginate across live inserts.
-        response.headers["X-Transaction-Snapshot"] = str(snapshot_rowid)
+        # durable ordering token for clients that paginate across live writes.
+        response.headers["X-Transaction-Snapshot"] = str(transaction_snapshot)
         return [txn_response(t) for t in rows]
 
     @app.get("/api/thumbnails/{txn_id}")

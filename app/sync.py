@@ -62,11 +62,16 @@ def _ingest_payment_with_status(
     txn["ts_ms"] = parse_ts_ms(txn["created_at"])
     txn["updated_ts_ms"] = parse_ts_ms(txn["updated_at"])
 
-    mapping = store.camera_for_location(txn["location_id"])
+    existing = store.get_transaction(txn["id"])
+    if existing and not txn["device_id"]:
+        txn["device_id"] = existing.get("device_id", "")
+        if not txn["device_name"]:
+            txn["device_name"] = existing.get("device_name", "")
+
+    mapping = store.camera_for_location(txn["location_id"], txn["device_id"])
     txn["camera_id"] = mapping["camera_id"] if mapping else None
     txn["thumbnail_path"] = None
 
-    existing = store.get_transaction(txn["id"])
     # A stale out-of-order event is ignored by the versioned upsert, so it must
     # not overwrite the on-disk thumbnail with a wrong-time frame either.
     stale_event = bool(existing and txn["updated_ts_ms"] < existing["updated_ts_ms"])

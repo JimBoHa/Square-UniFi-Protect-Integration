@@ -16,6 +16,9 @@ from app.square_client import SquareClient, SquarePermissionError
 from app.store import Store
 from app.sync import ingest_payment, retry_missing_thumbnails
 
+from app.protect_client import ProtectClient
+from app.sync import ingest_payment
+
 from .conftest import (
     ADMIN_PASSWORD,
     PROTECT_PASS,
@@ -229,8 +232,33 @@ def test_camera_and_location_listing(configured):
 def test_camera_mapping_roundtrip(configured):
     mapping = configured.get("/api/camera-mapping").json()
     assert mapping == [
-        {"location_id": "LOC1", "camera_id": CAM1, "camera_name": "Front Counter"}
+        {
+            "location_id": "LOC1",
+            "device_id": "",
+            "device_name": "",
+            "camera_id": CAM1,
+            "camera_name": "Front Counter",
+        }
     ]
+
+def test_camera_mapping_accepts_255_character_device_name(configured):
+    device_name = "R" * 255
+    resp = configured.put(
+        "/api/camera-mapping",
+        json={
+            "mappings": [
+                {
+                    "location_id": "LOC1",
+                    "device_id": "TERM_LONG_NAME",
+                    "device_name": device_name,
+                    "camera_id": CAM1,
+                    "camera_name": "Front Counter",
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert configured.get("/api/camera-mapping").json()[0]["device_name"] == device_name
 
 def test_camera_preview_returns_jpeg(configured):
     resp = configured.get(f"/api/camera-preview/{CAM1}")
@@ -371,22 +399,28 @@ def _webhook_signature(body: bytes) -> str:
         hmac.new(WEBHOOK_KEY.encode(), WEBHOOK_URL.encode() + body, hashlib.sha256).digest()
     ).decode()
 
-def make_webhook_event(payment_id: str = "PAY_HOOK") -> bytes:
+def make_webhook_event(
+    payment_id: str = "PAY_HOOK",
+    device_id: str = "",
+    device_name: str = "",
+) -> bytes:
+    payment = {
+        "id": payment_id,
+        "created_at": "2026-07-16T16:00:00.000Z",
+        "amount_money": {"amount": 500, "currency": "USD"},
+        "status": "COMPLETED",
+        "location_id": "LOC1",
+        "card_details": {"card": {"last_4": "9999"}},
+    }
+    if device_id or device_name:
+        payment["device_details"] = {
+            "device_id": device_id,
+            "device_name": device_name,
+        }
     return json.dumps(
         {
             "type": "payment.updated",
-            "data": {
-                "object": {
-                    "payment": {
-                        "id": payment_id,
-                        "created_at": "2026-07-16T16:00:00.000Z",
-                        "amount_money": {"amount": 500, "currency": "USD"},
-                        "status": "COMPLETED",
-                        "location_id": "LOC1",
-                        "card_details": {"card": {"last_4": "9999"}},
-                    }
-                }
-            },
+            "data": {"object": {"payment": payment}},
         }
     ).encode()
 
@@ -666,6 +700,205 @@ def test_square_settings_can_disable_existing_webhook(configured):
         headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
     )
     assert webhook_resp.status_code == 403
+
+def test_two_pos_devices_map_to_distinct_camera_evidence(configured, monkeypatch):
+    snapshot_requests = []
+
+    def record_snapshot(_self, camera_id, ts_ms=None, width=640):
+        snapshot_requests.append((camera_id, ts_ms))
+        return b"snapshot:" + camera_id.encode()
+
+    monkeypatch.setattr(ProtectClient, "get_snapshot", record_snapshot)
+    resp = configured.put(
+        "/api/camera-mapping",
+        json={
+            "mappings": [
+                {
+                    "location_id": "LOC1",
+                    "device_id": "TERM_A",
+                    "device_name": "Register A",
+                    "camera_id": CAM1,
+                    "camera_name": "Front Counter",
+                },
+                {
+                    "location_id": "LOC1",
+                    "device_id": "TERM_B",
+                    "device_name": "Register B",
+                    "camera_id": CAM2,
+                    "camera_name": "Back Door",
+                },
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert configured.get("/api/camera-mapping").json() == [
+        {
+            "location_id": "LOC1",
+            "device_id": "TERM_A",
+            "device_name": "Register A",
+            "camera_id": CAM1,
+            "camera_name": "Front Counter",
+        },
+        {
+            "location_id": "LOC1",
+            "device_id": "TERM_B",
+            "device_name": "Register B",
+            "camera_id": CAM2,
+            "camera_name": "Back Door",
+        },
+    ]
+
+    for payment_id, device_id, device_name in (
+        ("PAY_TERM_A", "TERM_A", "Register A"),
+        ("PAY_TERM_B", "TERM_B", "Register B"),
+    ):
+        body = make_webhook_event(payment_id, device_id, device_name)
+        resp = configured.post(
+            "/webhooks/square",
+            content=body,
+            headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+        )
+        assert resp.status_code == 200
+
+    txns = {
+        txn["id"]: txn
+        for txn in configured.get("/api/transactions").json()
+    }
+    for payment_id, device_id, camera_id in (
+        ("PAY_TERM_A", "TERM_A", CAM1),
+        ("PAY_TERM_B", "TERM_B", CAM2),
+    ):
+        txn = txns[payment_id]
+        assert txn["device_id"] == device_id
+        assert txn["camera_id"] == camera_id
+        assert txn["deep_link"] == (
+            f"https://192.168.1.1/protect/timeline/{camera_id}?ts={txn['ts_ms']}"
+        )
+        thumbnail = configured.get(txn["thumbnail_url"])
+        assert thumbnail.status_code == 200
+        assert camera_id.encode() in thumbnail.content
+
+    assert [camera_id for camera_id, _ in snapshot_requests] == [CAM1, CAM2]
+    assert configured.get("/api/pos-devices").json() == [
+        {"location_id": "LOC1", "device_id": "TERM_A", "device_name": "Register A"},
+        {"location_id": "LOC1", "device_id": "TERM_B", "device_name": "Register B"},
+    ]
+
+def test_payment_without_device_uses_location_fallback(configured, monkeypatch):
+    snapshot_requests = []
+
+    def record_snapshot(_self, camera_id, ts_ms=None, width=640):
+        snapshot_requests.append(camera_id)
+        return b"snapshot:" + camera_id.encode()
+
+    monkeypatch.setattr(ProtectClient, "get_snapshot", record_snapshot)
+    resp = configured.put(
+        "/api/camera-mapping",
+        json={
+            "mappings": [
+                {
+                    "location_id": "LOC1",
+                    "camera_id": CAM1,
+                    "camera_name": "Front Counter",
+                },
+                {
+                    "location_id": "LOC1",
+                    "device_id": "TERM_A",
+                    "device_name": "Register A",
+                    "camera_id": CAM2,
+                    "camera_name": "Back Door",
+                },
+            ]
+        },
+    )
+    assert resp.status_code == 200
+
+    body = make_webhook_event("PAY_NO_DEVICE")
+    resp = configured.post(
+        "/webhooks/square",
+        content=body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+    )
+    assert resp.status_code == 200
+    txn = next(
+        item
+        for item in configured.get("/api/transactions").json()
+        if item["id"] == "PAY_NO_DEVICE"
+    )
+    assert txn["device_id"] == ""
+    assert txn["camera_id"] == CAM1
+    assert f"/timeline/{CAM1}?" in txn["deep_link"]
+    assert snapshot_requests == [CAM1]
+
+def test_sparse_payment_update_preserves_device_camera_evidence(configured, monkeypatch):
+    snapshot_requests = []
+
+    def record_snapshot(_self, camera_id, ts_ms=None, width=640):
+        snapshot_requests.append(camera_id)
+        return b"snapshot:" + camera_id.encode()
+
+    monkeypatch.setattr(ProtectClient, "get_snapshot", record_snapshot)
+    mapping = {
+        "mappings": [
+            {
+                "location_id": "LOC1",
+                "camera_id": CAM2,
+                "camera_name": "Back Door",
+            },
+            {
+                "location_id": "LOC1",
+                "device_id": "TERM_A",
+                "device_name": "Register A",
+                "camera_id": CAM1,
+                "camera_name": "Front Counter",
+            },
+        ]
+    }
+    assert configured.put("/api/camera-mapping", json=mapping).status_code == 200
+
+    initial_body = make_webhook_event("PAY_SPARSE", "TERM_A", "Register A")
+    initial_payment = json.loads(initial_body)["data"]["object"]["payment"]
+    ingest_payment(configured.app.state.store, initial_payment, protect=None)
+
+    sparse_body = make_webhook_event("PAY_SPARSE")
+    resp = configured.post(
+        "/webhooks/square",
+        content=sparse_body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(sparse_body)},
+    )
+    assert resp.status_code == 200
+    txn = next(
+        item
+        for item in configured.get("/api/transactions").json()
+        if item["id"] == "PAY_SPARSE"
+    )
+    original_image = configured.get(txn["thumbnail_url"]).content
+    assert txn["device_id"] == "TERM_A"
+    assert txn["camera_id"] == CAM1
+    assert CAM1.encode() in original_image
+    assert snapshot_requests == [CAM1]
+
+    mapping["mappings"][1]["camera_id"] = CAM2
+    mapping["mappings"][1]["camera_name"] = "Back Door"
+    assert configured.put("/api/camera-mapping", json=mapping).status_code == 200
+    snapshot_requests.clear()
+    resp = configured.post(
+        "/webhooks/square",
+        content=sparse_body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(sparse_body)},
+    )
+    assert resp.status_code == 200
+
+    txn = next(
+        item
+        for item in configured.get("/api/transactions").json()
+        if item["id"] == "PAY_SPARSE"
+    )
+    assert txn["device_id"] == "TERM_A"
+    assert txn["camera_id"] == CAM1
+    assert f"/timeline/{CAM1}?" in txn["deep_link"]
+    assert configured.get(txn["thumbnail_url"]).content == original_image
+    assert snapshot_requests == []
 
 def test_webhook_ignores_non_payment_events(configured):
     body = json.dumps({"type": "inventory.count.updated", "data": {}}).encode()

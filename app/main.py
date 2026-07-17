@@ -65,6 +65,8 @@ class SquareSettingsBody(BaseModel):
 
 class CameraMappingEntry(BaseModel):
     location_id: str = Field(min_length=1, max_length=64)
+    device_id: str = Field(default="", max_length=255)
+    device_name: str = Field(default="", max_length=255)
     camera_id: str = Field(min_length=1, max_length=64)
     camera_name: str = Field(default="", max_length=128)
 
@@ -360,6 +362,10 @@ def create_app(
         finally:
             client.close()
 
+    @app.get("/api/pos-devices")
+    def pos_devices(_=authed) -> list[dict]:
+        return store.get_observed_devices()
+
     @app.get("/api/camera-preview/{camera_id}")
     def camera_preview(camera_id: str, _=authed) -> Response:
         try:
@@ -388,7 +394,13 @@ def create_app(
                 raise HTTPException(status_code=422, detail=str(exc))
         store.replace_camera_mappings(
             [
-                (entry.location_id, entry.camera_id, entry.camera_name)
+                (
+                    entry.location_id,
+                    entry.device_id,
+                    entry.device_name,
+                    entry.camera_id,
+                    entry.camera_name,
+                )
                 for entry in body.mappings
             ]
         )
@@ -417,6 +429,8 @@ def create_app(
             "currency": txn["currency"],
             "status": txn["status"],
             "location_id": txn["location_id"],
+            "device_id": txn.get("device_id", ""),
+            "device_name": txn.get("device_name", ""),
             "card_last4": txn["card_last4"],
             "receipt_url": txn["receipt_url"],
             "camera_id": txn.get("camera_id"),

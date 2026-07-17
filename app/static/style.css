@@ -39,7 +39,7 @@ button[type="submit"], #save-mapping, #sync-now {
 #message.ok { color: #2a9d3a; }
 
 .mapping-row { display: flex; gap: 0.75rem; align-items: center; margin: 0.4rem 0; }
-.mapping-row .loc { min-width: 180px; font-weight: 600; }
+.mapping-row .loc { min-width: 280px; font-weight: 600; }
 #camera-preview { max-width: 480px; width: 100%; border-radius: 8px; border: 1px solid var(--border); }
 
 .txn {

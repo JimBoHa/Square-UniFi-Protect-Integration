@@ -143,6 +143,7 @@ def payment_from_api(payment: dict) -> dict:
         display_money.get("currency") or amount_money.get("currency") or "USD"
     )
     card = payment.get("card_details", {}).get("card", {})
+    device = payment.get("device_details") or {}
     created_at = payment.get("created_at", "")
     server_created_at = created_at
     if payment.get("is_offline_payment") is True:
@@ -162,6 +163,8 @@ def payment_from_api(payment: dict) -> dict:
         "currency": display_currency,
         "status": payment.get("status", ""),
         "location_id": payment.get("location_id", ""),
+        "device_id": device.get("device_id") or "",
+        "device_name": device.get("device_name") or "",
         "card_last4": card.get("last_4", ""),
         "receipt_url": payment.get("receipt_url", ""),
         "raw": payment,

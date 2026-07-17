@@ -6,7 +6,6 @@ import hashlib
 import logging
 import re
 import threading
-import time
 from datetime import datetime, timedelta, timezone
 
 from .protect_client import ProtectClient, ProtectError
@@ -17,7 +16,8 @@ logger = logging.getLogger("spi.sync")
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_\-]")
 BACKFILL_HOURS = 24
-ALARM_RETRY_BUDGET_SECONDS = 5
+ALARM_RETRY_BATCH_SIZE = 1
+ALARM_RETRY_NETWORK_TIMEOUT_SECONDS = 5
 
 
 def parse_ts_ms(created_at: str) -> int:
@@ -178,18 +178,14 @@ def _retry_pending_alarms(
     alarm_trigger_id: str | None,
     txn_ids: list[str],
 ) -> None:
-    """Drain durable work after Square ingestion, stopping on first failure."""
-    deadline = time.monotonic() + ALARM_RETRY_BUDGET_SECONDS
-    for txn_id in txn_ids:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
+    """Attempt a bounded durable batch after Square ingestion."""
+    for txn_id in txn_ids[:ALARM_RETRY_BATCH_SIZE]:
         if not deliver_completed_alarm(
             store,
             txn_id,
             protect,
             alarm_trigger_id,
-            timeout=remaining,
+            timeout=ALARM_RETRY_NETWORK_TIMEOUT_SECONDS,
         ):
             break
 

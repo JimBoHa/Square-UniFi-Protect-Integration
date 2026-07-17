@@ -31,7 +31,7 @@ from .square_client import (
     SquareError,
     verify_webhook_signature,
 )
-from .store import Store
+from .store import ALARM_ENABLED_AFTER_SETTING, Store
 
 logger = logging.getLogger("spi")
 
@@ -301,7 +301,11 @@ def create_app(
     def clear_protect_alarm_settings() -> dict:
         store.update_settings(
             {},
-            delete_keys=("protect.api_key", "protect.alarm_trigger_id"),
+            delete_keys=(
+                "protect.api_key",
+                "protect.alarm_trigger_id",
+                ALARM_ENABLED_AFTER_SETTING,
+            ),
             suppress_completed_alarms=True,
         )
         return {"ok": True, "alarm_configured": False}
@@ -374,11 +378,15 @@ def create_app(
                 False,
             )
         alarm_is_configured = bool(effective_api_key and effective_trigger_id)
+        alarm_is_newly_enabled = alarm_is_configured and not alarm_was_configured
+        if alarm_is_newly_enabled:
+            settings_updates[ALARM_ENABLED_AFTER_SETTING] = (
+                str(int(time.time() * 1000)),
+                False,
+            )
         store.update_settings(
             settings_updates,
-            suppress_completed_alarms=(
-                alarm_is_configured and not alarm_was_configured
-            ),
+            suppress_completed_alarms=alarm_is_newly_enabled,
         )
         return {
             "ok": True,

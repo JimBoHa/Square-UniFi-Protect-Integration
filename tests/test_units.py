@@ -20,7 +20,7 @@ from app.protect_client import (
 )
 from app.security import CredentialCipher, hash_password, verify_password
 from app.square_client import SquareClient, verify_webhook_signature
-from app.store import Store
+from app.store import ALARM_ENABLED_AFTER_SETTING, Store
 from app.sync import parse_ts_ms, safe_thumbnail_name, sync_payments
 
 from .conftest import PROTECT_PASS, PROTECT_USER, protect_handler
@@ -358,6 +358,20 @@ def test_store_migrates_alarm_state_without_replaying_completed_rows(tmp_path):
         assert store.claim_alarm_trigger("OLD") is None
         store.upsert_transaction(_transaction("NEW"))
         assert store.claim_alarm_trigger("NEW") is not None
+    finally:
+        store.close()
+
+
+def test_alarm_activation_suppresses_later_historical_imports(tmp_path):
+    store = Store(tmp_path / "data")
+    try:
+        store.update_settings(
+            {ALARM_ENABLED_AFTER_SETTING: ("1500", False)}
+        )
+        store.upsert_transaction(_transaction("HISTORICAL") | {"ts_ms": 1000})
+        store.upsert_transaction(_transaction("LIVE") | {"ts_ms": 2000})
+        assert store.get_transaction("HISTORICAL")["alarm_state"] == "sent"
+        assert store.get_transaction("LIVE")["alarm_state"] == "idle"
     finally:
         store.close()
 

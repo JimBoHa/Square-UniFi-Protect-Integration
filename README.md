@@ -83,7 +83,10 @@ the `deep_link_template` key in the settings table; the default is
 > process crashes after Protect accepts a trigger but before delivery state is
 > saved, that sale can trigger the alarm again; the Protect endpoint does not
 > provide an idempotency key. Completed sales already stored when alarms are first
-> enabled are marked handled rather than replayed as a historical burst.
+> enabled, plus sales imported later whose transaction time predates activation,
+> are marked handled rather than replayed as a historical burst. Automatic retry
+> uses the Square poller; when `SPI_DISABLE_POLLER=1`, pending deliveries require
+> a duplicate webhook or manual **Sync now**.
 
 ## Security
 

@@ -16,6 +16,7 @@ ALARM_IDLE = "idle"
 ALARM_IN_PROGRESS = "in_progress"
 ALARM_SENT = "sent"
 ALARM_CLAIM_LEASE_SECONDS = 60
+ALARM_ENABLED_AFTER_SETTING = "protect.alarm_enabled_after_ms"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -90,6 +91,35 @@ class Store:
             if "alarm_claimed_at" not in columns:
                 self._db.execute(
                     "ALTER TABLE transactions ADD COLUMN alarm_claimed_at REAL"
+                )
+            configured_alarm_keys = {
+                row["key"]
+                for row in self._db.execute(
+                    "SELECT key FROM settings WHERE key IN (?, ?, ?)",
+                    (
+                        "protect.api_key",
+                        "protect.alarm_trigger_id",
+                        ALARM_ENABLED_AFTER_SETTING,
+                    ),
+                ).fetchall()
+            }
+            if {
+                "protect.api_key",
+                "protect.alarm_trigger_id",
+            }.issubset(configured_alarm_keys) and (
+                ALARM_ENABLED_AFTER_SETTING not in configured_alarm_keys
+            ):
+                # Upgrade early alarm-feature databases without replaying
+                # imports that happened before this process started.
+                self._db.execute(
+                    "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, 0)",
+                    (ALARM_ENABLED_AFTER_SETTING, str(int(time.time() * 1000))),
+                )
+                self._db.execute(
+                    "UPDATE transactions SET alarm_state = ?, "
+                    "alarm_claim_token = NULL, alarm_claimed_at = NULL "
+                    "WHERE UPPER(status) = 'COMPLETED' AND alarm_state != ?",
+                    (ALARM_SENT, ALARM_SENT),
                 )
             self._release_expired_alarm_claims_locked()
             self._db.commit()
@@ -222,6 +252,29 @@ class Store:
                     **{k: v for k, v in txn.items() if k != "raw"},
                 },
             )
+            activation = self._db.execute(
+                "SELECT value, encrypted FROM settings WHERE key = ?",
+                (ALARM_ENABLED_AFTER_SETTING,),
+            ).fetchone()
+            try:
+                enabled_after_ms = (
+                    int(activation["value"])
+                    if activation is not None and not activation["encrypted"]
+                    else None
+                )
+            except (TypeError, ValueError):
+                enabled_after_ms = None
+            if (
+                enabled_after_ms is not None
+                and str(txn.get("status", "")).upper() == "COMPLETED"
+                and int(txn["ts_ms"]) < enabled_after_ms
+            ):
+                self._db.execute(
+                    "UPDATE transactions SET alarm_state = ?, "
+                    "alarm_claim_token = NULL, alarm_claimed_at = NULL "
+                    "WHERE id = ? AND alarm_state != ?",
+                    (ALARM_SENT, txn["id"], ALARM_SENT),
+                )
             self._db.commit()
         return existing is None
 

@@ -263,7 +263,9 @@ def _webhook_signature(body: bytes) -> str:
     ).decode()
 
 def make_webhook_event(
-    payment_id: str = "PAY_HOOK", status: str = "COMPLETED"
+    payment_id: str = "PAY_HOOK",
+    status: str = "COMPLETED",
+    created_at: str = "2026-07-16T16:00:00.000Z",
 ) -> bytes:
     return json.dumps(
         {
@@ -272,7 +274,7 @@ def make_webhook_event(
                 "object": {
                     "payment": {
                         "id": payment_id,
-                        "created_at": "2026-07-16T16:00:00.000Z",
+                        "created_at": created_at,
                         "amount_money": {"amount": 500, "currency": "USD"},
                         "status": status,
                         "location_id": "LOC1",
@@ -307,6 +309,15 @@ def _wait_for_alarm_state(
     raise AssertionError(
         f"alarm state for {payment_id} did not become {state}"
     )
+
+
+def _wait_for_protect_jobs(client, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not client.app.state.thumbnail_jobs:
+            return
+        time.sleep(0.01)
+    raise AssertionError("webhook Protect work did not finish")
 
 
 def test_webhook_stores_payment_then_enriches_thumbnail(configured):
@@ -451,7 +462,9 @@ def test_webhook_ack_does_not_wait_for_alarm_delivery(tmp_path):
                 },
             ).status_code == 200
 
-            body = make_webhook_event("PAY_ALARM_BLOCKED")
+            body = make_webhook_event(
+                "PAY_ALARM_BLOCKED", created_at="2099-07-16T16:00:00.000Z"
+            )
             response = isolated.post(
                 "/webhooks/square",
                 content=body,
@@ -612,27 +625,31 @@ def _enable_alarm(client):
     )
     assert resp.status_code == 200, resp.text
 
-def test_completed_payments_trigger_once_across_sync_and_webhook(configured):
+def test_enable_before_first_sync_suppresses_backfill_then_triggers_live_sale(configured):
     _enable_alarm(configured)
 
     assert configured.post("/api/sync").status_code == 200
-    assert PROTECT_ALARM_CALLS == [
-        PROTECT_ALARM_TRIGGER_ID,
-        PROTECT_ALARM_TRIGGER_ID,
-    ]
+    assert PROTECT_ALARM_CALLS == []
     assert configured.post("/api/sync").status_code == 200
 
-    body = make_webhook_event("PAY_001")
-    resp = configured.post(
+    body = make_webhook_event(
+        "PAY_LIVE", created_at="2099-07-16T16:00:00.000Z"
+    )
+    assert configured.post(
         "/webhooks/square",
         content=body,
         headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
-    )
-    assert resp.status_code == 200
-    assert PROTECT_ALARM_CALLS == [
-        PROTECT_ALARM_TRIGGER_ID,
-        PROTECT_ALARM_TRIGGER_ID,
-    ]
+    ).status_code == 200
+    _wait_for_alarm_state(configured, "PAY_LIVE", "sent")
+    assert PROTECT_ALARM_CALLS == [PROTECT_ALARM_TRIGGER_ID]
+
+    assert configured.post(
+        "/webhooks/square",
+        content=body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+    ).status_code == 200
+    _wait_for_protect_jobs(configured)
+    assert PROTECT_ALARM_CALLS == [PROTECT_ALARM_TRIGGER_ID]
 
 def test_enabling_alarm_does_not_replay_existing_completed_sales(configured):
     assert configured.post("/api/sync").status_code == 200
@@ -644,7 +661,11 @@ def test_enabling_alarm_does_not_replay_existing_completed_sales(configured):
 def test_pending_payment_triggers_when_it_becomes_completed(configured):
     _enable_alarm(configured)
 
-    pending = make_webhook_event("PAY_TRANSITION", status="PENDING")
+    pending = make_webhook_event(
+        "PAY_TRANSITION",
+        status="PENDING",
+        created_at="2099-07-16T16:00:00.000Z",
+    )
     assert configured.post(
         "/webhooks/square",
         content=pending,
@@ -652,7 +673,11 @@ def test_pending_payment_triggers_when_it_becomes_completed(configured):
     ).status_code == 200
     assert PROTECT_ALARM_CALLS == []
 
-    completed = make_webhook_event("PAY_TRANSITION", status="COMPLETED")
+    completed = make_webhook_event(
+        "PAY_TRANSITION",
+        status="COMPLETED",
+        created_at="2099-07-16T16:00:00.000Z",
+    )
     assert configured.post(
         "/webhooks/square",
         content=completed,
@@ -664,7 +689,9 @@ def test_pending_payment_triggers_when_it_becomes_completed(configured):
 def test_alarm_failure_persists_transaction_and_retries(configured):
     _enable_alarm(configured)
     PROTECT_ALARM_RESPONSES.extend([500, 204])
-    body = make_webhook_event("PAY_RETRY")
+    body = make_webhook_event(
+        "PAY_RETRY", created_at="2099-07-16T16:00:00.000Z"
+    )
     headers = {"x-square-hmacsha256-signature": _webhook_signature(body)}
 
     assert configured.post("/webhooks/square", content=body, headers=headers).status_code == 200
@@ -678,10 +705,11 @@ def test_alarm_failure_persists_transaction_and_retries(configured):
 
     assert configured.post("/api/sync").status_code == 200
     assert configured.app.state.store.get_transaction("PAY_RETRY")["alarm_state"] == "sent"
-    assert len(PROTECT_ALARM_CALLS) == 4
+    assert len(PROTECT_ALARM_CALLS) == 2
 
     assert configured.post("/webhooks/square", content=body, headers=headers).status_code == 200
-    assert len(PROTECT_ALARM_CALLS) == 4
+    _wait_for_protect_jobs(configured)
+    assert len(PROTECT_ALARM_CALLS) == 2
 
 def test_webhook_ignores_non_payment_events(configured):
     body = json.dumps({"type": "inventory.count.updated", "data": {}}).encode()

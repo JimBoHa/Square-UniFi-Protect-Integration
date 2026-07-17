@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
@@ -15,6 +16,10 @@ logger = logging.getLogger("spi.sync")
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_\-]")
 BACKFILL_HOURS = 24
+THUMBNAIL_RETRY_BATCH_SIZE = 10
+THUMBNAIL_RETRY_LEASE_SECONDS = 5 * 60
+THUMBNAIL_RETRY_BASE_DELAY_SECONDS = 30
+THUMBNAIL_RETRY_MAX_DELAY_SECONDS = 60 * 60
 
 
 def parse_ts_ms(created_at: str) -> int:
@@ -27,6 +32,21 @@ def safe_thumbnail_name(payment_id: str) -> str:
     if not cleaned:
         raise ValueError("Payment id yields no safe filename")
     return f"{cleaned}.jpg"
+
+
+def retry_thumbnail_name(
+    payment_id: str,
+    camera_id: str,
+    ts_ms: int,
+    lease_token: str,
+) -> str:
+    """Unique filename bound to claimed camera/time evidence."""
+    cleaned = _SAFE_ID_RE.sub("", payment_id)[:48]
+    if not cleaned:
+        raise ValueError("Payment id yields no safe filename")
+    evidence = f"{payment_id}\0{camera_id}\0{int(ts_ms)}\0{lease_token}".encode()
+    digest = hashlib.sha256(evidence).hexdigest()[:24]
+    return f"{cleaned}-{int(ts_ms)}-{digest}.jpg"
 
 
 def ingest_payment(
@@ -51,17 +71,78 @@ def ingest_payment(
             name = safe_thumbnail_name(txn["id"])
             (store.thumbnail_dir / name).write_bytes(image)
             txn["thumbnail_path"] = name
-        except (ProtectError, ValueError) as exc:
+        except (ProtectError, ValueError, OSError) as exc:
             logger.warning("Thumbnail capture failed for %s: %s", txn["id"], exc)
 
     store.upsert_transaction(txn)
     return txn
 
 
+def retry_missing_thumbnails(
+    store: Store,
+    protect: ProtectClient,
+    *,
+    batch_size: int = THUMBNAIL_RETRY_BATCH_SIZE,
+    now: float | None = None,
+) -> int:
+    """Retry a bounded batch independently of Square's current payment window."""
+    jobs = store.claim_thumbnail_retries(
+        batch_size,
+        THUMBNAIL_RETRY_LEASE_SECONDS,
+        now=now,
+    )
+    completed = 0
+    for job in jobs:
+        path = None
+        try:
+            image = protect.get_snapshot(job["camera_id"], ts_ms=job["ts_ms"])
+            name = retry_thumbnail_name(
+                job["transaction_id"],
+                job["camera_id"],
+                job["ts_ms"],
+                job["lease_token"],
+            )
+            path = store.thumbnail_dir / name
+            path.write_bytes(image)
+            attached = store.complete_thumbnail_retry(
+                job["transaction_id"],
+                job["lease_token"],
+                job["camera_id"],
+                job["ts_ms"],
+                name,
+            )
+            if attached:
+                completed += 1
+            else:
+                path.unlink(missing_ok=True)
+        except (ProtectError, ValueError, OSError) as exc:
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            store.fail_thumbnail_retry(
+                job["transaction_id"],
+                job["lease_token"],
+                job["camera_id"],
+                job["ts_ms"],
+                str(exc),
+                now=now,
+                base_delay_seconds=THUMBNAIL_RETRY_BASE_DELAY_SECONDS,
+                max_delay_seconds=THUMBNAIL_RETRY_MAX_DELAY_SECONDS,
+            )
+            logger.warning(
+                "Thumbnail retry failed for %s: %s", job["transaction_id"], exc
+            )
+    return completed
+
+
 def sync_payments(
     store: Store, square: SquareClient, protect: ProtectClient | None
 ) -> int:
     """Pull recent Square payments and ingest them. Returns count ingested."""
+    if protect is not None:
+        retry_missing_thumbnails(store, protect)
     latest = store.latest_transaction_ts()
     if latest:
         begin = datetime.fromtimestamp(latest / 1000, tz=timezone.utc) - timedelta(minutes=5)

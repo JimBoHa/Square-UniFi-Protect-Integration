@@ -113,6 +113,7 @@ def test_older_payment_update_cannot_regress_state(tmp_path):
         card_last4="1111",
         receipt_url="https://square.example/pending",
     )
+    stale_pending["created_at"] = "2026-07-16T09:00:00.000Z"
 
     try:
         ingest_payment(store, completed, protect=None)
@@ -177,6 +178,44 @@ def test_sync_polls_old_payment_by_updated_at(tmp_path):
     assert stored["updated_at"] == "2026-07-16T15:05:00.000Z"
     assert stored["status"] == "COMPLETED"
     assert stored["receipt_url"] == "https://square.example/completed"
+
+
+def test_newer_timestamp_recaptures_camera_evidence(tmp_path):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC_OLD", CAMERA_ID, "Front Counter")
+    original = _payment(
+        "2026-07-16T15:01:00.000Z",
+        amount=500,
+        currency="USD",
+        status="PENDING",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/pending",
+    )
+    corrected = _payment(
+        "2026-07-16T15:02:00.000Z",
+        amount=500,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/completed",
+    )
+    corrected["created_at"] = "2026-07-16T08:30:00.000Z"
+
+    try:
+        ingest_payment(store, original, protect=_ProtectStub())
+        ingest_payment(store, corrected, protect=_ProtectStub())
+        stored = store.get_transaction("PAY_VERSIONED")
+        image = (store.thumbnail_dir / stored["thumbnail_path"]).read_bytes()
+    finally:
+        store.close()
+
+    corrected_ts_ms = parse_ts_ms(corrected["created_at"])
+    assert stored["created_at"] == corrected["created_at"]
+    assert stored["ts_ms"] == corrected_ts_ms
+    assert stored["camera_id"] == CAMERA_ID
+    assert image == f"snapshot:{CAMERA_ID}:{corrected_ts_ms}".encode()
 
 
 def test_store_migrates_legacy_transaction_schema_without_data_loss(tmp_path):

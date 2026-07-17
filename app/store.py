@@ -202,13 +202,18 @@ class Store:
                 "thumbnail_path, raw) VALUES (:id, :created_at, :ts_ms, :updated_at, "
                 ":updated_ts_ms, :amount, :currency, :status, :location_id, :card_last4, "
                 ":receipt_url, :camera_id, :thumbnail_path, :raw) "
-                "ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at, "
+                "ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at, "
+                "ts_ms=excluded.ts_ms, updated_at=excluded.updated_at, "
                 "updated_ts_ms=excluded.updated_ts_ms, amount=excluded.amount, "
                 "currency=excluded.currency, status=excluded.status, "
                 "location_id=excluded.location_id, card_last4=excluded.card_last4, "
                 "receipt_url=excluded.receipt_url, raw=excluded.raw, "
-                "camera_id=COALESCE(excluded.camera_id, transactions.camera_id), "
-                "thumbnail_path=COALESCE(excluded.thumbnail_path, transactions.thumbnail_path) "
+                "camera_id=CASE WHEN excluded.ts_ms != transactions.ts_ms "
+                "THEN excluded.camera_id ELSE COALESCE(excluded.camera_id, "
+                "transactions.camera_id) END, "
+                "thumbnail_path=CASE WHEN excluded.ts_ms != transactions.ts_ms "
+                "THEN excluded.thumbnail_path ELSE COALESCE(excluded.thumbnail_path, "
+                "transactions.thumbnail_path) END "
                 "WHERE excluded.updated_ts_ms >= transactions.updated_ts_ms",
                 values,
             )

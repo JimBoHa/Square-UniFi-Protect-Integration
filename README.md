@@ -1,30 +1,44 @@
 # Square × UniFi Protect Integration
 
-Link **Square POS transactions** to **UniFi Protect camera footage** — the same
-experience UniFi Protect's native Shopify integration provides, for Square.
+This standalone companion app links **Square POS transactions** to **UniFi
+Protect camera footage**. It approximates the transaction-to-video workflow of
+UniFi Protect's native Shopify integration, but it does not install a Square
+settings page or transaction feed inside the Protect application.
 
-Every Square payment shows up in the integration's feed with its timestamp,
-amount, card details, and a **thumbnail captured from the camera watching your
-POS at the exact moment of the sale**. Clicking the thumbnail opens the UniFi
-Protect timeline at that timestamp, so you can review the footage of any
-transaction in one click.
+Every Square payment shows up in the companion feed with its timestamp, amount,
+card details, and a thumbnail requested from the camera watching the POS.
+Clicking the thumbnail uses a version-dependent deep link to open the Protect
+timeline near that timestamp.
 
-## Features (parity with the Shopify ⇄ Protect integration, for Square)
+## Implemented companion features
 
-- **Connect your Square account** — enter a Square access token (production or
-  sandbox); the integration verifies it against the Square API before saving.
+- **Connect your Square account** — enter a Square access token in the companion
+  app (production or sandbox); the integration verifies it against the Square
+  API before saving.
 - **Connect your UniFi Protect console** — local-account credentials for your
   UniFi OS console (Dream Machine, NVR, etc.), verified on save.
 - **Choose the POS camera** — for each Square location, pick which Protect
   camera watches the register, with a live snapshot preview.
-- **Transaction feed** — payments appear with timestamp, amount, card last-4,
-  status, and a thumbnail pulled from the POS camera's recording at the
-  transaction's timestamp.
-- **Click through to footage** — clicking a thumbnail opens the UniFi Protect
-  timeline for that camera at the moment of the transaction.
+- **Transaction feed** — payments appear in the companion app with timestamp,
+  amount, card last-4, status, and a camera thumbnail.
+- **Click through to footage** — clicking a thumbnail uses the configured URL
+  template to open the Protect timeline near the transaction timestamp.
 - **Real-time + backfill** — a Square webhook receiver ingests payments the
   moment they happen (HMAC-SHA256 signature verified), and a background poller
   backfills/refreshes via the Square Payments API.
+
+## Protect integration boundary
+
+As of July 2026, the [documented UniFi Protect API](https://developer.ui.com/protect)
+does not expose a way for third-party applications to add a retail transaction
+feed or credential screen inside Protect. Native Shopify-style placement would
+therefore require a separate Ubiquiti partner/private integration contract.
+Square credentials and transactions in this repository live in the companion
+web app.
+
+The repository's local-account login, historical `ts` snapshot query, and
+timeline URL are legacy/undocumented Protect interfaces. They can change across
+Protect releases and must be tested against the target console and firmware.
 
 ## Quick start
 
@@ -62,10 +76,10 @@ The deep-link URL format can be adjusted for your Protect version by setting
 the `deep_link_template` key in the settings table; the default is
 `https://{host}/protect/timeline/{camera_id}?ts={ts_ms}`.
 
-> **Note on historical thumbnails:** recent UniFi Protect versions serve a
-> recorded frame when the snapshot endpoint is called with a `ts` parameter;
-> older versions ignore it and return a live frame. Webhook-ingested
-> transactions are captured within seconds of the sale either way.
+> **Note on historical thumbnails:** the documented snapshot API does not
+> include a timestamp parameter. A console may ignore the legacy `ts` query and
+> return a live frame. Verify thumbnail timing and the deep link on real target
+> hardware before relying on either as transaction evidence.
 
 ## Security
 
@@ -91,8 +105,8 @@ from the internet; everything else can stay LAN-only.
 .venv/bin/python -m pytest        # 91 functional + security tests
 ```
 
-Tests run against mocked Square and UniFi Protect APIs — no hardware or Square
-account needed.
+Tests run against mocked Square and UniFi Protect APIs. Passing tests do not
+validate firmware-specific snapshot or timeline behavior on real hardware.
 
 ## License
 

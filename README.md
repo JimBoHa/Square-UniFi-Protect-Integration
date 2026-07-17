@@ -100,6 +100,7 @@ Open `http://<host>:8000`, then:
 | `SPI_DISABLE_POLLER` | `0` | Set `1` to disable background polling |
 | `SPI_COOKIE_SECURE` | `0` | Set `1` when serving over HTTPS |
 | `SPI_ENCRYPTION_KEY` | — | Fernet key overriding the on-disk key file |
+| `SPI_TLS` | `0` | Set `1` to serve HTTPS with an auto-generated self-signed certificate (run via `python -m app`); enables Secure cookies automatically |
 
 The deep-link URL format can be adjusted for your Protect version by setting
 the `deep_link_template` key in the settings table; the default (verified on

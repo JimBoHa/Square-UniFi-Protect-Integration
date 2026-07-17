@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 
@@ -139,6 +140,26 @@ def test_square_failure_still_processes_retry_queue(tmp_path):
         store.close()
 
 
+def test_retry_error_does_not_mask_square_failure(tmp_path, monkeypatch, caplog):
+    store = Store(tmp_path / "data")
+
+    class Square:
+        def list_payments(self, begin_time=None):
+            raise SquareError("original Square failure")
+
+    def fail_retry(*_args, **_kwargs):
+        raise RuntimeError("retry drain failed")
+
+    monkeypatch.setattr("app.sync.retry_missing_thumbnails", fail_retry)
+    caplog.set_level(logging.WARNING, logger="spi.sync")
+    try:
+        with pytest.raises(SquareError, match="original Square failure"):
+            sync_payments(store, Square(), object())
+        assert "Thumbnail retry batch failed: retry drain failed" in caplog.text
+    finally:
+        store.close()
+
+
 def test_retry_backoff_is_exponential_and_capped(tmp_path):
     store = Store(tmp_path / "data")
     try:
@@ -163,11 +184,7 @@ def test_retry_backoff_is_exponential_and_capped(tmp_path):
         store.close()
 
 
-@pytest.mark.parametrize(
-    ("camera_id", "ts_ms"),
-    [(CAM_B, 1000), (CAM_A, 2000)],
-)
-def test_evidence_change_resets_retry_backoff(tmp_path, camera_id, ts_ms):
+def test_camera_change_resets_retry_backoff(tmp_path):
     store = Store(tmp_path / "data")
     try:
         store.upsert_transaction(_stored_txn("P", 1000, camera_id=CAM_A))
@@ -175,10 +192,89 @@ def test_evidence_change_resets_retry_backoff(tmp_path, camera_id, ts_ms):
         assert _fail(store, failed, 100)
         assert store.claim_thumbnail_retries(1, 10, now=109) == []
 
-        store.upsert_transaction(_stored_txn("P", ts_ms, camera_id=camera_id))
+        store.upsert_transaction(_stored_txn("P", 1000, camera_id=CAM_B))
         replacement = store.claim_thumbnail_retries(1, 10, now=100)[0]
-        assert replacement["camera_id"] == camera_id
-        assert replacement["ts_ms"] == ts_ms
+        assert replacement["camera_id"] == CAM_B
+        assert replacement["ts_ms"] == 1000
+        assert replacement["attempts"] == 0
+    finally:
+        store.close()
+
+
+def test_reingest_keeps_original_transaction_timestamp(tmp_path):
+    store = Store(tmp_path / "data")
+    original = _stored_txn("P", 1000)
+    original["created_at"] = "2026-07-16T15:30:00.000Z"
+    stale = _stored_txn("P", 2000)
+    stale["created_at"] = "2026-07-16T16:30:00.000Z"
+    try:
+        store.upsert_transaction(original)
+        store.upsert_transaction(stale)
+        saved = store.get_transaction("P")
+        assert saved["created_at"] == original["created_at"]
+        assert saved["ts_ms"] == original["ts_ms"]
+    finally:
+        store.close()
+
+
+def test_reingest_preserves_captured_camera_across_remap(tmp_path):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC1", CAM_A, "Original camera")
+    payment = _payment("P", "2026-07-16T15:30:00.000Z")
+
+    class Protect:
+        calls = 0
+
+        def get_snapshot(self, camera_id, ts_ms=None):
+            self.calls += 1
+            return f"jpeg-{camera_id}-{ts_ms}".encode()
+
+    protect = Protect()
+    try:
+        ingest_payment(store, payment, protect)
+        original = store.get_transaction("P")
+        original_image = (store.thumbnail_dir / original["thumbnail_path"]).read_bytes()
+
+        store.set_camera_mapping("LOC1", CAM_B, "New camera")
+        ingest_payment(store, payment, protect)
+        saved = store.get_transaction("P")
+
+        assert protect.calls == 1
+        assert saved["camera_id"] == CAM_A
+        assert saved["thumbnail_path"] == original["thumbnail_path"]
+        assert (
+            store.thumbnail_dir / saved["thumbnail_path"]
+        ).read_bytes() == original_image
+    finally:
+        store.close()
+
+
+def test_reingest_missing_evidence_adopts_remapped_camera(tmp_path):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC1", CAM_A, "Original camera")
+    payment = _payment("P", "2026-07-16T15:30:00.000Z")
+    ingest_payment(store, payment, None)
+    failed = store.claim_thumbnail_retries(1, 10, now=100)[0]
+    assert _fail(store, failed, 100)
+
+    class Protect:
+        calls = 0
+
+        def get_snapshot(self, camera_id, ts_ms=None):
+            self.calls += 1
+            return b"jpeg"
+
+    protect = Protect()
+    try:
+        store.set_camera_mapping("LOC1", CAM_B, "New camera")
+        ingest_payment(store, payment, protect)
+        saved = store.get_transaction("P")
+        assert protect.calls == 0
+        assert saved["camera_id"] == CAM_B
+        assert saved["thumbnail_path"] is None
+
+        replacement = store.claim_thumbnail_retries(1, 10, now=100)[0]
+        assert replacement["camera_id"] == CAM_B
         assert replacement["attempts"] == 0
     finally:
         store.close()

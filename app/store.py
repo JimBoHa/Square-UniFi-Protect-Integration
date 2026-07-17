@@ -154,7 +154,7 @@ class Store:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 existing = self._db.execute(
-                    "SELECT id, camera_id, ts_ms FROM transactions WHERE id = ?",
+                    "SELECT id, camera_id FROM transactions WHERE id = ?",
                     (txn["id"],),
                 ).fetchone()
                 self._db.execute(
@@ -163,11 +163,10 @@ class Store:
                     "VALUES (:id, :created_at, :ts_ms, :amount, :currency, :status, "
                     ":location_id, :card_last4, :receipt_url, :camera_id, :thumbnail_path, "
                     ":raw) ON CONFLICT(id) DO UPDATE SET status=excluded.status, "
-                    "created_at=excluded.created_at, ts_ms=excluded.ts_ms, "
                     "thumbnail_path=CASE WHEN "
                     "transactions.camera_id IS NOT COALESCE(excluded.camera_id, "
-                    "transactions.camera_id) OR transactions.ts_ms != excluded.ts_ms "
-                    "THEN excluded.thumbnail_path ELSE COALESCE(excluded.thumbnail_path, "
+                    "transactions.camera_id) THEN excluded.thumbnail_path "
+                    "ELSE COALESCE(excluded.thumbnail_path, "
                     "transactions.thumbnail_path) END, "
                     "camera_id=COALESCE(excluded.camera_id, transactions.camera_id)",
                     {
@@ -187,10 +186,7 @@ class Store:
                 evidence_changed = bool(
                     existing
                     and current
-                    and (
-                        existing["camera_id"] != current["camera_id"]
-                        or existing["ts_ms"] != current["ts_ms"]
-                    )
+                    and existing["camera_id"] != current["camera_id"]
                 )
                 if current and current["camera_id"] and not current["thumbnail_path"]:
                     if evidence_changed:

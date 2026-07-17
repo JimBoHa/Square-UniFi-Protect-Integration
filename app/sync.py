@@ -66,6 +66,11 @@ def ingest_payment(
     txn["thumbnail_path"] = None
 
     existing = store.get_transaction(txn["id"])
+    if existing and existing.get("camera_id") and existing.get("thumbnail_path"):
+        # Camera and thumbnail form historical evidence. A later location
+        # remap applies to new/missing evidence, never to this captured pair.
+        txn["camera_id"] = existing["camera_id"]
+        txn["thumbnail_path"] = existing["thumbnail_path"]
     # Existing misses belong to the durable queue. Directly fetching them here
     # would bypass its next_attempt_at backoff on every Square overlap page.
     if protect is not None and txn["camera_id"] and existing is None:
@@ -170,7 +175,10 @@ def sync_payments(
         # Retry persisted misses after fresh payments. This still runs when
         # Square listing fails, and never contributes to the ingested count.
         if protect is not None:
-            retry_missing_thumbnails(store, protect)
+            try:
+                retry_missing_thumbnails(store, protect)
+            except Exception as exc:
+                logger.warning("Thumbnail retry batch failed: %s", exc)
     return count
 
 

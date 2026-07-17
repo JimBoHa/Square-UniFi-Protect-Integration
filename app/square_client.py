@@ -104,13 +104,20 @@ def verify_webhook_signature(
 
 def payment_from_api(payment: dict) -> dict:
     """Normalize a Square Payment object into our transaction shape."""
-    amount = payment.get("amount_money", {})
+    amount_money = payment.get("amount_money") or {}
+    display_money = payment.get("total_money") or amount_money
+    display_amount = display_money.get("amount")
+    if display_amount is None:
+        display_amount = amount_money.get("amount") or 0
+    display_currency = (
+        display_money.get("currency") or amount_money.get("currency") or "USD"
+    )
     card = payment.get("card_details", {}).get("card", {})
     return {
         "id": payment.get("id", ""),
         "created_at": payment.get("created_at", ""),
-        "amount": int(amount.get("amount", 0)),
-        "currency": amount.get("currency", "USD"),
+        "amount": int(display_amount),
+        "currency": display_currency,
         "status": payment.get("status", ""),
         "location_id": payment.get("location_id", ""),
         "card_last4": card.get("last_4", ""),

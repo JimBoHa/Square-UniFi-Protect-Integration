@@ -10,7 +10,7 @@ import pytest
 from app.deeplink import build_deep_link
 from app.protect_client import ProtectAuthError, ProtectClient, validate_camera_id, validate_host
 from app.security import CredentialCipher, hash_password, verify_password
-from app.square_client import SquareClient, verify_webhook_signature
+from app.square_client import SquareClient, payment_from_api, verify_webhook_signature
 from app.sync import parse_ts_ms, safe_thumbnail_name
 
 from .conftest import PROTECT_PASS, PROTECT_USER, protect_handler
@@ -186,6 +186,39 @@ def test_protect_relogin_on_expired_session():
 
 
 # -- Square client -------------------------------------------------------------------
+
+def test_payment_from_api_prefers_tip_inclusive_total():
+    payment = {
+        "amount_money": {"amount": 1000, "currency": "USD"},
+        "tip_money": {"amount": 200, "currency": "USD"},
+        "total_money": {"amount": 1200, "currency": "USD"},
+    }
+
+    assert payment_from_api(payment)["amount"] == 1200
+
+def test_payment_from_api_falls_back_to_amount_money():
+    payment = {"amount_money": {"amount": 1000, "currency": "EUR"}}
+
+    normalized = payment_from_api(payment)
+    assert normalized["amount"] == 1000
+    assert normalized["currency"] == "EUR"
+
+def test_payment_from_api_uses_selected_currency_with_safe_fallback():
+    selected_currency = payment_from_api(
+        {
+            "amount_money": {"amount": 1000, "currency": "USD"},
+            "total_money": {"amount": 1200, "currency": "CAD"},
+        }
+    )
+    base_currency = payment_from_api(
+        {
+            "amount_money": {"amount": 1000, "currency": "GBP"},
+            "total_money": {"amount": 1200},
+        }
+    )
+
+    assert selected_currency["currency"] == "CAD"
+    assert base_currency["currency"] == "GBP"
 
 def test_square_pagination_follows_cursor():
     pages = {

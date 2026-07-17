@@ -231,14 +231,31 @@ class ProtectClient:
             not isinstance(camera, dict) for camera in cameras
         ):
             raise ProtectError("UniFi Protect camera response was invalid")
-        return [
-            {
-                "id": cam.get("id", ""),
-                "name": cam.get("name") or cam.get("marketName") or cam.get("id", ""),
-                "state": cam.get("state", ""),
-            }
-            for cam in cameras
-        ]
+        normalized = []
+        for camera in cameras:
+            camera_id = camera.get("id")
+            name = camera.get("name")
+            market_name = camera.get("marketName")
+            state = camera.get("state")
+            try:
+                validate_camera_id(camera_id)
+            except (TypeError, ValueError) as exc:
+                raise ProtectError(
+                    "UniFi Protect camera response was invalid"
+                ) from exc
+            if any(
+                value is not None and not isinstance(value, str)
+                for value in (name, market_name, state)
+            ):
+                raise ProtectError("UniFi Protect camera response was invalid")
+            normalized.append(
+                {
+                    "id": camera_id,
+                    "name": name or market_name or camera_id,
+                    "state": state or "",
+                }
+            )
+        return normalized
 
     def get_snapshot(
         self, camera_id: str, ts_ms: int | None = None, width: int = 640

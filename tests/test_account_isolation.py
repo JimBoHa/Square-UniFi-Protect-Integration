@@ -313,6 +313,74 @@ def test_api_refuses_then_atomically_purges_confirmed_account_switch(tmp_path):
         store.close()
 
 
+@pytest.mark.parametrize(
+    ("endpoint", "store_method"),
+    (
+        ("/api/transactions", "list_transactions_page"),
+        ("/api/pos-devices", "get_observed_devices"),
+        ("/api/camera-mapping", "get_camera_mappings"),
+    ),
+)
+def test_account_scoped_read_finishes_before_switch_can_commit(
+    tmp_path, monkeypatch, endpoint, store_method
+):
+    app, client = _authed_account_app(tmp_path)
+    store = app.state.store
+    read_started = threading.Event()
+    release_read = threading.Event()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    try:
+        connected = client.put(
+            "/api/settings/square",
+            json={"access_token": TOKEN_A, "environment": "production"},
+        )
+        assert connected.status_code == 200
+        _seed_account_data(store)
+        with pytest.raises(SquareAccountSwitchRequired) as challenge:
+            store.configure_square_account(
+                merchant_id=MERCHANT_B,
+                access_token=TOKEN_B,
+                environment="production",
+            )
+
+        original_read = getattr(store, store_method)
+
+        def blocked_read(*args, **kwargs):
+            result = original_read(*args, **kwargs)
+            read_started.set()
+            assert release_read.wait(timeout=5)
+            return result
+
+        monkeypatch.setattr(store, store_method, blocked_read)
+        read_future = executor.submit(client.get, endpoint)
+        assert read_started.wait(timeout=5)
+        switch_future = executor.submit(
+            store.configure_square_account,
+            merchant_id=MERCHANT_B,
+            access_token=TOKEN_B,
+            environment="production",
+            confirm_account_switch=True,
+            account_switch_confirmation_token=(
+                challenge.value.confirmation_token
+            ),
+        )
+        with pytest.raises(concurrent.futures.TimeoutError):
+            switch_future.result(timeout=0.05)
+
+        release_read.set()
+        response = read_future.result(timeout=5)
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "private, no-store"
+        assert {row["location_id"] for row in response.json()} == {"LOC_A"}
+        assert switch_future.result(timeout=5).switched
+        assert client.get(endpoint).json() == []
+    finally:
+        release_read.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+        client.close()
+        store.close()
+
+
 def test_same_merchant_refresh_retains_data_even_when_confirmation_is_set(tmp_path):
     app, client = _authed_account_app(tmp_path)
     store = app.state.store

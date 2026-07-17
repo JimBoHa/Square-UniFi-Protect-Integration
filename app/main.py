@@ -585,8 +585,12 @@ def create_app(
                 client.close()
 
     @app.get("/api/pos-devices")
-    def pos_devices(_=authed) -> list[dict]:
-        return store.get_observed_devices()
+    def pos_devices(_=authed) -> JSONResponse:
+        with store.integration_guard():
+            return JSONResponse(
+                store.get_observed_devices(),
+                headers={"Cache-Control": "private, no-store"},
+            )
 
     @app.get("/api/camera-preview/{camera_id}")
     def camera_preview(camera_id: str, _=authed) -> Response:
@@ -604,8 +608,12 @@ def create_app(
         return Response(content=image, media_type="image/jpeg")
 
     @app.get("/api/camera-mapping")
-    def get_mapping(_=authed) -> list[dict]:
-        return store.get_camera_mappings()
+    def get_mapping(_=authed) -> JSONResponse:
+        with store.integration_guard():
+            return JSONResponse(
+                store.get_camera_mappings(),
+                headers={"Cache-Control": "private, no-store"},
+            )
 
     @app.put("/api/camera-mapping")
     def set_mapping(body: CameraMappingBody, request: Request, _=authed) -> dict:
@@ -691,17 +699,24 @@ def create_app(
 
     @app.get("/api/transactions")
     def transactions(
-        response: Response,
         limit: int = 50,
         offset: int = 0,
         snapshot: int | None = None,
         _=authed,
-    ) -> list[dict]:
-        rows, snapshot_rowid = store.list_transactions_page(limit, offset, snapshot)
-        # Preserve the existing list response while issuing an optional
-        # snapshot boundary for clients that paginate across live inserts.
-        response.headers["X-Transaction-Snapshot"] = str(snapshot_rowid)
-        return [txn_response(t) for t in rows]
+    ) -> JSONResponse:
+        with store.integration_guard():
+            rows, snapshot_rowid = store.list_transactions_page(
+                limit, offset, snapshot
+            )
+            # Render the account-bound payload while the shared guard is held,
+            # so an acknowledged switch cannot bisect the read and encoding.
+            return JSONResponse(
+                [txn_response(t) for t in rows],
+                headers={
+                    "X-Transaction-Snapshot": str(snapshot_rowid),
+                    "Cache-Control": "private, no-store",
+                },
+            )
 
     @app.get("/api/thumbnails/{txn_id}")
     def thumbnail(txn_id: str, _=authed) -> FileResponse:
@@ -721,7 +736,11 @@ def create_app(
                 ):
                     nudge_protect_work_queue()
                 raise HTTPException(status_code=404, detail="Thumbnail not found")
-            return FileResponse(path, media_type="image/jpeg")
+            return FileResponse(
+                path,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "private, no-store"},
+            )
 
     def run_sync() -> int:
         with square_account_lock:

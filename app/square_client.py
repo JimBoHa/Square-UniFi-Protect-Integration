@@ -106,9 +106,11 @@ def payment_from_api(payment: dict) -> dict:
     """Normalize a Square Payment object into our transaction shape."""
     amount = payment.get("amount_money", {})
     card = payment.get("card_details", {}).get("card", {})
+    created_at = payment.get("created_at", "")
     return {
         "id": payment.get("id", ""),
-        "created_at": payment.get("created_at", ""),
+        "created_at": created_at,
+        "updated_at": payment.get("updated_at") or created_at,
         "amount": int(amount.get("amount", 0)),
         "currency": amount.get("currency", "USD"),
         "status": payment.get("status", ""),

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from .protect_client import validate_camera_id, validate_host
 
-DEFAULT_TEMPLATE = "https://{host}/protect/timeline/{camera_id}?ts={ts_ms}"
+# Verified against Protect 7.1.87: the web app's own event links use
+# /protect/timelapse/{camera}?start={ms} and the player seeks to `start`.
+DEFAULT_TEMPLATE = "https://{host}/protect/timelapse/{camera_id}?start={ts_ms}"
 
 
 def build_deep_link(

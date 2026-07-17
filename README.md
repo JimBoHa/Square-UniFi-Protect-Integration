@@ -47,9 +47,13 @@ web app. The sale-alarm feature uses the official integration API
 (`X-API-Key` + Alarm Manager webhook triggers) and is the supported way to
 surface sale events inside Protect itself.
 
-The repository's local-account login, historical `ts` snapshot query, and
-timeline URL are legacy/undocumented Protect interfaces. They can change across
-Protect releases and must be tested against the target console and firmware.
+The repository's local-account login, recording-snapshot query, and playback
+deep link are undocumented Protect interfaces. They have been verified against
+a UNVR G2 on Protect 7.1.87 (a dedicated view-only local account is
+sufficient for all of them), but they can change across Protect releases —
+re-verify after major console updates. The default deep link matches the
+URL Protect's own event links use on that version:
+`https://{host}/protect/timelapse/{camera_id}?start={ts_ms}`.
 
 ## Quick start
 
@@ -90,13 +94,18 @@ Open `http://<host>:8000`, then:
 | `SPI_ENCRYPTION_KEY` | — | Fernet key overriding the on-disk key file |
 
 The deep-link URL format can be adjusted for your Protect version by setting
-the `deep_link_template` key in the settings table; the default is
-`https://{host}/protect/timeline/{camera_id}?ts={ts_ms}`.
+the `deep_link_template` key in the settings table; the default (verified on
+Protect 7.1.87) is
+`https://{host}/protect/timelapse/{camera_id}?start={ts_ms}`.
 
-> **Note on historical thumbnails:** the documented snapshot API does not
-> include a timestamp parameter. A console may ignore the legacy `ts` query and
-> return a live frame. Verify thumbnail timing and the deep link on real target
-> hardware before relying on either as transaction evidence.
+> **Note on historical thumbnails:** verified against a UNVR G2 running
+> Protect 7.1.87 — historical frames come from the `recording-snapshot`
+> endpoint (the live `snapshot` endpoint silently ignores `ts` on this
+> firmware). Recorded frames become available roughly ten seconds behind
+> live; a sale ingested in real time gets its thumbnail on the first retry
+> pass rather than a wrong-time live frame. On older firmware without
+> `recording-snapshot`, the integration falls back to the legacy `snapshot?ts`
+> query, which some of those versions honored.
 
 > **Alarm delivery semantics:** each completed transaction is atomically claimed
 > and marked delivered after Protect accepts the trigger. Failed requests are

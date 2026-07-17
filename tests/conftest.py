@@ -84,12 +84,20 @@ def protect_handler(request: httpx.Request) -> httpx.Response:
                 ]
             },
         )
-    match = re.fullmatch(r"/proxy/protect/api/cameras/([^/]+)/snapshot", path)
+    match = re.fullmatch(
+        r"/proxy/protect/api/cameras/([^/]+)/(snapshot|recording-snapshot)", path
+    )
     if match:
-        camera_id = match.group(1)
+        camera_id, endpoint = match.groups()
         if camera_id not in ("cam1aaaaaaaaaaaaaaaaaaaaa", "cam2bbbbbbbbbbbbbbbbbbbbb"):
             return httpx.Response(404)
         ts = request.url.params.get("ts", "")
+        if endpoint == "recording-snapshot" and not ts:
+            # Mirrors Protect 7.1.87: the recording endpoint requires ts.
+            return httpx.Response(
+                404,
+                json={"error": "Recording not found"},
+            )
         return httpx.Response(
             200,
             content=FAKE_JPEG + ts.encode(),

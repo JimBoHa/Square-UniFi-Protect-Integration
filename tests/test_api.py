@@ -364,7 +364,7 @@ def test_transaction_deep_link_points_at_protect_timeline(configured):
     configured.post("/api/sync")
     txn = configured.get("/api/transactions").json()[-1]
     assert txn["deep_link"] == (
-        f"https://192.168.1.1/protect/timeline/{CAM1}?ts={txn['ts_ms']}"
+        f"https://192.168.1.1/protect/timelapse/{CAM1}?start={txn['ts_ms']}"
     )
 
 def test_transaction_thumbnail_served(configured):
@@ -398,7 +398,7 @@ def test_transactions_without_camera_mapping_still_listed(authed):
 
 def test_snapshot_transport_error_stores_transaction_without_thumbnail(tmp_path):
     def snapshot_unavailable(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/snapshot"):
+        if request.url.path.endswith("snapshot"):
             raise httpx.ReadTimeout("sensitive snapshot details", request=request)
         return protect_handler(request)
 
@@ -564,7 +564,7 @@ def test_webhook_ack_and_transaction_listing_do_not_wait_for_snapshot(tmp_path):
     release_snapshot = threading.Event()
 
     def blocking_snapshot(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/snapshot"):
+        if request.url.path.endswith("snapshot"):
             snapshot_started.set()
             if not release_snapshot.wait(timeout=10):
                 raise httpx.ReadTimeout("snapshot test timed out", request=request)
@@ -763,7 +763,7 @@ def test_webhook_burst_acks_immediately_and_queue_drains_all(tmp_path):
     release_snapshots = threading.Event()
 
     def blocking_snapshot(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/snapshot"):
+        if request.url.path.endswith("snapshot"):
             assert release_snapshots.wait(timeout=10)
         return protect_handler(request)
 
@@ -946,7 +946,7 @@ def test_two_pos_devices_map_to_distinct_camera_evidence(configured, monkeypatch
         assert txn["device_id"] == device_id
         assert txn["camera_id"] == camera_id
         assert txn["deep_link"] == (
-            f"https://192.168.1.1/protect/timeline/{camera_id}?ts={txn['ts_ms']}"
+            f"https://192.168.1.1/protect/timelapse/{camera_id}?start={txn['ts_ms']}"
         )
         thumbnail = configured.get(txn["thumbnail_url"])
         assert thumbnail.status_code == 200
@@ -998,7 +998,7 @@ def test_payment_without_device_uses_location_fallback(configured, monkeypatch):
     txn = _wait_for_thumbnail(configured, "PAY_NO_DEVICE")
     assert txn["device_id"] == ""
     assert txn["camera_id"] == CAM1
-    assert f"/timeline/{CAM1}?" in txn["deep_link"]
+    assert f"/timelapse/{CAM1}?start=" in txn["deep_link"]
     assert snapshot_requests == [CAM1]
 
 def test_sparse_payment_update_preserves_device_camera_evidence(configured, monkeypatch):
@@ -1064,7 +1064,7 @@ def test_sparse_payment_update_preserves_device_camera_evidence(configured, monk
     )
     assert txn["device_id"] == "TERM_A"
     assert txn["camera_id"] == CAM1
-    assert f"/timeline/{CAM1}?" in txn["deep_link"]
+    assert f"/timelapse/{CAM1}?start=" in txn["deep_link"]
     assert configured.get(txn["thumbnail_url"]).content == original_image
     assert snapshot_requests == []
 

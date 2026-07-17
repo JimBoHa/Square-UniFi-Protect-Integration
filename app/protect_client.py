@@ -106,7 +106,9 @@ class ProtectClient:
         )
         self._logged_in = True
 
-    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+    def _request(
+        self, method: str, path: str, raise_for_status: bool = True, **kwargs
+    ) -> httpx.Response:
         if not self._logged_in:
             self.login()
         headers = kwargs.pop("headers", {})
@@ -125,7 +127,7 @@ class ProtectClient:
                 resp = self._client.request(method, path, headers=headers, **kwargs)
             except httpx.RequestError as exc:
                 raise ProtectError("Network error while contacting UniFi Protect") from exc
-        if not 200 <= resp.status_code < 300:
+        if raise_for_status and not 200 <= resp.status_code < 300:
             raise ProtectError(
                 f"UniFi Protect request {method} {path} failed (HTTP {resp.status_code})"
             )
@@ -169,10 +171,39 @@ class ProtectClient:
     ) -> bytes:
         """JPEG snapshot for a camera; historical if ts_ms is given.
 
-        Recent Protect versions serve historical frames from the recording
-        when `ts` is passed; older ones ignore it and return a live frame.
+        Modern Protect firmware (verified on 7.1.87) serves recorded frames
+        from ``recording-snapshot?ts=`` and silently ignores ``ts`` on the
+        live ``snapshot`` endpoint, so the recording endpoint must be
+        preferred — falling back to a live frame would attach wrong-time
+        evidence. Frames become available roughly ten seconds behind live;
+        "no recording yet/anymore" raises ProtectError so the durable retry
+        queue can back off and try again.
         """
         camera_id = validate_camera_id(camera_id)
+        if ts_ms is not None:
+            resp = self._request(
+                "GET",
+                f"/proxy/protect/api/cameras/{camera_id}/recording-snapshot",
+                params={"ts": int(ts_ms)},
+                raise_for_status=False,
+            )
+            if 200 <= resp.status_code < 300:
+                return resp.content
+            content_type = resp.headers.get("content-type", "")
+            if resp.status_code == 404 and "json" in content_type:
+                # Firmware supports the endpoint but has no recorded frame at
+                # this timestamp (not flushed yet, or outside retention).
+                raise ProtectError(
+                    f"No recording available for camera {camera_id} at ts {int(ts_ms)}"
+                )
+            if resp.status_code != 404:
+                raise ProtectError(
+                    "UniFi Protect recording-snapshot failed "
+                    f"(HTTP {resp.status_code})"
+                )
+            # Plain 404 (HTML): older firmware without recording-snapshot.
+            # Fall through to the legacy snapshot endpoint, which honored
+            # ``ts`` on some of those versions.
         params: dict = {"w": width}
         if ts_ms is not None:
             params["ts"] = int(ts_ms)

@@ -157,7 +157,7 @@ def test_validate_alarm_trigger_id_rejects_invalid_value(trigger_id):
 
 def test_deep_link_default_template():
     link = build_deep_link("192.168.1.1", "cam1", 1609459200000)
-    assert link == "https://192.168.1.1/protect/timeline/cam1?ts=1609459200000"
+    assert link == "https://192.168.1.1/protect/timelapse/cam1?start=1609459200000"
 
 def test_deep_link_custom_template():
     link = build_deep_link(
@@ -889,4 +889,67 @@ def test_square_permission_error_is_distinct():
     client = SquareClient("tok", transport=httpx.MockTransport(handler))
     with pytest.raises(SquarePermissionError):
         client.list_payments(limit=1)
+    client.close()
+
+
+# -- historical snapshots against firmware variants (verified on 7.1.87) -------------
+
+def test_snapshot_with_ts_uses_recording_endpoint():
+    paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        paths.append(request.url.path + "?" + str(request.url.params))
+        if request.url.path.endswith("/recording-snapshot"):
+            return httpx.Response(
+                200,
+                content=b"\xff\xd8rec:" + request.url.params["ts"].encode(),
+                headers={"content-type": "image/jpeg"},
+            )
+        return httpx.Response(200, content=b"\xff\xd8live")
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    image = client.get_snapshot("cam1", ts_ms=1609459200000)
+    assert image == b"\xff\xd8rec:1609459200000"
+    assert len(paths) == 1 and "recording-snapshot" in paths[0]
+    client.close()
+
+def test_snapshot_no_recording_at_ts_raises_instead_of_wrong_frame():
+    """Firmware supports recording-snapshot but has no frame at ts (too fresh
+    or out of retention). Falling back to a live frame would attach wrong-time
+    evidence; the retry queue must get a chance instead."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        if request.url.path.endswith("/recording-snapshot"):
+            return httpx.Response(404, json={"error": "Recording not found"})
+        return httpx.Response(200, content=b"\xff\xd8live")
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    with pytest.raises(ProtectError, match="No recording available"):
+        client.get_snapshot("cam1", ts_ms=1609459200000)
+    client.close()
+
+def test_snapshot_falls_back_to_legacy_ts_on_old_firmware():
+    """Old firmware without recording-snapshot returns an HTML 404 for the
+    unknown path; the legacy snapshot endpoint (which honored ts on some of
+    those versions) is used instead."""
+    legacy_params = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        if request.url.path.endswith("/recording-snapshot"):
+            return httpx.Response(
+                404, content=b"<!DOCTYPE html>", headers={"content-type": "text/html"}
+            )
+        legacy_params.append(dict(request.url.params))
+        return httpx.Response(200, content=b"\xff\xd8legacy")
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    image = client.get_snapshot("cam1", ts_ms=1609459200000)
+    assert image == b"\xff\xd8legacy"
+    assert legacy_params == [{"w": "640", "ts": "1609459200000"}]
     client.close()

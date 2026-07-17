@@ -139,18 +139,24 @@ class Store:
 
     def _clear_missing_thumbnail_references_locked(self) -> None:
         rows = self._db.execute(
-            "SELECT id, thumbnail_path FROM transactions "
+            "SELECT id, location_id, device_id, thumbnail_path FROM transactions "
             "WHERE thumbnail_path IS NOT NULL"
         ).fetchall()
-        missing_ids = [
-            row["id"]
-            for row in rows
-            if not self._thumbnail_file_exists(row["thumbnail_path"])
-        ]
-        self._db.executemany(
-            "UPDATE transactions SET thumbnail_path = NULL WHERE id = ?",
-            ((txn_id,) for txn_id in missing_ids),
-        )
+        for row in rows:
+            if self._thumbnail_file_exists(row["thumbnail_path"]):
+                continue
+            # Once historical evidence is gone, retry against the mapping that
+            # currently owns this POS. This matches the runtime missing-file
+            # repair path and avoids recreating evidence from a stale camera.
+            mapping = self._camera_for_location_locked(
+                row["location_id"], row["device_id"]
+            )
+            camera_id = mapping["camera_id"] if mapping else None
+            self._db.execute(
+                "UPDATE transactions SET camera_id = ?, thumbnail_path = NULL "
+                "WHERE id = ?",
+                (camera_id, row["id"]),
+            )
 
     def _migrate_alarms(self) -> None:
         """Add alarm delivery columns; never replay pre-existing completed sales."""

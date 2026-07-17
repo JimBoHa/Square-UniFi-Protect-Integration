@@ -250,6 +250,7 @@ def test_missing_file_requeue_uses_current_mapping(
 def test_store_startup_requeues_missing_thumbnail_file(tmp_path):
     data_dir = tmp_path / "data"
     store = Store(data_dir)
+    store.set_camera_mapping("LOC1", CAM_A, "Register")
     store.upsert_transaction(
         _stored_txn("LOST", 1000, thumbnail_path="vanished.jpg")
     )
@@ -262,6 +263,47 @@ def test_store_startup_requeues_missing_thumbnail_file(tmp_path):
         assert [job["transaction_id"] for job in jobs] == ["LOST"]
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("mappings", "expected_camera"),
+    [
+        ([("LOC1", "TERM1", "Terminal", CAM_B, "Exact")], CAM_B),
+        ([("LOC1", "", "", CAM_B, "Location")], CAM_B),
+        ([("*", "", "", CAM_B, "Wildcard")], CAM_B),
+        ([], None),
+    ],
+    ids=("exact", "location", "wildcard", "unmapped"),
+)
+def test_store_startup_missing_thumbnail_uses_current_mapping(
+    tmp_path, mappings, expected_camera
+):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    evidence = store.thumbnail_dir / "vanished.jpg"
+    evidence.write_bytes(b"old evidence")
+    txn = _stored_txn("LOST", 1000, thumbnail_path=evidence.name)
+    txn["device_id"] = "TERM1"
+    store.upsert_transaction(txn)
+
+    # Captured evidence keeps its historical camera when mappings change.
+    store.replace_camera_mappings(mappings)
+    assert store.get_transaction("LOST")["camera_id"] == CAM_A
+    store.close()
+    evidence.unlink()
+
+    reopened = Store(data_dir)
+    try:
+        stored = reopened.get_transaction("LOST")
+        jobs = reopened.claim_thumbnail_retries(1, 10, now=0)
+    finally:
+        reopened.close()
+
+    assert stored["thumbnail_path"] is None
+    assert stored["camera_id"] == expected_camera
+    assert [job["camera_id"] for job in jobs] == (
+        [expected_camera] if expected_camera else []
+    )
 
 
 def test_square_failure_still_processes_retry_queue(tmp_path):

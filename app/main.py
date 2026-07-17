@@ -41,6 +41,7 @@ LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
 SQUARE_WEBHOOK_MAX_BODY_BYTES = 1024 * 1024
 LOGIN_FAILURE_KEY_LIMIT = 10_000
+DRAIN_MAX_BATCHES = 100
 PROTECT_SETTING_KEYS = (
     "protect.host",
     "protect.username",
@@ -156,21 +157,25 @@ def create_app(
             return
         try:
             # Sale alarms first: a slow snapshot request must not delay the
-            # Alarm Manager automation for a completed sale.
-            while (
-                sync.retry_pending_alarms(
-                    store,
-                    protect,
-                    protect_settings["protect.alarm_trigger_id"],
-                )
-                == sync.ALARM_RETRY_BATCH_SIZE
-            ):
-                # A full successful batch may have more immediately runnable
-                # alarms. A partial batch includes failures, so stop and wait
-                # for the next nudge instead of retrying a dead console here.
-                pass
+            # Alarm Manager automation for a completed sale. The iteration
+            # caps are a backstop: no realistic queue needs more than
+            # cap * batch-size items per drain, and the next nudge or poll
+            # picks up anything a pathological interaction leaves behind.
+            for _ in range(DRAIN_MAX_BATCHES):
+                if (
+                    sync.retry_pending_alarms(
+                        store,
+                        protect,
+                        protect_settings["protect.alarm_trigger_id"],
+                    )
+                    != sync.ALARM_RETRY_BATCH_SIZE
+                ):
+                    # A partial batch includes failures or an empty queue, so
+                    # stop and wait for the next nudge instead of retrying a
+                    # dead console here.
+                    break
 
-            while True:
+            for _ in range(DRAIN_MAX_BATCHES):
                 sync.retry_missing_thumbnails(store, protect)
                 # Failed captures move into backoff and are intentionally not
                 # considered due. Continue only for runnable jobs beyond the

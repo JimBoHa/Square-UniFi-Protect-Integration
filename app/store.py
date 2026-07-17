@@ -157,6 +157,17 @@ class Store:
             ).fetchone()
         return dict(row) if row else None
 
+    def set_transaction_thumbnail(self, txn_id: str, thumbnail_path: str) -> bool:
+        """Attach a thumbnail if the transaction still has none."""
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE transactions SET thumbnail_path = ? "
+                "WHERE id = ? AND thumbnail_path IS NULL",
+                (thumbnail_path, txn_id),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
+
     def list_transactions(self, limit: int = 50, offset: int = 0) -> list[dict]:
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))

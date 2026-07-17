@@ -58,6 +58,23 @@ def ingest_payment(
     return txn
 
 
+def enrich_transaction_thumbnail(
+    store: Store, txn_id: str, protect: ProtectClient
+) -> bool:
+    """Capture and attach a thumbnail for a previously stored transaction."""
+    txn = store.get_transaction(txn_id)
+    if not txn or not txn.get("camera_id") or txn.get("thumbnail_path"):
+        return False
+    try:
+        image = protect.get_snapshot(txn["camera_id"], ts_ms=txn["ts_ms"])
+        name = safe_thumbnail_name(txn_id)
+        (store.thumbnail_dir / name).write_bytes(image)
+        return store.set_transaction_thumbnail(txn_id, name)
+    except (ProtectError, ValueError) as exc:
+        logger.warning("Thumbnail capture failed for %s: %s", txn_id, exc)
+        return False
+
+
 def sync_payments(
     store: Store, square: SquareClient, protect: ProtectClient | None
 ) -> int:

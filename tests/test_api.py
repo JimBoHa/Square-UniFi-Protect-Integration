@@ -4,6 +4,14 @@ import base64
 import hashlib
 import hmac
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import httpx
+from fastapi.testclient import TestClient
+
+from app.main import create_app
 
 from .conftest import (
     ADMIN_PASSWORD,
@@ -12,6 +20,8 @@ from .conftest import (
     SQUARE_TOKEN,
     WEBHOOK_KEY,
     WEBHOOK_URL,
+    protect_handler,
+    square_handler,
 )
 
 CAM1 = "cam1aaaaaaaaaaaaaaaaaaaaa"
@@ -193,7 +203,19 @@ def make_webhook_event(payment_id: str = "PAY_HOOK") -> bytes:
         }
     ).encode()
 
-def test_webhook_ingests_payment_with_thumbnail(configured):
+
+def _wait_for_thumbnail(client, payment_id: str, timeout: float = 3.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        txns = client.get("/api/transactions?limit=500").json()
+        txn = next((item for item in txns if item["id"] == payment_id), None)
+        if txn and txn["thumbnail_url"]:
+            return txn
+        time.sleep(0.01)
+    raise AssertionError(f"thumbnail enrichment did not finish for {payment_id}")
+
+
+def test_webhook_stores_payment_then_enriches_thumbnail(configured):
     body = make_webhook_event()
     resp = configured.post(
         "/webhooks/square",
@@ -203,8 +225,91 @@ def test_webhook_ingests_payment_with_thumbnail(configured):
     assert resp.status_code == 200
     txns = configured.get("/api/transactions").json()
     assert txns[0]["id"] == "PAY_HOOK"
-    assert txns[0]["thumbnail_url"] is not None
     assert txns[0]["deep_link"] is not None
+    txn = _wait_for_thumbnail(configured, "PAY_HOOK")
+    assert configured.get(txn["thumbnail_url"]).status_code == 200
+
+
+def test_webhook_ack_and_transaction_listing_do_not_wait_for_snapshot(tmp_path):
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+
+    def blocking_snapshot(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/snapshot"):
+            snapshot_started.set()
+            if not release_snapshot.wait(timeout=10):
+                raise httpx.ReadTimeout("snapshot test timed out", request=request)
+        return protect_handler(request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(blocking_snapshot),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+            assert isolated.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
+            assert isolated.put(
+                "/api/settings/protect",
+                json={
+                    "host": "192.168.1.1",
+                    "username": PROTECT_USER,
+                    "password": PROTECT_PASS,
+                },
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/square",
+                json={
+                    "access_token": SQUARE_TOKEN,
+                    "environment": "production",
+                    "webhook_signature_key": WEBHOOK_KEY,
+                    "webhook_url": WEBHOOK_URL,
+                },
+            ).status_code == 200
+            assert isolated.put(
+                "/api/camera-mapping",
+                json={
+                    "mappings": [
+                        {
+                            "location_id": "LOC1",
+                            "camera_id": CAM1,
+                            "camera_name": "Front Counter",
+                        }
+                    ]
+                },
+            ).status_code == 200
+
+            body = make_webhook_event("PAY_BLOCKED")
+            with ThreadPoolExecutor(max_workers=1) as requester:
+                response_future = requester.submit(
+                    isolated.post,
+                    "/webhooks/square",
+                    content=body,
+                    headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+                )
+                try:
+                    assert snapshot_started.wait(timeout=3)
+                    response = response_future.result(timeout=2)
+                    assert response.status_code == 200
+                    assert not release_snapshot.is_set()
+
+                    listing = isolated.get("/api/transactions")
+                    assert listing.status_code == 200
+                    txn = next(
+                        item for item in listing.json() if item["id"] == "PAY_BLOCKED"
+                    )
+                    assert txn["thumbnail_url"] is None
+                    assert txn["deep_link"] is not None
+                finally:
+                    release_snapshot.set()
+
+            txn = _wait_for_thumbnail(isolated, "PAY_BLOCKED")
+            assert isolated.get(txn["thumbnail_url"]).status_code == 200
+    finally:
+        release_snapshot.set()
+        app.state.store.close()
 
 def test_webhook_ignores_non_payment_events(configured):
     body = json.dumps({"type": "inventory.count.updated", "data": {}}).encode()

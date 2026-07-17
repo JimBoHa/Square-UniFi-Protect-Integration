@@ -6,9 +6,11 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -35,6 +37,7 @@ logger = logging.getLogger("spi")
 SESSION_COOKIE = "spi_session"
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
+WEBHOOK_THUMBNAIL_WORKERS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +87,13 @@ def create_app(
     app.state.store = store
     app.state.login_failures: dict[str, list[float]] = {}
     app.state.login_lock = threading.Lock()
+    thumbnail_executor = ThreadPoolExecutor(
+        max_workers=WEBHOOK_THUMBNAIL_WORKERS,
+        thread_name_prefix="spi-webhook-thumbnail",
+    )
+    thumbnail_jobs: set[str] = set()
+    thumbnail_jobs_lock = threading.Lock()
+    app.state.thumbnail_executor = thumbnail_executor
 
     cookie_secure = os.environ.get("SPI_COOKIE_SECURE", "0") == "1"
     if enable_poller is None:
@@ -114,6 +124,47 @@ def create_app(
             environment=store.get_setting("square.environment") or "production",
             transport=square_transport,
         )
+
+    def enrich_webhook_thumbnail(txn_id: str) -> None:
+        protect = None
+        try:
+            txn = store.get_transaction(txn_id)
+            if not txn or txn.get("thumbnail_path") or not txn.get("camera_id"):
+                return
+            protect = build_protect()
+            if protect is not None:
+                sync.enrich_transaction_thumbnail(store, txn_id, protect)
+        except Exception:
+            logger.exception("Webhook thumbnail enrichment failed for payment %s", txn_id)
+        finally:
+            if protect is not None:
+                try:
+                    protect.close()
+                except Exception:
+                    logger.exception("Could not close Protect client for payment %s", txn_id)
+
+    def submit_thumbnail_enrichment(txn_id: str) -> None:
+        with thumbnail_jobs_lock:
+            if txn_id in thumbnail_jobs:
+                return
+            thumbnail_jobs.add(txn_id)
+        try:
+            future = thumbnail_executor.submit(enrich_webhook_thumbnail, txn_id)
+        except RuntimeError:
+            with thumbnail_jobs_lock:
+                thumbnail_jobs.discard(txn_id)
+            logger.warning("Thumbnail executor unavailable for payment %s", txn_id)
+            return
+
+        def job_done(_future) -> None:
+            with thumbnail_jobs_lock:
+                thumbnail_jobs.discard(txn_id)
+
+        future.add_done_callback(job_done)
+
+    @app.on_event("shutdown")
+    def _shutdown_thumbnail_executor() -> None:
+        thumbnail_executor.shutdown(wait=True, cancel_futures=False)
 
     def require_protect() -> ProtectClient:
         client = build_protect()
@@ -404,14 +455,12 @@ def create_app(
         )
         if not payment:
             return JSONResponse({"ok": True, "ignored": True})
-        protect = build_protect()
         try:
-            sync.ingest_payment(store, payment, protect)
+            txn = await run_in_threadpool(sync.ingest_payment, store, payment, None)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        finally:
-            if protect:
-                protect.close()
+        if txn.get("camera_id"):
+            submit_thumbnail_enrichment(txn["id"])
         return JSONResponse({"ok": True})
 
     # -- static frontend ---------------------------------------------------------

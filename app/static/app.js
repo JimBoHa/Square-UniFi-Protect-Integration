@@ -118,6 +118,15 @@ for (const btn of document.querySelectorAll("nav button[data-view]")) {
 
 // ---------------------------------------------------------------- settings
 
+const loadDeepLinkSettings = createLatestDeepLinkSettingsLoader(
+  () => api("/api/settings/deep-link"),
+  (settings) => applyDeepLinkSettings(
+    $("#deep-link-template"),
+    $("#deep-link-status"),
+    settings,
+  ),
+);
+
 $("#protect-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {
@@ -160,6 +169,7 @@ $("#deep-link-form").addEventListener("submit", async (e) => {
       method: "PUT",
       body: JSON.stringify(deepLinkSettingsRequest($("#deep-link-template"))),
     });
+    loadDeepLinkSettings.invalidate();
     applyDeepLinkSettings(
       $("#deep-link-template"),
       $("#deep-link-status"),
@@ -202,14 +212,7 @@ async function loadSettingsView() {
   const rows = $("#mapping-rows");
   rows.textContent = "";
   let cameras = [], locations = [], mappings = [], devices = [];
-  try {
-    const settings = await api("/api/settings/deep-link");
-    applyDeepLinkSettings(
-      $("#deep-link-template"),
-      $("#deep-link-status"),
-      settings,
-    );
-  } catch { /* Session routing and API errors are handled by api(). */ }
+  loadDeepLinkSettings();
   try { cameras = await api("/api/cameras"); } catch { /* Protect not configured yet */ }
   try { locations = await api("/api/locations"); } catch { /* Square not configured yet */ }
   try { devices = await api("/api/pos-devices"); } catch { /* No observed devices yet */ }

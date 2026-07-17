@@ -16,6 +16,26 @@ function applyDeepLinkSettings(input, status, settings) {
     : `Using built-in default: ${defaultTemplate}`;
 }
 
+function createLatestDeepLinkSettingsLoader(fetchSettings, renderSettings) {
+  let generation = 0;
+  const load = async () => {
+    const currentGeneration = ++generation;
+    let settings;
+    try {
+      settings = await fetchSettings();
+    } catch {
+      return;
+    }
+    if (currentGeneration === generation) renderSettings(settings);
+  };
+  load.invalidate = () => { generation += 1; };
+  return load;
+}
+
 if (typeof module !== "undefined") {
-  module.exports = { applyDeepLinkSettings, deepLinkSettingsRequest };
+  module.exports = {
+    applyDeepLinkSettings,
+    createLatestDeepLinkSettingsLoader,
+    deepLinkSettingsRequest,
+  };
 }

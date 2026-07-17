@@ -7,6 +7,7 @@ const test = require("node:test");
 
 const {
   applyDeepLinkSettings,
+  createLatestDeepLinkSettingsLoader,
   deepLinkSettingsRequest,
 } = require("../app/static/deep-link-form.js");
 
@@ -41,6 +42,40 @@ test("custom settings populate the field and submissions trim outer space", () =
 
   input.value = `  ${custom}  `;
   assert.deepEqual(deepLinkSettingsRequest(input), { template: custom });
+});
+
+test("only the newest deep-link settings load renders", async () => {
+  const pending = [];
+  const rendered = [];
+  const loader = createLatestDeepLinkSettingsLoader(
+    () => new Promise((resolve) => pending.push(resolve)),
+    (settings) => rendered.push(settings.template),
+  );
+
+  const older = loader();
+  const newer = loader();
+  pending[1]({ template: "newer" });
+  await newer;
+  pending[0]({ template: "older" });
+  await older;
+
+  assert.deepEqual(rendered, ["newer"]);
+});
+
+test("saved settings invalidate an older in-flight load", async () => {
+  let resolveLoad;
+  const rendered = [];
+  const loader = createLatestDeepLinkSettingsLoader(
+    () => new Promise((resolve) => { resolveLoad = resolve; }),
+    (settings) => rendered.push(settings.template),
+  );
+
+  const pendingLoad = loader();
+  loader.invalidate();
+  resolveLoad({ template: "stale" });
+  await pendingLoad;
+
+  assert.deepEqual(rendered, []);
 });
 
 test("app loads the form helper before its browser entry point", () => {

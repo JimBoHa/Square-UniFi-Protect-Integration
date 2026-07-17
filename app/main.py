@@ -388,6 +388,7 @@ def create_app(
         try:
             try:
                 locations = client.list_locations()
+                merchant_id = client.merchant_id()
             except SquarePermissionError as exc:
                 raise HTTPException(
                     status_code=403,
@@ -408,8 +409,13 @@ def create_app(
             raise HTTPException(status_code=502, detail=f"Could not reach Square: {exc}")
         finally:
             client.close()
-        store.set_setting("square.access_token", body.access_token, secret=True)
-        store.set_setting("square.environment", body.environment)
+        store.update_settings(
+            {
+                "square.access_token": (body.access_token, True),
+                "square.environment": (body.environment, False),
+                "square.merchant_id": (merchant_id, False),
+            }
+        )
         if body.webhook_signature_key and body.webhook_url:
             store.set_setting(
                 "square.webhook_signature_key", body.webhook_signature_key, secret=True
@@ -566,8 +572,15 @@ def create_app(
 
     @app.post("/webhooks/square")
     async def square_webhook(request: Request) -> JSONResponse:
-        signature_key = store.get_setting("square.webhook_signature_key")
-        webhook_url = store.get_setting("square.webhook_url")
+        square_settings = store.get_settings(
+            (
+                "square.webhook_signature_key",
+                "square.webhook_url",
+                "square.merchant_id",
+            )
+        )
+        signature_key = square_settings["square.webhook_signature_key"]
+        webhook_url = square_settings["square.webhook_url"]
         if not signature_key or not webhook_url:
             raise HTTPException(status_code=403, detail="Webhook not configured")
         body = await request.body()
@@ -580,6 +593,12 @@ def create_app(
             event = _json.loads(body)
         except ValueError:
             raise HTTPException(status_code=422, detail="Invalid JSON payload")
+        if (
+            not isinstance(event, dict)
+            or not square_settings["square.merchant_id"]
+            or event.get("merchant_id") != square_settings["square.merchant_id"]
+        ):
+            return JSONResponse({"ok": True, "ignored": True})
         payment = (
             event.get("data", {}).get("object", {}).get("payment")
             if isinstance(event, dict)

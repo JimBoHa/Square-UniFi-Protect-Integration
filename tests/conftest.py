@@ -16,6 +16,7 @@ PROTECT_PASS = "protect-pass-123"
 PROTECT_API_KEY = "protect-api-key-secret-789"
 PROTECT_ALARM_TRIGGER_ID = "square-completed-sale"
 SQUARE_TOKEN = "sq-test-token-abc123"
+SQUARE_MERCHANT_ID = "MERCHANT_TEST_123"
 ADMIN_PASSWORD = "hunter2-hunter2"
 WEBHOOK_KEY = "whsec_test_key_456"
 WEBHOOK_URL = "https://shop.example.com/webhooks/square"
@@ -126,6 +127,8 @@ def square_handler(request: httpx.Request) -> httpx.Response:
             200,
             json={"locations": [{"id": "LOC1", "name": "Main Store", "status": "ACTIVE"}]},
         )
+    if path == "/v2/merchants/me":
+        return httpx.Response(200, json={"merchant": {"id": SQUARE_MERCHANT_ID}})
     if path == "/v2/payments":
         return httpx.Response(200, json={"payments": SQUARE_PAYMENTS})
     return httpx.Response(404)

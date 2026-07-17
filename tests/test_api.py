@@ -27,6 +27,7 @@ from .conftest import (
     PROTECT_PASS,
     PROTECT_USER,
     SQUARE_TOKEN,
+    SQUARE_MERCHANT_ID,
     WEBHOOK_KEY,
     WEBHOOK_URL,
     protect_handler,
@@ -479,6 +480,7 @@ def make_webhook_event(
     status: str = "COMPLETED",
     created_at: str = "2026-07-16T16:00:00.000Z",
     updated_at: str | None = None,
+    merchant_id: str = SQUARE_MERCHANT_ID,
 ) -> bytes:
     payment = {
         "id": payment_id,
@@ -497,10 +499,24 @@ def make_webhook_event(
         }
     return json.dumps(
         {
+            "merchant_id": merchant_id,
             "type": "payment.updated",
             "data": {"object": {"payment": payment}},
         }
     ).encode()
+
+
+def test_webhook_ignores_payment_for_another_merchant(configured):
+    body = make_webhook_event("PAY_FOREIGN", merchant_id="MERCHANT_FOREIGN")
+    resp = configured.post(
+        "/webhooks/square",
+        content=body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "ignored": True}
+    assert configured.app.state.store.get_transaction("PAY_FOREIGN") is None
 
 
 def _wait_for_thumbnail(client, payment_id: str, timeout: float = 3.0) -> dict:

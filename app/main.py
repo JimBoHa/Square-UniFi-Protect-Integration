@@ -11,7 +11,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -51,6 +51,19 @@ PROTECT_SETTING_KEYS = (
     "protect.alarm_trigger_id",
 )
 MAX_CAMERA_MAPPINGS = 500
+
+
+def _read_thumbnail_bytes(path: Path) -> bytes:
+    """Read an already-resolved evidence file without following a final symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    chunks: list[bytes] = []
+    try:
+        while chunk := os.read(fd, 1024 * 1024):
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
 
 
 # ---------------------------------------------------------------------------
@@ -634,16 +647,27 @@ def create_app(
         return [txn_response(t) for t in rows]
 
     @app.get("/api/thumbnails/{txn_id}")
-    def thumbnail(txn_id: str, _=authed) -> FileResponse:
+    def thumbnail(txn_id: str, _=authed) -> Response:
         txn = store.get_transaction(txn_id)
         if not txn or not txn.get("thumbnail_path"):
             raise HTTPException(status_code=404, detail="No thumbnail for this transaction")
         path = (store.thumbnail_dir / txn["thumbnail_path"]).resolve()
-        if store.thumbnail_dir.resolve() not in path.parents or not path.is_file():
+
+        def missing_thumbnail() -> None:
             if store.requeue_missing_thumbnail(txn_id, txn["thumbnail_path"]):
                 nudge_protect_work_queue()
             raise HTTPException(status_code=404, detail="Thumbnail not found")
-        return FileResponse(path, media_type="image/jpeg")
+
+        if store.thumbnail_dir.resolve() not in path.parents or not path.is_file():
+            missing_thumbnail()
+        try:
+            image = _read_thumbnail_bytes(path)
+        except OSError:
+            # The file can disappear or be atomically replaced after is_file().
+            # Reconcile the durable reference instead of letting a lazy response
+            # fail after headers have already been sent.
+            missing_thumbnail()
+        return Response(content=image, media_type="image/jpeg")
 
     def run_sync() -> int:
         square = build_square()

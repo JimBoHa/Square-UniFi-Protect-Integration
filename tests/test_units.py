@@ -523,6 +523,42 @@ def test_square_pagination_sends_location_filter_on_every_page():
     assert requested_locations == ["LOC1", "LOC1"]
     client.close()
 
+def test_square_payment_update_filters_persist_across_pages():
+    requests = []
+    pages = {
+        None: {"payments": [{"id": "P1"}], "cursor": "next1"},
+        "next1": {"payments": [{"id": "P2"}]},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(dict(request.url.params))
+        cursor = request.url.params.get("cursor")
+        return httpx.Response(200, json=pages[cursor])
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    payments = client.list_payments(
+        updated_at_begin_time="2026-07-16T14:59:00Z",
+        sort_field="UPDATED_AT",
+    )
+    client.close()
+
+    assert [p["id"] for p in payments] == ["P1", "P2"]
+    assert requests == [
+        {
+            "sort_order": "DESC",
+            "limit": "100",
+            "updated_at_begin_time": "2026-07-16T14:59:00Z",
+            "sort_field": "UPDATED_AT",
+        },
+        {
+            "sort_order": "DESC",
+            "limit": "100",
+            "updated_at_begin_time": "2026-07-16T14:59:00Z",
+            "sort_field": "UPDATED_AT",
+            "cursor": "next1",
+        },
+    ]
+
 def test_square_rejects_bad_environment():
     with pytest.raises(ValueError):
         SquareClient("tok", environment="staging")

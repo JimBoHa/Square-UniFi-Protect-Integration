@@ -82,6 +82,8 @@ class SquareClient:
         begin_time: str | None = None,
         limit: int | None = None,
         location_id: str | None = None,
+        updated_at_begin_time: str | None = None,
+        sort_field: str | None = None,
     ) -> list[dict]:
         """Completed and pending payments, newest first, following pagination.
 
@@ -100,6 +102,10 @@ class SquareClient:
                 params["begin_time"] = begin_time
             if location_id:
                 params["location_id"] = location_id
+            if updated_at_begin_time:
+                params["updated_at_begin_time"] = updated_at_begin_time
+            if sort_field:
+                params["sort_field"] = sort_field
             if cursor:
                 params["cursor"] = cursor
             data = self._get("/v2/payments", params=params)

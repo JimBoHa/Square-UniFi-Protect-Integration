@@ -78,7 +78,9 @@ def sync_payments(
             logger.warning("Skipping Square location without an id")
             continue
 
-        latest = store.latest_transaction_ts(location_id=location_id)
+        # Watermark on Square's updated_at so delayed completions, refunds, and
+        # other state changes to older payments are still reconciled.
+        latest = store.latest_transaction_updated_ts(location_id=location_id)
         if latest:
             begin = datetime.fromtimestamp(latest / 1000, tz=timezone.utc) - timedelta(
                 minutes=5
@@ -86,7 +88,10 @@ def sync_payments(
         else:
             begin = datetime.now(tz=timezone.utc) - timedelta(hours=BACKFILL_HOURS)
         payments = square.list_payments(
-            begin_time=begin.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            updated_at_begin_time=begin.isoformat(timespec="seconds").replace(
+                "+00:00", "Z"
+            ),
+            sort_field="UPDATED_AT",
             location_id=location_id,
         )
 

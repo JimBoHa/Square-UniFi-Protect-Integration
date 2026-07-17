@@ -245,6 +245,20 @@ class Store:
                 ).fetchone()
         return row["ts"] if row and row["ts"] is not None else None
 
+    def latest_transaction_updated_ts(self, location_id: str | None = None) -> int | None:
+        with self._lock:
+            if location_id is None:
+                row = self._db.execute(
+                    "SELECT MAX(updated_ts_ms) AS ts FROM transactions"
+                ).fetchone()
+            else:
+                row = self._db.execute(
+                    "SELECT MAX(updated_ts_ms) AS ts FROM transactions "
+                    "WHERE location_id = ?",
+                    (location_id,),
+                ).fetchone()
+        return row["ts"] if row and row["ts"] is not None else None
+
     # -- sessions ----------------------------------------------------------
 
     def create_session(self, token: str) -> None:

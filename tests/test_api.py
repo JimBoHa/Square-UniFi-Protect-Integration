@@ -333,6 +333,41 @@ def test_camera_mapping_accepts_255_character_device_name(configured):
     assert resp.status_code == 200
     assert configured.get("/api/camera-mapping").json()[0]["device_name"] == device_name
 
+
+def test_camera_mapping_save_drains_previously_unmapped_evidence(configured):
+    _wait_for_protect_jobs(configured)
+    configured.app.state.store.upsert_transaction(
+        {
+            "id": "PAY_PENDING_MAPPING",
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "ts_ms": 1784215800000,
+            "amount": 500,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+            "camera_id": None,
+        }
+    )
+
+    resp = configured.put(
+        "/api/camera-mapping",
+        json={
+            "mappings": [
+                {
+                    "location_id": "LOC1",
+                    "camera_id": CAM2,
+                    "camera_name": "Back Door",
+                }
+            ]
+        },
+    )
+
+    assert resp.status_code == 200
+    txn = _wait_for_thumbnail(configured, "PAY_PENDING_MAPPING")
+    assert txn["camera_id"] == CAM2
+    assert configured.get(txn["thumbnail_url"]).status_code == 200
+
+
 def test_camera_preview_returns_jpeg(configured):
     resp = configured.get(f"/api/camera-preview/{CAM1}")
     assert resp.status_code == 200

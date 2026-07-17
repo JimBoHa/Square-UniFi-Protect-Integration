@@ -87,6 +87,10 @@ def test_legacy_location_mapping_migrates_to_device_aware_schema(tmp_path):
     )
     db.commit()
     db.close()
+    thumbnail_dir = data_dir / "thumbnails"
+    thumbnail_dir.mkdir()
+    (thumbnail_dir / "PAY_LEGACY.jpg").write_bytes(b"legacy image")
+    (thumbnail_dir / "PAY_MALFORMED.jpg").write_bytes(b"malformed image")
 
     store = Store(data_dir)
     try:

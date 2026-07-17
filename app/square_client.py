@@ -77,12 +77,22 @@ class SquareClient:
             for loc in data.get("locations", [])
         ]
 
-    def list_payments(self, begin_time: str | None = None, limit: int = 100) -> list[dict]:
-        """Completed and pending payments, newest first, following pagination."""
+    def list_payments(
+        self, begin_time: str | None = None, limit: int | None = None
+    ) -> list[dict]:
+        """Completed and pending payments, newest first, following pagination.
+
+        By default, exhaust all cursor pages.  A positive limit caps the total
+        number of returned payments.
+        """
+        if limit is not None and limit <= 0:
+            raise ValueError("limit must be positive or None")
+
         payments: list[dict] = []
         cursor: str | None = None
         while True:
-            params: dict = {"sort_order": "DESC", "limit": min(limit, 100)}
+            remaining = limit - len(payments) if limit is not None else 100
+            params: dict = {"sort_order": "DESC", "limit": min(remaining, 100)}
             if begin_time:
                 params["begin_time"] = begin_time
             if cursor:
@@ -90,9 +100,9 @@ class SquareClient:
             data = self._get("/v2/payments", params=params)
             payments.extend(data.get("payments", []))
             cursor = data.get("cursor")
-            if not cursor or len(payments) >= limit:
+            if not cursor or (limit is not None and len(payments) >= limit):
                 break
-        return payments[:limit]
+        return payments if limit is None else payments[:limit]
 
 
 def verify_webhook_signature(

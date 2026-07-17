@@ -321,19 +321,45 @@ def test_payment_from_api_uses_selected_currency_with_safe_fallback():
     assert selected_currency["currency"] == "CAD"
     assert base_currency["currency"] == "GBP"
 
-def test_square_pagination_follows_cursor():
+def test_square_pagination_exhausts_cursor_pages_by_default():
+    first_page = [{"id": f"P{i}"} for i in range(100)]
     pages = {
-        None: {"payments": [{"id": "P1"}], "cursor": "next1"},
-        "next1": {"payments": [{"id": "P2"}]},
+        None: {"payments": first_page, "cursor": "next1"},
+        "next1": {"payments": [{"id": "P100"}, {"id": "P101"}]},
     }
+    request_limits = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        request_limits.append(int(request.url.params["limit"]))
         cursor = request.url.params.get("cursor")
         return httpx.Response(200, json=pages[cursor])
 
     client = SquareClient("tok", transport=httpx.MockTransport(handler))
     payments = client.list_payments()
-    assert [p["id"] for p in payments] == ["P1", "P2"]
+    assert [p["id"] for p in payments] == [f"P{i}" for i in range(102)]
+    assert request_limits == [100, 100]
+    client.close()
+
+def test_square_pagination_honors_explicit_total_limit():
+    first_page = [{"id": f"P{i}"} for i in range(100)]
+    pages = {
+        None: {"payments": first_page, "cursor": "next1"},
+        "next1": {
+            "payments": [{"id": f"P{i}"} for i in range(100, 125)],
+            "cursor": "next2",
+        },
+    }
+    request_limits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_limits.append(int(request.url.params["limit"]))
+        cursor = request.url.params.get("cursor")
+        return httpx.Response(200, json=pages[cursor])
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    payments = client.list_payments(limit=125)
+    assert [p["id"] for p in payments] == [f"P{i}" for i in range(125)]
+    assert request_limits == [100, 25]
     client.close()
 
 def test_square_rejects_bad_environment():

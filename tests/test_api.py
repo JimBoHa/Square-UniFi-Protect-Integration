@@ -861,11 +861,8 @@ def test_sparse_payment_update_preserves_device_camera_evidence(configured, monk
         headers={"x-square-hmacsha256-signature": _webhook_signature(sparse_body)},
     )
     assert resp.status_code == 200
-    txn = next(
-        item
-        for item in configured.get("/api/transactions").json()
-        if item["id"] == "PAY_SPARSE"
-    )
+    # The thumbnail attaches asynchronously after the webhook ack.
+    txn = _wait_for_thumbnail(configured, "PAY_SPARSE")
     original_image = configured.get(txn["thumbnail_url"]).content
     assert txn["device_id"] == "TERM_A"
     assert txn["camera_id"] == CAM1

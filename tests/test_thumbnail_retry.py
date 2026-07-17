@@ -461,7 +461,7 @@ def test_retry_file_write_failure_is_caught(tmp_path, monkeypatch):
     def fail_write(_path: Path, _image: bytes):
         raise OSError("disk full")
 
-    monkeypatch.setattr(Path, "write_bytes", fail_write)
+    monkeypatch.setattr("app.sync.write_thumbnail", fail_write)
     try:
         assert retry_missing_thumbnails(store, Protect(), batch_size=1, now=100) == 0
         assert store.get_transaction("P")["thumbnail_path"] is None

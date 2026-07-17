@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sqlite3
 import threading
@@ -75,12 +76,22 @@ CREATE TABLE IF NOT EXISTS sessions (
 class Store:
     def __init__(self, data_dir: Path):
         self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.data_dir, 0o700)
         self.thumbnail_dir = self.data_dir / "thumbnails"
-        self.thumbnail_dir.mkdir(exist_ok=True)
+        self.thumbnail_dir.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(self.thumbnail_dir, 0o700)
+        for path in self.thumbnail_dir.iterdir():
+            if path.is_file() and not path.is_symlink():
+                path.chmod(0o600)
         self.cipher = CredentialCipher(self.data_dir)
+        key_path = self.data_dir / "secret.key"
+        if key_path.is_file() and not key_path.is_symlink():
+            key_path.chmod(0o600)
         self._lock = threading.Lock()
-        self._db = sqlite3.connect(self.data_dir / "spi.db", check_same_thread=False)
+        db_path = self.data_dir / "spi.db"
+        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        os.chmod(db_path, 0o600)
         self._db.row_factory = sqlite3.Row
         with self._lock:
             self._db.executescript(_SCHEMA)

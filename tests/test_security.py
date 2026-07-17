@@ -1,10 +1,14 @@
 """Security tests: authentication, secrets at rest, webhook forgery, traversal."""
 
 import json
+import os
+import stat
 
 import pytest
 
 from app.main import SQUARE_WEBHOOK_MAX_BODY_BYTES
+from app.store import Store
+from app.sync import ingest_payment
 
 from .conftest import ADMIN_PASSWORD, PROTECT_PASS, SQUARE_TOKEN, WEBHOOK_KEY
 from .test_api import make_webhook_event
@@ -23,6 +27,67 @@ PROTECTED_ENDPOINTS = [
     ("PUT", "/api/settings/square"),
     ("POST", "/api/logout"),
 ]
+
+
+def _mode(path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_transaction_data_and_camera_evidence_are_private_with_open_umask(tmp_path):
+    old_umask = os.umask(0)
+    store = None
+    try:
+        store = Store(tmp_path / "data")
+        store.set_camera_mapping("LOC1", "CAM1", "Register")
+
+        class Protect:
+            def get_snapshot(self, camera_id, ts_ms=None):
+                return b"private camera evidence"
+
+        ingest_payment(
+            store,
+            {
+                "id": "PRIVATE",
+                "created_at": "2026-07-16T15:30:00.000Z",
+                "amount_money": {"amount": 100, "currency": "USD"},
+                "status": "COMPLETED",
+                "location_id": "LOC1",
+            },
+            Protect(),
+        )
+    finally:
+        os.umask(old_umask)
+
+    assert store is not None
+    try:
+        txn = store.get_transaction("PRIVATE")
+        assert _mode(store.data_dir) == 0o700
+        assert _mode(store.thumbnail_dir) == 0o700
+        assert _mode(store.data_dir / "spi.db") == 0o600
+        assert _mode(store.data_dir / "secret.key") == 0o600
+        assert _mode(store.thumbnail_dir / txn["thumbnail_path"]) == 0o600
+    finally:
+        store.close()
+
+
+def test_store_hardens_existing_data_permissions(tmp_path):
+    data_dir = tmp_path / "existing"
+    thumbnail_dir = data_dir / "thumbnails"
+    thumbnail_dir.mkdir(parents=True, mode=0o777)
+    image_path = thumbnail_dir / "old.jpg"
+    image_path.write_bytes(b"old evidence")
+    os.chmod(data_dir, 0o777)
+    os.chmod(thumbnail_dir, 0o777)
+    os.chmod(image_path, 0o666)
+
+    store = Store(data_dir)
+    try:
+        assert _mode(data_dir) == 0o700
+        assert _mode(thumbnail_dir) == 0o700
+        assert _mode(image_path) == 0o600
+        assert _mode(data_dir / "spi.db") == 0o600
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("method,path", PROTECTED_ENDPOINTS)

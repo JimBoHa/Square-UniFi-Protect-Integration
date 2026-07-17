@@ -150,7 +150,7 @@ def test_newer_device_correction_requeues_camera_evidence(tmp_path):
         ingest_payment(store, fallback_payment, protect=_ProtectStub())
         original = store.get_transaction("PAY_VERSIONED")
         assert original["camera_id"] == CAMERA_ID
-        assert original["thumbnail_path"] == "PAY_VERSIONED.jpg"
+        assert original["thumbnail_path"].startswith("PAY_VERSIONED-")
 
         # Webhooks persist without a Protect client; the durable queue must
         # replace the fallback evidence on its background pass.
@@ -494,10 +494,10 @@ def test_sync_restart_does_not_skip_older_updates_after_mid_batch_failure(
     store = Store(data_dir)
     original_upsert = store.upsert_transaction
 
-    def fail_on_middle(txn):
+    def fail_on_middle(txn, **kwargs):
         if txn["id"] == "PAY_MIDDLE":
             raise RuntimeError("simulated database interruption")
-        return original_upsert(txn)
+        return original_upsert(txn, **kwargs)
 
     monkeypatch.setattr(store, "upsert_transaction", fail_on_middle)
     try:

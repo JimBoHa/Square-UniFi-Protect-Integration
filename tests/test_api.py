@@ -5,10 +5,12 @@ import concurrent.futures
 import hashlib
 import hmac
 import json
+import sqlite3
 import threading
 import time
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
@@ -877,6 +879,36 @@ def test_square_settings_can_disable_existing_webhook(configured):
         headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
     )
     assert webhook_resp.status_code == 403
+
+
+def test_square_settings_failure_rolls_back_entire_bundle(configured):
+    store = configured.app.state.store
+    keys = (
+        "square.access_token",
+        "square.environment",
+        "square.webhook_signature_key",
+        "square.webhook_url",
+    )
+    before = store.get_settings(keys)
+    store._db.execute(
+        "CREATE TRIGGER reject_webhook_url BEFORE UPDATE ON settings "
+        "WHEN NEW.key = 'square.webhook_url' BEGIN "
+        "SELECT RAISE(ABORT, 'simulated settings failure'); END"
+    )
+    store._db.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="simulated settings failure"):
+        configured.put(
+            "/api/settings/square",
+            json={
+                "access_token": SQUARE_TOKEN,
+                "environment": "sandbox",
+                "webhook_signature_key": "replacement-signature-key",
+                "webhook_url": "https://replacement.example/webhooks/square",
+            },
+        )
+
+    assert store.get_settings(keys) == before
 
 def test_two_pos_devices_map_to_distinct_camera_evidence(configured, monkeypatch):
     snapshot_requests = []

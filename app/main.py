@@ -408,17 +408,26 @@ def create_app(
             raise HTTPException(status_code=502, detail=f"Could not reach Square: {exc}")
         finally:
             client.close()
-        store.set_setting("square.access_token", body.access_token, secret=True)
-        store.set_setting("square.environment", body.environment)
+        settings_updates = {
+            "square.access_token": (body.access_token, True),
+            "square.environment": (body.environment, False),
+        }
+        delete_keys = ()
         if body.webhook_signature_key and body.webhook_url:
-            store.set_setting(
-                "square.webhook_signature_key", body.webhook_signature_key, secret=True
+            settings_updates.update(
+                {
+                    "square.webhook_signature_key": (
+                        body.webhook_signature_key,
+                        True,
+                    ),
+                    "square.webhook_url": (body.webhook_url, False),
+                }
             )
-            store.set_setting("square.webhook_url", body.webhook_url)
         elif body.clear_webhook:
-            store.delete_settings(
+            delete_keys = (
                 "square.webhook_signature_key", "square.webhook_url"
             )
+        store.update_settings(settings_updates, delete_keys=delete_keys)
         # Blank webhook fields without clear_webhook leave any stored webhook
         # configuration untouched, so re-saving the access token is safe.
         return {"ok": True, "locations": locations}

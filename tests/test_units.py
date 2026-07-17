@@ -173,13 +173,15 @@ def test_replace_camera_mappings_rolls_back_on_failure(tmp_path):
         with pytest.raises(sqlite3.IntegrityError):
             store.replace_camera_mappings(
                 [
-                    ("LOC_NEW", "camnew", "New camera"),
-                    ("LOC_BROKEN", None, "Broken camera"),
+                    ("LOC_NEW", "", "", "camnew", "New camera"),
+                    ("LOC_BROKEN", "", "", None, "Broken camera"),
                 ]
             )
         assert store.get_camera_mappings() == [
             {
                 "location_id": "LOC_OLD",
+                "device_id": "",
+                "device_name": "",
                 "camera_id": "camold",
                 "camera_name": "Old camera",
             }

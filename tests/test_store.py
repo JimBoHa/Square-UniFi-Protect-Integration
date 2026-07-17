@@ -288,6 +288,8 @@ def test_store_migrates_legacy_transaction_schema_without_data_loss(tmp_path):
         "raw": '{"legacy": true}',
         "updated_at": created_at,
         "updated_ts_ms": ts_ms,
+        "device_id": "",
+        "device_name": "",
     }
 
 

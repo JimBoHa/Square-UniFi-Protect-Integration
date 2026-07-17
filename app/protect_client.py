@@ -68,14 +68,17 @@ class ProtectClient:
     # -- auth ----------------------------------------------------------------
 
     def login(self) -> None:
-        resp = self._client.post(
-            "/api/auth/login",
-            json={
-                "username": self._username,
-                "password": self._password,
-                "rememberMe": True,
-            },
-        )
+        try:
+            resp = self._client.post(
+                "/api/auth/login",
+                json={
+                    "username": self._username,
+                    "password": self._password,
+                    "rememberMe": True,
+                },
+            )
+        except httpx.RequestError as exc:
+            raise ProtectError("Network error while contacting UniFi Protect") from exc
         if resp.status_code in (401, 403):
             raise ProtectAuthError("UniFi Protect rejected the credentials")
         if resp.status_code >= 400:
@@ -91,13 +94,19 @@ class ProtectClient:
         headers = kwargs.pop("headers", {})
         if self._csrf_token:
             headers["X-CSRF-Token"] = self._csrf_token
-        resp = self._client.request(method, path, headers=headers, **kwargs)
+        try:
+            resp = self._client.request(method, path, headers=headers, **kwargs)
+        except httpx.RequestError as exc:
+            raise ProtectError("Network error while contacting UniFi Protect") from exc
         if resp.status_code == 401:
             # Session expired — log in once more and retry.
             self.login()
             if self._csrf_token:
                 headers["X-CSRF-Token"] = self._csrf_token
-            resp = self._client.request(method, path, headers=headers, **kwargs)
+            try:
+                resp = self._client.request(method, path, headers=headers, **kwargs)
+            except httpx.RequestError as exc:
+                raise ProtectError("Network error while contacting UniFi Protect") from exc
         if resp.status_code >= 400:
             raise ProtectError(
                 f"UniFi Protect request {method} {path} failed (HTTP {resp.status_code})"

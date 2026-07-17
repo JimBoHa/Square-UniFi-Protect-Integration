@@ -38,6 +38,7 @@ SESSION_COOKIE = "spi_session"
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
 WEBHOOK_THUMBNAIL_WORKERS = 2
+WEBHOOK_THUMBNAIL_MAX_PENDING = 32
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +95,7 @@ def create_app(
     thumbnail_jobs: set[str] = set()
     thumbnail_jobs_lock = threading.Lock()
     app.state.thumbnail_executor = thumbnail_executor
+    app.state.thumbnail_jobs = thumbnail_jobs
 
     cookie_secure = os.environ.get("SPI_COOKIE_SECURE", "0") == "1"
     if enable_poller is None:
@@ -147,6 +149,12 @@ def create_app(
         with thumbnail_jobs_lock:
             if txn_id in thumbnail_jobs:
                 return
+            if len(thumbnail_jobs) >= WEBHOOK_THUMBNAIL_MAX_PENDING:
+                logger.warning(
+                    "Thumbnail queue full; deferring payment %s to later sync",
+                    txn_id,
+                )
+                return
             thumbnail_jobs.add(txn_id)
         try:
             future = thumbnail_executor.submit(enrich_webhook_thumbnail, txn_id)
@@ -164,7 +172,7 @@ def create_app(
 
     @app.on_event("shutdown")
     def _shutdown_thumbnail_executor() -> None:
-        thumbnail_executor.shutdown(wait=True, cancel_futures=False)
+        thumbnail_executor.shutdown(wait=True, cancel_futures=True)
 
     def require_protect() -> ProtectClient:
         client = build_protect()

@@ -366,6 +366,81 @@ def test_thumbnail_enrichment_retries_if_camera_changes_in_flight(tmp_path):
         release_snapshot.set()
         store.close()
 
+
+def test_webhook_thumbnail_queue_is_bounded(tmp_path, monkeypatch):
+    max_pending = 4
+    monkeypatch.setattr("app.main.WEBHOOK_THUMBNAIL_MAX_PENDING", max_pending)
+    release_snapshots = threading.Event()
+
+    def blocking_snapshot(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/snapshot"):
+            assert release_snapshots.wait(timeout=10)
+        return protect_handler(request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(blocking_snapshot),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/protect",
+                json={
+                    "host": "192.168.1.1",
+                    "username": PROTECT_USER,
+                    "password": PROTECT_PASS,
+                },
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/square",
+                json={
+                    "access_token": SQUARE_TOKEN,
+                    "environment": "production",
+                    "webhook_signature_key": WEBHOOK_KEY,
+                    "webhook_url": WEBHOOK_URL,
+                },
+            ).status_code == 200
+            assert isolated.put(
+                "/api/camera-mapping",
+                json={
+                    "mappings": [
+                        {
+                            "location_id": "LOC1",
+                            "camera_id": CAM1,
+                            "camera_name": "Front Counter",
+                        }
+                    ]
+                },
+            ).status_code == 200
+
+            for index in range(max_pending + 3):
+                body = make_webhook_event(f"PAY_QUEUE_{index}")
+                response = isolated.post(
+                    "/webhooks/square",
+                    content=body,
+                    headers={
+                        "x-square-hmacsha256-signature": _webhook_signature(body)
+                    },
+                )
+                assert response.status_code == 200
+
+            assert len(app.state.thumbnail_jobs) == max_pending
+            assert len(isolated.get("/api/transactions?limit=500").json()) == (
+                max_pending + 3
+            )
+            release_snapshots.set()
+    finally:
+        release_snapshots.set()
+        app.state.store.close()
+
 def test_webhook_ignores_non_payment_events(configured):
     body = json.dumps({"type": "inventory.count.updated", "data": {}}).encode()
     resp = configured.post(

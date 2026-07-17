@@ -85,6 +85,15 @@ CREATE TABLE IF NOT EXISTS transaction_feed_order_history (
 );
 CREATE INDEX IF NOT EXISTS idx_transaction_feed_history_revision
     ON transaction_feed_order_history (order_revision);
+CREATE TRIGGER IF NOT EXISTS invalidate_transaction_feed_after_delete
+AFTER DELETE ON transactions
+BEGIN
+    DELETE FROM transaction_feed_snapshots;
+    DELETE FROM transaction_feed_order_history;
+    UPDATE transaction_feed_state
+    SET order_revision = order_revision + 1
+    WHERE singleton = 1;
+END;
 CREATE TABLE IF NOT EXISTS thumbnail_retries (
     transaction_id TEXT PRIMARY KEY,
     attempts INTEGER NOT NULL DEFAULT 0,

@@ -784,6 +784,46 @@ def test_transaction_snapshots_bound_multiple_timestamp_versions(
         store.close()
 
 
+def test_transaction_delete_expires_snapshot_before_rowid_reuse(tmp_path):
+    store = Store(tmp_path / "data")
+
+    def transaction(txn_id: str, ts_ms: int) -> dict:
+        return {
+            "id": txn_id,
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "ts_ms": ts_ms,
+            "amount": 100,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        }
+
+    try:
+        store.upsert_transaction(transaction("OLD_ACCOUNT", 100))
+        _page, old_snapshot = store.list_transactions_page(limit=1)
+        with store._lock:
+            old_rowid = store._db.execute(
+                "SELECT rowid FROM transactions WHERE id = 'OLD_ACCOUNT'"
+            ).fetchone()["rowid"]
+            store._db.execute("DELETE FROM transactions")
+            store._db.commit()
+
+        store.upsert_transaction(transaction("NEW_ACCOUNT", 200))
+        with store._lock:
+            new_rowid = store._db.execute(
+                "SELECT rowid FROM transactions WHERE id = 'NEW_ACCOUNT'"
+            ).fetchone()["rowid"]
+
+        assert new_rowid == old_rowid
+        with pytest.raises(TransactionSnapshotExpired):
+            store.list_transactions_page(limit=1, snapshot_id=old_snapshot)
+        fresh_page, fresh_snapshot = store.list_transactions_page(limit=1)
+        assert [txn["id"] for txn in fresh_page] == ["NEW_ACCOUNT"]
+        assert fresh_snapshot > old_snapshot
+    finally:
+        store.close()
+
+
 def test_store_migrates_legacy_fields_and_scrubs_raw_payment(tmp_path):
     data_dir = tmp_path / "legacy"
     data_dir.mkdir()

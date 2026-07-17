@@ -499,7 +499,8 @@ class Store:
                     values,
                 )
                 current = self._db.execute(
-                    "SELECT camera_id, ts_ms, thumbnail_path FROM transactions WHERE id = ?",
+                    "SELECT camera_id, ts_ms, thumbnail_path, status "
+                    "FROM transactions WHERE id = ?",
                     (txn["id"],),
                 ).fetchone()
                 # Evidence changed when the camera or the sale time moved; a
@@ -549,8 +550,9 @@ class Store:
                     enabled_after_ms = None
                 if (
                     enabled_after_ms is not None
-                    and str(txn.get("status", "")).upper() == "COMPLETED"
-                    and int(txn["ts_ms"]) < enabled_after_ms
+                    and current is not None
+                    and str(current["status"]).upper() == "COMPLETED"
+                    and int(current["ts_ms"]) < enabled_after_ms
                 ):
                     self._db.execute(
                         "UPDATE transactions SET alarm_state = ?, "

@@ -521,6 +521,31 @@ def test_alarm_activation_suppresses_later_historical_imports(tmp_path):
         store.close()
 
 
+def test_stale_historical_event_cannot_suppress_live_alarm(tmp_path):
+    store = Store(tmp_path / "data")
+    try:
+        store.update_settings({ALARM_ENABLED_AFTER_SETTING: ("1500", False)})
+        live = _transaction("PAY_LIVE") | {
+            "ts_ms": 2000,
+            "updated_ts_ms": 2000,
+        }
+        stale = _transaction("PAY_LIVE") | {
+            "ts_ms": 1000,
+            "updated_ts_ms": 1000,
+        }
+
+        store.upsert_transaction(live)
+        assert store.get_transaction("PAY_LIVE")["alarm_state"] == "idle"
+
+        store.upsert_transaction(stale)
+        saved = store.get_transaction("PAY_LIVE")
+        assert saved["ts_ms"] == 2000
+        assert saved["updated_ts_ms"] == 2000
+        assert saved["alarm_state"] == "idle"
+    finally:
+        store.close()
+
+
 def test_alarm_activation_watermark_is_set_once_across_settings_saves(tmp_path):
     data_dir = tmp_path / "data"
     first = Store(data_dir)

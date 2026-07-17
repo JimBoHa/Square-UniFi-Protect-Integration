@@ -1027,8 +1027,10 @@ class Store:
                     min(int(snapshot_rowid), (1 << 63) - 1),
                 )
             rows = self._db.execute(
-                "SELECT * FROM transactions WHERE rowid <= ? "
-                "ORDER BY ts_ms DESC, id DESC LIMIT ? OFFSET ?",
+                "SELECT t.*, COALESCE(r.attempts, 0) AS thumbnail_retry_attempts "
+                "FROM transactions t LEFT JOIN thumbnail_retries r "
+                "ON r.transaction_id = t.id WHERE t.rowid <= ? "
+                "ORDER BY t.ts_ms DESC, t.id DESC LIMIT ? OFFSET ?",
                 (snapshot_rowid, limit, offset),
             ).fetchall()
         return [dict(r) for r in rows], snapshot_rowid

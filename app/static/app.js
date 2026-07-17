@@ -351,7 +351,12 @@ function renderTransactions(txns) {
     } else {
       thumb = document.createElement("div");
       thumb.className = "thumb placeholder";
-      thumb.textContent = "no footage";
+      const thumbnailLabels = {
+        unmapped: "camera not mapped",
+        queued: "footage queued",
+        retrying: "capture retrying",
+      };
+      thumb.textContent = thumbnailLabels[txn.thumbnail_status] || "no footage";
     }
 
     const amount = document.createElement("div");

@@ -69,22 +69,38 @@ def sync_payments(
     store: Store, square: SquareClient, protect: ProtectClient | None
 ) -> int:
     """Pull recent Square payments and ingest them. Returns count ingested."""
-    latest = store.latest_transaction_ts()
-    if latest:
-        begin = datetime.fromtimestamp(latest / 1000, tz=timezone.utc) - timedelta(minutes=5)
-    else:
-        begin = datetime.now(tz=timezone.utc) - timedelta(hours=BACKFILL_HOURS)
-    payments = square.list_payments(
-        begin_time=begin.isoformat(timespec="seconds").replace("+00:00", "Z")
-    )
     count = 0
-    for payment in payments:
-        try:
-            _txn, is_new = _ingest_payment_with_status(store, payment, protect)
-            if is_new:
-                count += 1
-        except ValueError as exc:
-            logger.warning("Skipping malformed payment: %s", exc)
+    seen_payment_ids: set[str] = set()
+    for location in square.list_locations():
+        location_id = location.get("id", "")
+        if not location_id:
+            logger.warning("Skipping Square location without an id")
+            continue
+
+        latest = store.latest_transaction_ts(location_id=location_id)
+        if latest:
+            begin = datetime.fromtimestamp(latest / 1000, tz=timezone.utc) - timedelta(
+                minutes=5
+            )
+        else:
+            begin = datetime.now(tz=timezone.utc) - timedelta(hours=BACKFILL_HOURS)
+        payments = square.list_payments(
+            begin_time=begin.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            location_id=location_id,
+        )
+
+        for payment in payments:
+            payment_id = payment.get("id", "")
+            if payment_id and payment_id in seen_payment_ids:
+                continue
+            try:
+                _txn, is_new = _ingest_payment_with_status(store, payment, protect)
+                if is_new:
+                    count += 1
+                if payment_id:
+                    seen_payment_ids.add(payment_id)
+            except ValueError as exc:
+                logger.warning("Skipping malformed payment: %s", exc)
     return count
 
 

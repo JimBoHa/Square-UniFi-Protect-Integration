@@ -932,26 +932,39 @@ def test_snapshot_no_recording_at_ts_raises_instead_of_wrong_frame():
         client.get_snapshot("cam1", ts_ms=1609459200000)
     client.close()
 
-def test_snapshot_falls_back_to_legacy_ts_on_old_firmware():
-    """Old firmware without recording-snapshot returns an HTML 404 for the
-    unknown path; the legacy snapshot endpoint (which honored ts on some of
-    those versions) is used instead."""
-    legacy_params = []
+def test_historical_snapshot_fails_closed_on_old_firmware():
+    """Never attach a live frame when old firmware ignores snapshot?ts."""
+    requested_paths = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/auth/login":
             return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        requested_paths.append(request.url.path)
         if request.url.path.endswith("/recording-snapshot"):
             return httpx.Response(
                 404, content=b"<!DOCTYPE html>", headers={"content-type": "text/html"}
             )
-        legacy_params.append(dict(request.url.params))
-        return httpx.Response(200, content=b"\xff\xd8legacy")
+        return httpx.Response(200, content=b"\xff\xd8live")
 
     client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
-    image = client.get_snapshot("cam1", ts_ms=1609459200000)
-    assert image == b"\xff\xd8legacy"
-    assert legacy_params == [{"w": "640", "ts": "1609459200000"}]
+    with pytest.raises(ProtectError, match="recording-snapshot support"):
+        client.get_snapshot("cam1", ts_ms=1609459200000)
+    assert requested_paths == ["/proxy/protect/api/cameras/cam1/recording-snapshot"]
+    client.close()
+
+
+def test_live_snapshot_still_uses_snapshot_endpoint():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        requests.append((request.url.path, dict(request.url.params)))
+        return httpx.Response(200, content=b"\xff\xd8live")
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    assert client.get_snapshot("cam1") == b"\xff\xd8live"
+    assert requests == [("/proxy/protect/api/cameras/cam1/snapshot", {"w": "640"})]
     client.close()
 
 

@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -26,6 +27,10 @@ THUMBNAIL_RETRY_MAX_DELAY_SECONDS = 60 * 60
 _THUMBNAIL_ERRORS = (ProtectError, httpx.RequestError, ValueError, OSError)
 ALARM_RETRY_BATCH_SIZE = 10
 ALARM_RETRY_NETWORK_TIMEOUT_SECONDS = 5
+
+
+def _current_time_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def parse_ts_ms(created_at: str) -> int:
@@ -396,15 +401,19 @@ def sync_payments(
                 logger.warning("Skipping Square location without an id")
                 continue
 
-            # Watermark on Square's updated_at so delayed completions, refunds,
-            # and other state changes to older payments are still reconciled.
-            latest = store.latest_transaction_updated_ts(location_id=location_id)
-            if latest:
+            # Only completed polls advance this cursor. Transaction rows can be
+            # inserted by webhooks and therefore cannot prove that earlier
+            # Square pages were reconciled.
+            poll_boundary_ms = _current_time_ms()
+            watermark = store.get_square_poll_watermark(location_id)
+            if watermark is not None:
                 begin = datetime.fromtimestamp(
-                    latest / 1000, tz=timezone.utc
+                    watermark / 1000, tz=timezone.utc
                 ) - timedelta(minutes=5)
             else:
-                begin = datetime.now(tz=timezone.utc) - timedelta(hours=BACKFILL_HOURS)
+                begin = datetime.fromtimestamp(
+                    poll_boundary_ms / 1000, tz=timezone.utc
+                ) - timedelta(hours=BACKFILL_HOURS)
             payments = square.list_payments(
                 updated_at_begin_time=begin.isoformat(timespec="seconds").replace(
                     "+00:00", "Z"
@@ -428,6 +437,9 @@ def sync_payments(
                         seen_payment_ids.add(payment_id)
                 except ValueError as exc:
                     logger.warning("Skipping malformed payment: %s", exc)
+            # Set this only after listing every cursor page and processing every
+            # returned payment. Any exception leaves the prior boundary intact.
+            store.advance_square_poll_watermark(location_id, poll_boundary_ms)
     finally:
         # Durable Protect work runs even when Square listing fails, and never
         # contributes to the ingested count: first any pending sale alarms,

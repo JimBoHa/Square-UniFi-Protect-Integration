@@ -437,6 +437,9 @@ def test_sync_polls_old_payment_by_updated_at(tmp_path):
     try:
         ingest_payment(store, old_pending, protect=None)
         ingest_payment(store, recent_payment, protect=None)
+        store.advance_square_poll_watermark(
+            "LOC_OLD", parse_ts_ms("2026-07-16T15:00:00.000Z")
+        )
         assert sync_payments(store, square, protect=None) == 0
         stored = store.get_transaction("PAY_VERSIONED")
     finally:
@@ -527,6 +530,7 @@ def test_sync_restart_does_not_skip_older_updates_after_mid_batch_failure(
     try:
         with pytest.raises(RuntimeError, match="simulated database interruption"):
             sync_payments(store, square, protect=None)
+        assert store.get_square_poll_watermark("LOC_OLD") is None
         assert store.get_transaction("PAY_OLDEST") is not None
         assert store.get_transaction("PAY_MIDDLE") is None
         assert store.get_transaction("PAY_NEWEST") is None
@@ -536,6 +540,7 @@ def test_sync_restart_does_not_skip_older_updates_after_mid_batch_failure(
     restarted_store = Store(data_dir)
     try:
         assert sync_payments(restarted_store, square, protect=None) == 2
+        assert restarted_store.get_square_poll_watermark("LOC_OLD") is not None
         assert all(
             restarted_store.get_transaction(item["id"]) is not None
             for item in payments

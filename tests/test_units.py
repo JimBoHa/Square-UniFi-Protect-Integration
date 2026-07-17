@@ -256,6 +256,12 @@ def test_sync_queries_every_location_with_its_own_watermark(tmp_path):
             payment("OLD_LOC2", "2026-07-10T08:00:00Z", "LOC2"),
             None,
         )
+        store.advance_square_poll_watermark(
+            "LOC1", parse_ts_ms("2026-07-15T12:00:00Z")
+        )
+        store.advance_square_poll_watermark(
+            "LOC2", parse_ts_ms("2026-07-10T08:00:00Z")
+        )
         square = RecordingSquare()
 
         assert sync_payments(store, square, None) == 2
@@ -265,6 +271,165 @@ def test_sync_queries_every_location_with_its_own_watermark(tmp_path):
         ]
         assert store.get_transaction("PAY_LOC1") is not None
         assert store.get_transaction("PAY_LOC2") is not None
+    finally:
+        store.close()
+
+
+def test_webhook_before_first_poll_keeps_full_backfill(tmp_path, monkeypatch):
+    poll_boundary = "2026-07-17T12:00:00Z"
+    poll_boundary_ms = parse_ts_ms(poll_boundary)
+    monkeypatch.setattr("app.sync._current_time_ms", lambda: poll_boundary_ms)
+
+    def payment(payment_id: str, timestamp: str) -> dict:
+        return {
+            "id": payment_id,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "amount_money": {"amount": 100, "currency": "USD"},
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        }
+
+    live_webhook_payment = payment("PAY_LIVE", poll_boundary)
+    backfill_payment = payment("PAY_BACKFILL", "2026-07-16T13:00:00Z")
+
+    class Square:
+        def __init__(self):
+            self.begin_times = []
+
+        def list_locations(self):
+            return [{"id": "LOC1"}]
+
+        def list_payments(self, **params):
+            self.begin_times.append(params["updated_at_begin_time"])
+            return [backfill_payment]
+
+    store = Store(tmp_path / "data")
+    square = Square()
+    try:
+        # This is the webhook path: it stores a recent row without completing
+        # any Square reconciliation window.
+        ingest_payment(store, live_webhook_payment, None)
+        assert store.latest_transaction_updated_ts("LOC1") == poll_boundary_ms
+        assert store.get_square_poll_watermark("LOC1") is None
+
+        assert sync_payments(store, square, None) == 1
+        assert square.begin_times == ["2026-07-16T12:00:00Z"]
+        assert store.get_transaction("PAY_BACKFILL") is not None
+        assert store.get_square_poll_watermark("LOC1") == poll_boundary_ms
+    finally:
+        store.close()
+
+
+def test_quiet_location_watermark_survives_restart(tmp_path, monkeypatch):
+    first_boundary_ms = parse_ts_ms("2026-07-17T12:00:00Z")
+    second_boundary_ms = parse_ts_ms("2026-07-17T12:10:00Z")
+    poll_times = iter([first_boundary_ms, second_boundary_ms])
+    monkeypatch.setattr("app.sync._current_time_ms", lambda: next(poll_times))
+
+    class EmptySquare:
+        def __init__(self):
+            self.begin_times = []
+
+        def list_locations(self):
+            return [{"id": "LOC1"}]
+
+        def list_payments(self, **params):
+            self.begin_times.append(params["updated_at_begin_time"])
+            return []
+
+    data_dir = tmp_path / "data"
+    square = EmptySquare()
+    first_store = Store(data_dir)
+    try:
+        assert sync_payments(first_store, square, None) == 0
+        assert first_store.get_square_poll_watermark("LOC1") == first_boundary_ms
+    finally:
+        first_store.close()
+
+    restarted_store = Store(data_dir)
+    try:
+        assert sync_payments(restarted_store, square, None) == 0
+        assert restarted_store.get_square_poll_watermark("LOC1") == second_boundary_ms
+    finally:
+        restarted_store.close()
+
+    assert square.begin_times == [
+        "2026-07-16T12:00:00Z",
+        "2026-07-17T11:55:00Z",
+    ]
+
+
+def test_later_page_failure_does_not_advance_poll_watermark(
+    tmp_path, monkeypatch
+):
+    original_watermark = parse_ts_ms("2026-07-17T10:00:00Z")
+    failed_boundary = parse_ts_ms("2026-07-17T12:00:00Z")
+    successful_boundary = parse_ts_ms("2026-07-17T12:10:00Z")
+    poll_times = iter([failed_boundary, successful_boundary])
+    monkeypatch.setattr("app.sync._current_time_ms", lambda: next(poll_times))
+
+    def payment(payment_id: str, timestamp: str) -> dict:
+        return {
+            "id": payment_id,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "amount_money": {"amount": 100, "currency": "USD"},
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        }
+
+    first_page_payment = payment("PAY_PAGE_1", "2026-07-17T10:30:00Z")
+    second_page_payment = payment("PAY_PAGE_2", "2026-07-17T11:00:00Z")
+    state = {"fail_second_page": True}
+    begin_times = []
+    payment_cursors = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/locations":
+            return httpx.Response(200, json={"locations": [{"id": "LOC1"}]})
+        cursor = request.url.params.get("cursor")
+        payment_cursors.append(cursor)
+        if cursor is None:
+            begin_times.append(request.url.params["updated_at_begin_time"])
+            return httpx.Response(
+                200,
+                json={"payments": [first_page_payment], "cursor": "next1"},
+            )
+        if state["fail_second_page"]:
+            return httpx.Response(
+                503,
+                json={"errors": [{"code": "SERVICE_UNAVAILABLE"}]},
+            )
+        return httpx.Response(200, json={"payments": [second_page_payment]})
+
+    store = Store(tmp_path / "data")
+    store.advance_square_poll_watermark("LOC1", original_watermark)
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match="HTTP 503"):
+            sync_payments(store, client, None)
+        assert store.get_square_poll_watermark("LOC1") == original_watermark
+
+        state["fail_second_page"] = False
+        sync_payments(store, client, None)
+        assert store.get_transaction("PAY_PAGE_1") is not None
+        assert store.get_transaction("PAY_PAGE_2") is not None
+        assert store.get_square_poll_watermark("LOC1") == successful_boundary
+    finally:
+        client.close()
+        store.close()
+
+    assert begin_times == ["2026-07-17T09:55:00Z"] * 2
+    assert payment_cursors == [None, "next1", None, "next1"]
+
+
+def test_square_poll_watermark_never_moves_backward(tmp_path):
+    store = Store(tmp_path / "data")
+    try:
+        store.advance_square_poll_watermark("LOC1", 2000)
+        store.advance_square_poll_watermark("LOC1", 1000)
+        assert store.get_square_poll_watermark("LOC1") == 2000
     finally:
         store.close()
 

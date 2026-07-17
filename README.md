@@ -57,6 +57,13 @@ URL Protect's own event links use on that version:
 
 ## Quick start
 
+**macOS:** double-click `Start Square Protect.command` in this folder. It sets
+up everything on first run, starts the app, and opens the dashboard in your
+browser. Keep the Terminal window it opens in the background; closing it stops
+the app.
+
+**Any platform (terminal):**
+
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/uvicorn app.main:app --factory --host 0.0.0.0 --port 8000

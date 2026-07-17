@@ -15,9 +15,13 @@ class _ProtectStub:
 
 
 class _SquareStub:
-    def __init__(self, payments):
+    def __init__(self, payments, locations=("LOC_OLD",)):
         self.payments = payments
         self.params = None
+        self.locations = list(locations)
+
+    def list_locations(self):
+        return [{"id": loc} for loc in self.locations]
 
     def list_payments(self, **params):
         self.params = params
@@ -159,14 +163,15 @@ def test_sync_polls_old_payment_by_updated_at(tmp_path):
     try:
         ingest_payment(store, old_pending, protect=None)
         ingest_payment(store, recent_payment, protect=None)
-        assert sync_payments(store, square, protect=None) == 1
+        assert sync_payments(store, square, protect=None) == 0
         stored = store.get_transaction("PAY_VERSIONED")
     finally:
         store.close()
 
     assert square.params == {
-        "updated_at_begin_time": "2026-07-16T14:59:00Z",
+        "updated_at_begin_time": "2026-07-16T14:55:00Z",
         "sort_field": "UPDATED_AT",
+        "location_id": "LOC_OLD",
     }
     assert stored["created_at"] == "2026-06-01T12:00:00.000Z"
     assert stored["updated_at"] == "2026-07-16T15:05:00.000Z"

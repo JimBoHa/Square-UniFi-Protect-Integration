@@ -207,8 +207,9 @@ def test_sync_queries_every_location_with_its_own_watermark(tmp_path):
         def list_locations(self):
             return [{"id": "LOC1"}, {"id": "LOC2"}]
 
-        def list_payments(self, begin_time=None, location_id=None):
-            self.calls.append((location_id, begin_time))
+        def list_payments(self, updated_at_begin_time=None, sort_field=None, location_id=None):
+            assert sort_field == "UPDATED_AT"
+            self.calls.append((location_id, updated_at_begin_time))
             if location_id == "LOC1":
                 return [first_payment]
             return [first_payment, second_payment]
@@ -414,7 +415,7 @@ def test_sync_uses_offline_client_timestamp_for_snapshot(tmp_path):
         def list_locations(self):
             return [{"id": "LOC1"}]
 
-        def list_payments(self, begin_time=None, location_id=None):
+        def list_payments(self, **params):
             return [payment]
 
     class RecordingProtect:
@@ -454,7 +455,7 @@ def test_sync_skips_nonempty_malformed_offline_timestamp(tmp_path):
         def list_locations(self):
             return [{"id": "LOC1"}]
 
-        def list_payments(self, begin_time=None, location_id=None):
+        def list_payments(self, **params):
             return [payment]
 
     store = Store(tmp_path / "data")

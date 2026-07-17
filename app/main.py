@@ -337,7 +337,6 @@ def create_app(
         )
         stored_api_key = stored_alarm_settings["protect.api_key"]
         stored_trigger_id = stored_alarm_settings["protect.alarm_trigger_id"]
-        alarm_was_configured = bool(stored_api_key and stored_trigger_id)
         effective_api_key = submitted_api_key or stored_api_key
         effective_trigger_id = submitted_trigger_id or stored_trigger_id
         if effective_trigger_id and not effective_api_key:
@@ -378,15 +377,11 @@ def create_app(
                 False,
             )
         alarm_is_configured = bool(effective_api_key and effective_trigger_id)
-        alarm_is_newly_enabled = alarm_is_configured and not alarm_was_configured
-        if alarm_is_newly_enabled:
-            settings_updates[ALARM_ENABLED_AFTER_SETTING] = (
-                str(int(time.time() * 1000)),
-                False,
-            )
         store.update_settings(
             settings_updates,
-            suppress_completed_alarms=alarm_is_newly_enabled,
+            activate_alarm_at_ms=(
+                int(time.time() * 1000) if alarm_is_configured else None
+            ),
         )
         return {
             "ok": True,

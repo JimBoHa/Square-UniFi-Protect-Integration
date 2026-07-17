@@ -376,6 +376,87 @@ def test_alarm_activation_suppresses_later_historical_imports(tmp_path):
         store.close()
 
 
+def test_alarm_activation_watermark_is_set_once_across_settings_saves(tmp_path):
+    data_dir = tmp_path / "data"
+    first = Store(data_dir)
+    second = Store(data_dir)
+    alarm_settings = {
+        "protect.api_key": ("api-key", True),
+        "protect.alarm_trigger_id": ("square.completed", False),
+    }
+    try:
+        first.upsert_transaction(_transaction("BEFORE") | {"ts_ms": 1000})
+        assert first.update_settings(
+            alarm_settings, activate_alarm_at_ms=1500
+        ) is True
+        assert first.get_transaction("BEFORE")["alarm_state"] == "sent"
+
+        first.upsert_transaction(_transaction("AFTER") | {"ts_ms": 2000})
+        # This models a second request that began validation before the first
+        # committed. Its stale decision cannot advance the activation boundary.
+        assert second.update_settings(
+            alarm_settings, activate_alarm_at_ms=2500
+        ) is False
+        assert second.get_setting(ALARM_ENABLED_AFTER_SETTING) == "1500"
+        assert second.get_transaction("AFTER")["alarm_state"] == "idle"
+    finally:
+        second.close()
+        first.close()
+
+
+def test_alarm_disable_then_reenable_sets_a_new_watermark(tmp_path):
+    store = Store(tmp_path / "data")
+    alarm_settings = {
+        "protect.api_key": ("api-key", True),
+        "protect.alarm_trigger_id": ("square.completed", False),
+    }
+    try:
+        assert store.update_settings(
+            alarm_settings, activate_alarm_at_ms=1500
+        ) is True
+        store.update_settings(
+            {},
+            delete_keys=(
+                "protect.api_key",
+                "protect.alarm_trigger_id",
+                ALARM_ENABLED_AFTER_SETTING,
+            ),
+            suppress_completed_alarms=True,
+        )
+        assert store.get_setting(ALARM_ENABLED_AFTER_SETTING) is None
+
+        store.upsert_transaction(_transaction("WHILE_DISABLED") | {"ts_ms": 2500})
+        assert store.update_settings(
+            alarm_settings, activate_alarm_at_ms=3000
+        ) is True
+        assert store.get_setting(ALARM_ENABLED_AFTER_SETTING) == "3000"
+        assert store.get_transaction("WHILE_DISABLED")["alarm_state"] == "sent"
+        store.upsert_transaction(_transaction("AFTER_REENABLE") | {"ts_ms": 3500})
+        assert store.get_transaction("AFTER_REENABLE")["alarm_state"] == "idle"
+    finally:
+        store.close()
+
+
+def test_store_upgrades_configured_alarm_without_watermark(tmp_path):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    store.update_settings(
+        {
+            "protect.api_key": ("api-key", True),
+            "protect.alarm_trigger_id": ("square.completed", False),
+        }
+    )
+    store.upsert_transaction(_transaction("PRE_UPGRADE"))
+    store.close()
+
+    reopened = Store(data_dir)
+    try:
+        assert reopened.get_setting(ALARM_ENABLED_AFTER_SETTING) is not None
+        assert reopened.get_transaction("PRE_UPGRADE")["alarm_state"] == "sent"
+    finally:
+        reopened.close()
+
+
 def test_alarm_retry_runs_when_square_listing_fails(tmp_path):
     class UnavailableSquare:
         def list_payments(self, **_kwargs):
@@ -391,7 +472,12 @@ def test_alarm_retry_runs_when_square_listing_fails(tmp_path):
     store = Store(tmp_path / "data")
     protect = RecordingProtect()
     try:
-        store.upsert_transaction(_transaction("PAY_RETRY_DURING_OUTAGE"))
+        store.upsert_transaction(
+            _transaction("PAY_RETRY_DURING_OUTAGE_1") | {"ts_ms": 1000}
+        )
+        store.upsert_transaction(
+            _transaction("PAY_RETRY_DURING_OUTAGE_2") | {"ts_ms": 2000}
+        )
         with pytest.raises(RuntimeError, match="Square unavailable"):
             sync_payments(
                 store,
@@ -399,7 +485,8 @@ def test_alarm_retry_runs_when_square_listing_fails(tmp_path):
                 protect,
                 alarm_trigger_id="square.completed",
             )
-        assert store.get_transaction("PAY_RETRY_DURING_OUTAGE")["alarm_state"] == "sent"
+        assert store.get_transaction("PAY_RETRY_DURING_OUTAGE_1")["alarm_state"] == "sent"
+        assert store.get_transaction("PAY_RETRY_DURING_OUTAGE_2")["alarm_state"] == "idle"
         assert len(protect.timeouts) == 1
         assert 0 < protect.timeouts[0] <= 5
     finally:

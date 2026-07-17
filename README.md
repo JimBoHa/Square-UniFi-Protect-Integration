@@ -78,7 +78,7 @@ the `deep_link_template` key in the settings table; the default is
 
 > **Alarm delivery semantics:** each completed transaction is atomically claimed
 > and marked delivered after Protect accepts the trigger. Failed requests are
-> released for retry by the next poll or duplicate webhook. On startup and retry
+> released for retry by a later poll or duplicate webhook. On startup and retry
 > scans, expired in-progress claims are also released. If a request times out or the
 > process crashes after Protect accepts a trigger but before delivery state is
 > saved, that sale can trigger the alarm again; the Protect endpoint does not

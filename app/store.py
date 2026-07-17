@@ -137,14 +137,17 @@ class Store:
         updates: dict[str, tuple[str, bool]],
         delete_keys: tuple[str, ...] = (),
         suppress_completed_alarms: bool = False,
-    ) -> None:
-        """Apply related settings changes in one database transaction."""
+        activate_alarm_at_ms: int | None = None,
+    ) -> bool:
+        """Apply settings atomically; return whether alarm activation occurred."""
         stored_updates = [
             (key, self.cipher.encrypt(value) if secret else value, int(secret))
             for key, (value, secret) in updates.items()
         ]
+        alarm_activated = False
         with self._lock:
             try:
+                self._db.execute("BEGIN IMMEDIATE")
                 for key in delete_keys:
                     self._db.execute("DELETE FROM settings WHERE key = ?", (key,))
                 self._db.executemany(
@@ -153,7 +156,34 @@ class Store:
                     "encrypted=excluded.encrypted",
                     stored_updates,
                 )
-                if suppress_completed_alarms:
+                if activate_alarm_at_ms is not None:
+                    configured_keys = {
+                        row["key"]
+                        for row in self._db.execute(
+                            "SELECT key FROM settings WHERE key IN (?, ?, ?)",
+                            (
+                                "protect.api_key",
+                                "protect.alarm_trigger_id",
+                                ALARM_ENABLED_AFTER_SETTING,
+                            ),
+                        ).fetchall()
+                    }
+                    if {
+                        "protect.api_key",
+                        "protect.alarm_trigger_id",
+                    }.issubset(configured_keys) and (
+                        ALARM_ENABLED_AFTER_SETTING not in configured_keys
+                    ):
+                        self._db.execute(
+                            "INSERT INTO settings (key, value, encrypted) "
+                            "VALUES (?, ?, 0)",
+                            (
+                                ALARM_ENABLED_AFTER_SETTING,
+                                str(int(activate_alarm_at_ms)),
+                            ),
+                        )
+                        alarm_activated = True
+                if suppress_completed_alarms or alarm_activated:
                     self._db.execute(
                         "UPDATE transactions SET alarm_state = ?, "
                         "alarm_claim_token = NULL, alarm_claimed_at = NULL "
@@ -164,6 +194,7 @@ class Store:
             except Exception:
                 self._db.rollback()
                 raise
+        return alarm_activated
 
     def get_setting(self, key: str) -> str | None:
         return self.get_settings((key,))[key]

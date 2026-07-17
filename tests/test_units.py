@@ -8,9 +8,15 @@ import httpx
 import pytest
 
 from app.deeplink import build_deep_link
-from app.protect_client import ProtectAuthError, ProtectClient, validate_camera_id, validate_host
+from app.protect_client import (
+    ProtectAuthError,
+    ProtectClient,
+    ProtectError,
+    validate_camera_id,
+    validate_host,
+)
 from app.security import CredentialCipher, hash_password, verify_password
-from app.square_client import SquareClient, verify_webhook_signature
+from app.square_client import SquareClient, SquareError, verify_webhook_signature
 from app.sync import parse_ts_ms, safe_thumbnail_name
 
 from .conftest import PROTECT_PASS, PROTECT_USER, protect_handler
@@ -158,6 +164,35 @@ def test_protect_bad_credentials():
         client.get_cameras()
     client.close()
 
+
+def test_protect_login_transport_error_is_normalized():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("sensitive connection details", request=request)
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    with pytest.raises(ProtectError) as exc_info:
+        client.get_cameras()
+    assert str(exc_info.value) == "Network error while contacting UniFi Protect"
+    assert "sensitive connection details" not in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, httpx.RequestError)
+    client.close()
+
+
+def test_protect_request_transport_error_is_normalized():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        raise httpx.ReadTimeout("sensitive timeout details", request=request)
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    with pytest.raises(ProtectError) as exc_info:
+        client.get_cameras()
+    assert str(exc_info.value) == "Network error while contacting UniFi Protect"
+    assert "sensitive timeout details" not in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, httpx.RequestError)
+    client.close()
+
+
 def test_protect_snapshot_passes_timestamp():
     client = ProtectClient(
         "unifi.local", PROTECT_USER, PROTECT_PASS,
@@ -205,3 +240,16 @@ def test_square_pagination_follows_cursor():
 def test_square_rejects_bad_environment():
     with pytest.raises(ValueError):
         SquareClient("tok", environment="staging")
+
+
+def test_square_transport_error_is_normalized():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("sensitive Square connection details", request=request)
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    with pytest.raises(SquareError) as exc_info:
+        client.list_locations()
+    assert str(exc_info.value) == "Network error while contacting Square"
+    assert "sensitive Square connection details" not in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, httpx.RequestError)
+    client.close()

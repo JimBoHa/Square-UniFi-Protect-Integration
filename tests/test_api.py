@@ -5,6 +5,11 @@ import hashlib
 import hmac
 import json
 
+import httpx
+from fastapi.testclient import TestClient
+
+from app.main import create_app
+
 from .conftest import (
     ADMIN_PASSWORD,
     PROTECT_PASS,
@@ -12,6 +17,8 @@ from .conftest import (
     SQUARE_TOKEN,
     WEBHOOK_KEY,
     WEBHOOK_URL,
+    protect_handler,
+    square_handler,
 )
 
 CAM1 = "cam1aaaaaaaaaaaaaaaaaaaaa"
@@ -84,6 +91,64 @@ def test_square_settings_success(authed):
     assert resp.json()["locations"] == [
         {"id": "LOC1", "name": "Main Store", "status": "ACTIVE"}
     ]
+
+
+def test_protect_settings_transport_error_returns_502(tmp_path):
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("sensitive upstream details", request=request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(unavailable),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+            assert isolated.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
+            resp = isolated.put(
+                "/api/settings/protect",
+                json={
+                    "host": "192.168.1.1",
+                    "username": PROTECT_USER,
+                    "password": PROTECT_PASS,
+                },
+            )
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == (
+            "Could not reach UniFi Protect: Network error while contacting UniFi Protect"
+        )
+        assert "sensitive upstream details" not in resp.text
+    finally:
+        app.state.store.close()
+
+
+def test_square_settings_transport_error_returns_502(tmp_path):
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("sensitive upstream details", request=request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(protect_handler),
+        square_transport=httpx.MockTransport(unavailable),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+            assert isolated.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
+            resp = isolated.put(
+                "/api/settings/square",
+                json={"access_token": SQUARE_TOKEN, "environment": "production"},
+            )
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == (
+            "Could not reach Square: Network error while contacting Square"
+        )
+        assert "sensitive upstream details" not in resp.text
+    finally:
+        app.state.store.close()
 
 
 # -- cameras, locations, POS camera selection ------------------------------------------
@@ -162,6 +227,60 @@ def test_transactions_without_camera_mapping_still_listed(authed):
     txns = authed.get("/api/transactions").json()
     assert all(t["thumbnail_url"] is None for t in txns)
     assert all(t["deep_link"] is None for t in txns)
+
+
+def test_snapshot_transport_error_stores_transaction_without_thumbnail(tmp_path):
+    def snapshot_unavailable(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/snapshot"):
+            raise httpx.ReadTimeout("sensitive snapshot details", request=request)
+        return protect_handler(request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(snapshot_unavailable),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+            assert isolated.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
+            assert isolated.put(
+                "/api/settings/protect",
+                json={
+                    "host": "192.168.1.1",
+                    "username": PROTECT_USER,
+                    "password": PROTECT_PASS,
+                },
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/square",
+                json={"access_token": SQUARE_TOKEN, "environment": "production"},
+            ).status_code == 200
+            assert isolated.put(
+                "/api/camera-mapping",
+                json={
+                    "mappings": [
+                        {
+                            "location_id": "LOC1",
+                            "camera_id": CAM1,
+                            "camera_name": "Front Counter",
+                        }
+                    ]
+                },
+            ).status_code == 200
+
+            sync_resp = isolated.post("/api/sync")
+            txns = isolated.get("/api/transactions").json()
+
+        assert sync_resp.status_code == 200
+        assert sync_resp.json()["ingested"] == 2
+        assert len(txns) == 2
+        assert all(txn["camera_id"] == CAM1 for txn in txns)
+        assert all(txn["thumbnail_url"] is None for txn in txns)
+        assert all(txn["deep_link"] is not None for txn in txns)
+    finally:
+        app.state.store.close()
 
 def test_thumbnail_missing_returns_404(configured):
     assert configured.get("/api/thumbnails/NOPE").status_code == 404

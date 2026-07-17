@@ -50,7 +50,10 @@ class SquareClient:
         self._client.close()
 
     def _get(self, path: str, params: dict | None = None) -> dict:
-        resp = self._client.get(path, params=params)
+        try:
+            resp = self._client.get(path, params=params)
+        except httpx.RequestError as exc:
+            raise SquareError("Network error while contacting Square") from exc
         if resp.status_code == 401:
             raise SquareAuthError("Square rejected the access token")
         if resp.status_code >= 400:

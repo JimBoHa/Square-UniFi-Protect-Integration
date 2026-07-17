@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import threading
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,22 @@ def safe_thumbnail_name(payment_id: str) -> str:
     if not cleaned:
         raise ValueError("Payment id yields no safe filename")
     return f"{cleaned}.jpg"
+
+
+def write_thumbnail(path, image: bytes) -> None:
+    """Write private camera evidence regardless of the process umask."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(image)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("Could not write thumbnail")
+            view = view[written:]
+    finally:
+        os.close(fd)
 
 
 def retry_thumbnail_name(
@@ -102,7 +119,7 @@ def _ingest_payment_with_status(
         try:
             image = protect.get_snapshot(txn["camera_id"], ts_ms=txn["ts_ms"])
             name = safe_thumbnail_name(txn["id"])
-            (store.thumbnail_dir / name).write_bytes(image)
+            write_thumbnail(store.thumbnail_dir / name, image)
             txn["thumbnail_path"] = name
         except _THUMBNAIL_ERRORS as exc:
             logger.warning("Thumbnail capture failed for %s: %s", txn["id"], exc)
@@ -147,7 +164,7 @@ def retry_missing_thumbnails(
                 job["lease_token"],
             )
             path = store.thumbnail_dir / name
-            path.write_bytes(image)
+            write_thumbnail(path, image)
             attached = store.complete_thumbnail_retry(
                 job["transaction_id"],
                 job["lease_token"],

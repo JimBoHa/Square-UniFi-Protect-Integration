@@ -132,6 +132,18 @@ class Store:
             self._db.execute("DELETE FROM camera_map")
             self._db.commit()
 
+    def replace_camera_mappings(
+        self, mappings: list[tuple[str, str, str]]
+    ) -> None:
+        """Replace every camera mapping in one SQLite transaction."""
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM camera_map")
+            self._db.executemany(
+                "INSERT INTO camera_map (location_id, camera_id, camera_name) "
+                "VALUES (?, ?, ?)",
+                mappings,
+            )
+
     # -- transactions ------------------------------------------------------
 
     def upsert_transaction(self, txn: dict) -> bool:

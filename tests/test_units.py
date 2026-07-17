@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import hmac
+import sqlite3
 
 import httpx
 import pytest
@@ -22,6 +23,7 @@ from app.square_client import (
     SquarePermissionError,
     verify_webhook_signature,
 )
+from app.store import Store
 from app.sync import parse_ts_ms, safe_thumbnail_name
 
 from .conftest import PROTECT_PASS, PROTECT_USER, protect_handler
@@ -125,6 +127,27 @@ def test_safe_thumbnail_name_sanitizes():
 def test_safe_thumbnail_name_rejects_empty():
     with pytest.raises(ValueError):
         safe_thumbnail_name("../../..")
+
+def test_replace_camera_mappings_rolls_back_on_failure(tmp_path):
+    store = Store(tmp_path / "data")
+    try:
+        store.set_camera_mapping("LOC_OLD", "camold", "Old camera")
+        with pytest.raises(sqlite3.IntegrityError):
+            store.replace_camera_mappings(
+                [
+                    ("LOC_NEW", "camnew", "New camera"),
+                    ("LOC_BROKEN", None, "Broken camera"),
+                ]
+            )
+        assert store.get_camera_mappings() == [
+            {
+                "location_id": "LOC_OLD",
+                "camera_id": "camold",
+                "camera_name": "Old camera",
+            }
+        ]
+    finally:
+        store.close()
 
 
 # -- Square webhook signature ------------------------------------------------------

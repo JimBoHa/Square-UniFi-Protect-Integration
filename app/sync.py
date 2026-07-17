@@ -300,6 +300,9 @@ def sync_payments(
                     "+00:00", "Z"
                 ),
                 sort_field="UPDATED_AT",
+                # Keep the durable watermark behind any unprocessed result if
+                # ingestion is interrupted partway through the response.
+                sort_order="ASC",
                 location_id=location_id,
             )
 

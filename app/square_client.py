@@ -84,20 +84,23 @@ class SquareClient:
         location_id: str | None = None,
         updated_at_begin_time: str | None = None,
         sort_field: str | None = None,
+        sort_order: str = "DESC",
     ) -> list[dict]:
-        """Completed and pending payments, newest first, following pagination.
+        """Completed and pending payments in the requested order, following pagination.
 
         By default, exhaust all cursor pages.  A positive limit caps the total
         number of returned payments.
         """
         if limit is not None and limit <= 0:
             raise ValueError("limit must be positive or None")
+        if sort_order not in {"ASC", "DESC"}:
+            raise ValueError("sort_order must be 'ASC' or 'DESC'")
 
         payments: list[dict] = []
         cursor: str | None = None
         while True:
             remaining = limit - len(payments) if limit is not None else 100
-            params: dict = {"sort_order": "DESC", "limit": min(remaining, 100)}
+            params: dict = {"sort_order": sort_order, "limit": min(remaining, 100)}
             if begin_time:
                 params["begin_time"] = begin_time
             if location_id:

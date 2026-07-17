@@ -44,10 +44,7 @@ def evidence_thumbnail_name(txn_id: str, camera_id: str, ts_ms: int) -> str:
 
 
 def ingest_payment(
-    store: Store,
-    payment: dict,
-    protect: ProtectClient | None,
-    alarm_trigger_id: str | None = None,
+    store: Store, payment: dict, protect: ProtectClient | None
 ) -> dict:
     """Store one Square payment; capture a Protect thumbnail if possible."""
     txn = payment_from_api(payment)
@@ -72,7 +69,6 @@ def ingest_payment(
             logger.warning("Thumbnail capture failed for %s: %s", txn["id"], exc)
 
     store.upsert_transaction(txn)
-    _trigger_completed_alarm(store, txn["id"], protect, alarm_trigger_id)
     return txn
 
 
@@ -115,11 +111,13 @@ def enrich_transaction_thumbnail(
     return False
 
 
-def _trigger_completed_alarm(
+def deliver_completed_alarm(
     store: Store,
     txn_id: str,
     protect: ProtectClient | None,
     alarm_trigger_id: str | None,
+    *,
+    timeout: float | None = None,
 ) -> bool:
     """Best-effort Alarm Manager delivery after the transaction is durable."""
     if protect is None or not alarm_trigger_id:
@@ -133,7 +131,7 @@ def _trigger_completed_alarm(
         return True
 
     try:
-        protect.trigger_alarm(alarm_trigger_id)
+        protect.trigger_alarm(alarm_trigger_id, timeout=timeout)
     except Exception as exc:
         try:
             store.release_alarm_claim(txn_id, claim_token)
@@ -183,9 +181,16 @@ def _retry_pending_alarms(
     """Drain durable work after Square ingestion, stopping on first failure."""
     deadline = time.monotonic() + ALARM_RETRY_BUDGET_SECONDS
     for txn_id in txn_ids:
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             break
-        if not _trigger_completed_alarm(store, txn_id, protect, alarm_trigger_id):
+        if not deliver_completed_alarm(
+            store,
+            txn_id,
+            protect,
+            alarm_trigger_id,
+            timeout=remaining,
+        ):
             break
 
 
@@ -197,37 +202,40 @@ def sync_payments(
 ) -> int:
     """Pull recent Square payments and ingest them. Returns count ingested."""
     previously_pending = _load_pending_alarm_ids(store, protect, alarm_trigger_id)
-    latest = store.latest_transaction_ts()
-    if latest:
-        begin = datetime.fromtimestamp(latest / 1000, tz=timezone.utc) - timedelta(minutes=5)
-    else:
-        begin = datetime.now(tz=timezone.utc) - timedelta(hours=BACKFILL_HOURS)
-    payments = square.list_payments(
-        begin_time=begin.isoformat(timespec="seconds").replace("+00:00", "Z")
-    )
     count = 0
-    for payment in payments:
-        try:
-            ingest_payment(
-                store,
-                payment,
-                protect,
-                alarm_trigger_id=None,
+    try:
+        latest = store.latest_transaction_ts()
+        if latest:
+            begin = datetime.fromtimestamp(latest / 1000, tz=timezone.utc) - timedelta(
+                minutes=5
             )
-            count += 1
-        except ValueError as exc:
-            logger.warning("Skipping malformed payment: %s", exc)
-    pending_after_ingest = _load_pending_alarm_ids(store, protect, alarm_trigger_id)
-    prior_ids = set(previously_pending)
-    retry_ids = previously_pending + [
-        txn_id for txn_id in pending_after_ingest if txn_id not in prior_ids
-    ]
-    _retry_pending_alarms(
-        store,
-        protect,
-        alarm_trigger_id,
-        retry_ids[:100],
-    )
+        else:
+            begin = datetime.now(tz=timezone.utc) - timedelta(hours=BACKFILL_HOURS)
+        payments = square.list_payments(
+            begin_time=begin.isoformat(timespec="seconds").replace("+00:00", "Z")
+        )
+        for payment in payments:
+            try:
+                ingest_payment(store, payment, protect)
+                count += 1
+            except ValueError as exc:
+                logger.warning("Skipping malformed payment: %s", exc)
+    finally:
+        # Alarm delivery is durable work, independent of Square availability
+        # and the current payment-list window.
+        pending_after_ingest = _load_pending_alarm_ids(
+            store, protect, alarm_trigger_id
+        )
+        prior_ids = set(previously_pending)
+        retry_ids = previously_pending + [
+            txn_id for txn_id in pending_after_ingest if txn_id not in prior_ids
+        ]
+        _retry_pending_alarms(
+            store,
+            protect,
+            alarm_trigger_id,
+            retry_ids[:100],
+        )
     return count
 
 

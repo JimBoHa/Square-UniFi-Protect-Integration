@@ -116,15 +116,24 @@ $("#protect-form").addEventListener("submit", async (e) => {
         verify_ssl: $("#protect-verify-ssl").checked,
         api_key: $("#protect-api-key").value.trim(),
         alarm_trigger_id: $("#protect-alarm-trigger-id").value.trim(),
-        disable_alarm: $("#protect-disable-alarm").checked,
       }),
     });
     $("#protect-password").value = "";
     $("#protect-api-key").value = "";
-    $("#protect-disable-alarm").checked = false;
     const alarm = result.alarm_configured ? " Alarm trigger enabled." : "";
     message(`Connected to UniFi Protect (${result.cameras} cameras found).${alarm}`, "ok");
     loadSettingsView();
+  } catch (err) {
+    message(err.message, "error");
+  }
+});
+
+$("#protect-disable-alarm").addEventListener("click", async () => {
+  try {
+    await api("/api/settings/protect/alarm", { method: "DELETE" });
+    $("#protect-api-key").value = "";
+    $("#protect-alarm-trigger-id").value = "";
+    message("Protect alarm trigger disabled.", "ok");
   } catch (err) {
     message(err.message, "error");
   }

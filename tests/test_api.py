@@ -135,21 +135,13 @@ def test_protect_alarm_settings_verify_and_encrypt_api_key(authed, tmp_path):
 def test_protect_alarm_settings_can_be_disabled(authed):
     _enable_alarm(authed)
 
-    resp = authed.put(
-        "/api/settings/protect",
-        json={
-            "host": "192.168.1.1",
-            "username": PROTECT_USER,
-            "password": PROTECT_PASS,
-            "disable_alarm": True,
-        },
-    )
+    resp = authed.delete("/api/settings/protect/alarm")
     assert resp.status_code == 200
     assert resp.json()["alarm_configured"] is False
     assert authed.app.state.store.get_setting("protect.api_key") is None
     assert authed.app.state.store.get_setting("protect.alarm_trigger_id") is None
 
-def test_protect_settings_reject_malformed_alarm_trigger(authed):
+def test_protect_settings_reject_control_characters_in_alarm_trigger(authed):
     resp = authed.put(
         "/api/settings/protect",
         json={
@@ -157,7 +149,7 @@ def test_protect_settings_reject_malformed_alarm_trigger(authed):
             "username": PROTECT_USER,
             "password": PROTECT_PASS,
             "api_key": PROTECT_API_KEY,
-            "alarm_trigger_id": "../trigger?all=true",
+            "alarm_trigger_id": "trigger\nall",
         },
     )
     assert resp.status_code == 422
@@ -303,6 +295,20 @@ def _wait_for_thumbnail(client, payment_id: str, timeout: float = 3.0) -> dict:
     raise AssertionError(f"thumbnail enrichment did not finish for {payment_id}")
 
 
+def _wait_for_alarm_state(
+    client, payment_id: str, state: str, timeout: float = 3.0
+) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        txn = client.app.state.store.get_transaction(payment_id)
+        if txn and txn["alarm_state"] == state:
+            return txn
+        time.sleep(0.01)
+    raise AssertionError(
+        f"alarm state for {payment_id} did not become {state}"
+    )
+
+
 def test_webhook_stores_payment_then_enriches_thumbnail(configured):
     body = make_webhook_event()
     resp = configured.post(
@@ -397,6 +403,73 @@ def test_webhook_ack_and_transaction_listing_do_not_wait_for_snapshot(tmp_path):
             assert isolated.get(txn["thumbnail_url"]).status_code == 200
     finally:
         release_snapshot.set()
+        app.state.store.close()
+
+
+def test_webhook_ack_does_not_wait_for_alarm_delivery(tmp_path):
+    alarm_started = threading.Event()
+    release_alarm = threading.Event()
+
+    def blocking_alarm(request: httpx.Request) -> httpx.Response:
+        if "/alarm-manager/webhook/" in request.url.path:
+            alarm_started.set()
+            if not release_alarm.wait(timeout=10):
+                raise httpx.ReadTimeout("alarm test timed out", request=request)
+        return protect_handler(request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(blocking_alarm),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/protect",
+                json={
+                    "host": "192.168.1.1",
+                    "username": PROTECT_USER,
+                    "password": PROTECT_PASS,
+                    "api_key": PROTECT_API_KEY,
+                    "alarm_trigger_id": PROTECT_ALARM_TRIGGER_ID,
+                },
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/square",
+                json={
+                    "access_token": SQUARE_TOKEN,
+                    "environment": "production",
+                    "webhook_signature_key": WEBHOOK_KEY,
+                    "webhook_url": WEBHOOK_URL,
+                },
+            ).status_code == 200
+
+            body = make_webhook_event("PAY_ALARM_BLOCKED")
+            response = isolated.post(
+                "/webhooks/square",
+                content=body,
+                headers={
+                    "x-square-hmacsha256-signature": _webhook_signature(body)
+                },
+            )
+            assert response.status_code == 200
+            assert alarm_started.wait(timeout=3)
+            assert not release_alarm.is_set()
+            assert (
+                isolated.app.state.store.get_transaction("PAY_ALARM_BLOCKED")
+                is not None
+            )
+            release_alarm.set()
+            _wait_for_alarm_state(isolated, "PAY_ALARM_BLOCKED", "sent")
+    finally:
+        release_alarm.set()
         app.state.store.close()
 
 
@@ -585,6 +658,7 @@ def test_pending_payment_triggers_when_it_becomes_completed(configured):
         content=completed,
         headers={"x-square-hmacsha256-signature": _webhook_signature(completed)},
     ).status_code == 200
+    _wait_for_alarm_state(configured, "PAY_TRANSITION", "sent")
     assert PROTECT_ALARM_CALLS == [PROTECT_ALARM_TRIGGER_ID]
 
 def test_alarm_failure_persists_transaction_and_retries(configured):
@@ -594,9 +668,13 @@ def test_alarm_failure_persists_transaction_and_retries(configured):
     headers = {"x-square-hmacsha256-signature": _webhook_signature(body)}
 
     assert configured.post("/webhooks/square", content=body, headers=headers).status_code == 200
-    transaction = configured.app.state.store.get_transaction("PAY_RETRY")
+    transaction = _wait_for_alarm_state(configured, "PAY_RETRY", "idle")
+    deadline = time.monotonic() + 3
+    while not PROTECT_ALARM_CALLS and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert transaction is not None
     assert transaction["alarm_state"] == "idle"
+    assert PROTECT_ALARM_CALLS
 
     assert configured.post("/api/sync").status_code == 200
     assert configured.app.state.store.get_transaction("PAY_RETRY")["alarm_state"] == "sent"

@@ -125,9 +125,10 @@ class Store:
                 )
                 if suppress_completed_alarms:
                     self._db.execute(
-                        "UPDATE transactions SET alarm_state = ? "
-                        "WHERE UPPER(status) = 'COMPLETED' AND alarm_state = ?",
-                        (ALARM_SENT, ALARM_IDLE),
+                        "UPDATE transactions SET alarm_state = ?, "
+                        "alarm_claim_token = NULL, alarm_claimed_at = NULL "
+                        "WHERE UPPER(status) = 'COMPLETED' AND alarm_state != ?",
+                        (ALARM_SENT, ALARM_SENT),
                     )
                 self._db.commit()
             except Exception:

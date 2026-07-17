@@ -8,12 +8,12 @@ historical timestamp), and official API-key Alarm Manager triggers.
 from __future__ import annotations
 
 import re
+from urllib.parse import quote
 
 import httpx
 
 HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?(?::\d{1,5})?$")
 CAMERA_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
-ALARM_TRIGGER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 class ProtectError(Exception):
@@ -44,9 +44,11 @@ def validate_camera_id(camera_id: str) -> str:
 def validate_alarm_trigger_id(trigger_id: str) -> str:
     """Validate a user-defined Alarm Manager webhook path segment."""
     trigger_id = (trigger_id or "").strip()
-    if not ALARM_TRIGGER_ID_RE.fullmatch(trigger_id):
+    if not trigger_id or len(trigger_id) > 256 or any(
+        ord(char) < 32 or ord(char) == 127 for char in trigger_id
+    ):
         raise ValueError(
-            "Alarm trigger id must be 1-64 letters, numbers, underscores, or hyphens"
+            "Alarm trigger id must be 1-256 characters without control characters"
         )
     return trigger_id
 
@@ -181,10 +183,13 @@ class ProtectClient:
             raise ProtectError("UniFi Protect integration metadata was invalid")
         return data
 
-    def trigger_alarm(self, trigger_id: str) -> None:
+    def trigger_alarm(self, trigger_id: str, timeout: float | None = None) -> None:
         """Send a user-defined webhook trigger to Protect Alarm Manager."""
         trigger_id = validate_alarm_trigger_id(trigger_id)
+        request_options = {"timeout": timeout} if timeout is not None else {}
         self._integration_request(
             "POST",
-            f"/proxy/protect/integration/v1/alarm-manager/webhook/{trigger_id}",
+            "/proxy/protect/integration/v1/alarm-manager/webhook/"
+            f"{quote(trigger_id, safe='')}",
+            **request_options,
         )

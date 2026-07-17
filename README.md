@@ -45,7 +45,8 @@ Open `http://<host>:8000`, then:
    Manager → Settings → API Keys and enter it with the ID of a matching Alarm
    Manager webhook trigger. The key is verified against Protect's official local
    integration API before it is saved. Leave alarm fields blank to retain saved
-   values, or use the disable checkbox to remove them.
+   values, or use the disable button to remove them locally even when the
+   Protect console is unavailable.
 3. **Settings → Square account** — a Square access token
    (Developer Dashboard → your application → Credentials). Optionally add your
    webhook signature key and notification URL for real-time ingestion

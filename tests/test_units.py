@@ -21,7 +21,7 @@ from app.protect_client import (
 from app.security import CredentialCipher, hash_password, verify_password
 from app.square_client import SquareClient, verify_webhook_signature
 from app.store import Store
-from app.sync import parse_ts_ms, safe_thumbnail_name
+from app.sync import parse_ts_ms, safe_thumbnail_name, sync_payments
 
 from .conftest import PROTECT_PASS, PROTECT_USER, protect_handler
 
@@ -90,14 +90,23 @@ def test_validate_camera_id_rejects(cam):
     with pytest.raises(ValueError):
         validate_camera_id(cam)
 
-@pytest.mark.parametrize("trigger_id", ["sale", "Square_Sale-01", "A" * 64])
-def test_validate_alarm_trigger_id_accepts_safe_path_segment(trigger_id):
+@pytest.mark.parametrize(
+    "trigger_id",
+    [
+        "sale",
+        "Square_Sale-01",
+        "square.completed",
+        "sale/other",
+        "sale?all=1",
+        "sale space",
+        "A" * 256,
+    ],
+)
+def test_validate_alarm_trigger_id_accepts_user_defined_value(trigger_id):
     assert validate_alarm_trigger_id(trigger_id) == trigger_id
 
-@pytest.mark.parametrize(
-    "trigger_id", ["", "../sale", "sale/other", "sale?all=1", "sale space", "A" * 65]
-)
-def test_validate_alarm_trigger_id_rejects_unsafe_path_segment(trigger_id):
+@pytest.mark.parametrize("trigger_id", ["", "sale\nother", "sale\x7fother", "A" * 257])
+def test_validate_alarm_trigger_id_rejects_invalid_value(trigger_id):
     with pytest.raises(ValueError):
         validate_alarm_trigger_id(trigger_id)
 
@@ -209,7 +218,13 @@ def test_protect_official_api_uses_key_without_legacy_login():
     requests = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append((request.method, request.url.path, request.headers.get("x-api-key")))
+        requests.append(
+            (
+                request.method,
+                request.url.raw_path.decode(),
+                request.headers.get("x-api-key"),
+            )
+        )
         if request.url.path.endswith("/meta/info"):
             return httpx.Response(200, json={"applicationVersion": "7.1.87"})
         return httpx.Response(204)
@@ -222,7 +237,7 @@ def test_protect_official_api_uses_key_without_legacy_login():
         transport=httpx.MockTransport(handler),
     )
     assert client.get_integration_info() == {"applicationVersion": "7.1.87"}
-    client.trigger_alarm("square-sale")
+    client.trigger_alarm("square.completed/sale?all=1")
     client.close()
 
     assert requests == [
@@ -233,7 +248,8 @@ def test_protect_official_api_uses_key_without_legacy_login():
         ),
         (
             "POST",
-            "/proxy/protect/integration/v1/alarm-manager/webhook/square-sale",
+            "/proxy/protect/integration/v1/alarm-manager/webhook/"
+            "square.completed%2Fsale%3Fall%3D1",
             "api-key",
         ),
     ]
@@ -342,6 +358,36 @@ def test_store_migrates_alarm_state_without_replaying_completed_rows(tmp_path):
         assert store.claim_alarm_trigger("OLD") is None
         store.upsert_transaction(_transaction("NEW"))
         assert store.claim_alarm_trigger("NEW") is not None
+    finally:
+        store.close()
+
+
+def test_alarm_retry_runs_when_square_listing_fails(tmp_path):
+    class UnavailableSquare:
+        def list_payments(self, **_kwargs):
+            raise RuntimeError("Square unavailable")
+
+    class RecordingProtect:
+        def __init__(self):
+            self.timeouts = []
+
+        def trigger_alarm(self, _trigger_id, timeout=None):
+            self.timeouts.append(timeout)
+
+    store = Store(tmp_path / "data")
+    protect = RecordingProtect()
+    try:
+        store.upsert_transaction(_transaction("PAY_RETRY_DURING_OUTAGE"))
+        with pytest.raises(RuntimeError, match="Square unavailable"):
+            sync_payments(
+                store,
+                UnavailableSquare(),
+                protect,
+                alarm_trigger_id="square.completed",
+            )
+        assert store.get_transaction("PAY_RETRY_DURING_OUTAGE")["alarm_state"] == "sent"
+        assert len(protect.timeouts) == 1
+        assert 0 < protect.timeouts[0] <= 5
     finally:
         store.close()
 

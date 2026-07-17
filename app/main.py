@@ -66,7 +66,7 @@ class ProtectSettingsBody(BaseModel):
     password: str
     verify_ssl: bool = False
     api_key: str = Field(default="", max_length=512)
-    alarm_trigger_id: str = Field(default="", max_length=64)
+    alarm_trigger_id: str = Field(default="", max_length=256)
     disable_alarm: bool = False
 
 class SquareSettingsBody(BaseModel):
@@ -105,6 +105,7 @@ def create_app(
         thread_name_prefix="spi-webhook-thumbnail",
     )
     thumbnail_jobs: set[str] = set()
+    thumbnail_jobs_dirty: set[str] = set()
     thumbnail_jobs_lock = threading.Lock()
     app.state.thumbnail_executor = thumbnail_executor
     app.state.thumbnail_jobs = thumbnail_jobs
@@ -145,13 +146,23 @@ def create_app(
         protect = None
         try:
             txn = store.get_transaction(txn_id)
-            if not txn or txn.get("thumbnail_path") or not txn.get("camera_id"):
+            if not txn:
                 return
-            protect = build_protect()
+            protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
+            protect = build_protect(protect_settings)
             if protect is not None:
-                sync.enrich_transaction_thumbnail(store, txn_id, protect)
+                # Alarm delivery is durable and goes first; a slow legacy
+                # snapshot request must not delay the sale automation.
+                sync.deliver_completed_alarm(
+                    store,
+                    txn_id,
+                    protect,
+                    protect_settings["protect.alarm_trigger_id"],
+                )
+                if txn.get("camera_id") and not txn.get("thumbnail_path"):
+                    sync.enrich_transaction_thumbnail(store, txn_id, protect)
         except Exception:
-            logger.exception("Webhook thumbnail enrichment failed for payment %s", txn_id)
+            logger.exception("Webhook Protect enrichment failed for payment %s", txn_id)
         finally:
             if protect is not None:
                 try:
@@ -162,10 +173,13 @@ def create_app(
     def submit_thumbnail_enrichment(txn_id: str) -> None:
         with thumbnail_jobs_lock:
             if txn_id in thumbnail_jobs:
+                # A newer webhook arrived while this payment was being
+                # processed. Coalesce it into one follow-up pass.
+                thumbnail_jobs_dirty.add(txn_id)
                 return
             if len(thumbnail_jobs) >= WEBHOOK_THUMBNAIL_MAX_PENDING:
                 logger.warning(
-                    "Thumbnail queue full; deferring payment %s to later sync",
+                    "Protect work queue full; deferring payment %s to later sync",
                     txn_id,
                 )
                 return
@@ -175,12 +189,16 @@ def create_app(
         except RuntimeError:
             with thumbnail_jobs_lock:
                 thumbnail_jobs.discard(txn_id)
-            logger.warning("Thumbnail executor unavailable for payment %s", txn_id)
+            logger.warning("Protect work executor unavailable for payment %s", txn_id)
             return
 
         def job_done(_future) -> None:
             with thumbnail_jobs_lock:
                 thumbnail_jobs.discard(txn_id)
+                rerun = txn_id in thumbnail_jobs_dirty
+                thumbnail_jobs_dirty.discard(txn_id)
+            if rerun:
+                submit_thumbnail_enrichment(txn_id)
 
         future.add_done_callback(job_done)
 
@@ -280,8 +298,26 @@ def create_app(
 
     # -- settings --------------------------------------------------------------
 
+    def clear_protect_alarm_settings() -> dict:
+        store.update_settings(
+            {},
+            delete_keys=("protect.api_key", "protect.alarm_trigger_id"),
+            suppress_completed_alarms=True,
+        )
+        return {"ok": True, "alarm_configured": False}
+
+    @app.delete("/api/settings/protect/alarm")
+    def delete_protect_alarm(_=authed) -> dict:
+        """Disable alarms locally even when the Protect console is offline."""
+        return clear_protect_alarm_settings()
+
     @app.put("/api/settings/protect")
     def set_protect(body: ProtectSettingsBody, _=authed) -> dict:
+        if body.disable_alarm:
+            return {
+                **clear_protect_alarm_settings(),
+                "cameras": None,
+            }
         try:
             host = validate_host(body.host)
             submitted_trigger_id = (
@@ -298,12 +334,8 @@ def create_app(
         stored_api_key = stored_alarm_settings["protect.api_key"]
         stored_trigger_id = stored_alarm_settings["protect.alarm_trigger_id"]
         alarm_was_configured = bool(stored_api_key and stored_trigger_id)
-        if body.disable_alarm:
-            effective_api_key = None
-            effective_trigger_id = None
-        else:
-            effective_api_key = submitted_api_key or stored_api_key
-            effective_trigger_id = submitted_trigger_id or stored_trigger_id
+        effective_api_key = submitted_api_key or stored_api_key
+        effective_trigger_id = submitted_trigger_id or stored_trigger_id
         if effective_trigger_id and not effective_api_key:
             raise HTTPException(
                 status_code=422,
@@ -334,21 +366,16 @@ def create_app(
             "protect.password": (body.password, True),
             "protect.verify_ssl": ("1" if body.verify_ssl else "0", False),
         }
-        delete_keys: tuple[str, ...] = ()
-        if body.disable_alarm:
-            delete_keys = ("protect.api_key", "protect.alarm_trigger_id")
-        else:
-            if submitted_api_key:
-                settings_updates["protect.api_key"] = (submitted_api_key, True)
-            if submitted_trigger_id:
-                settings_updates["protect.alarm_trigger_id"] = (
-                    submitted_trigger_id,
-                    False,
-                )
+        if submitted_api_key:
+            settings_updates["protect.api_key"] = (submitted_api_key, True)
+        if submitted_trigger_id:
+            settings_updates["protect.alarm_trigger_id"] = (
+                submitted_trigger_id,
+                False,
+            )
         alarm_is_configured = bool(effective_api_key and effective_trigger_id)
         store.update_settings(
             settings_updates,
-            delete_keys=delete_keys,
             suppress_completed_alarms=(
                 alarm_is_configured and not alarm_was_configured
             ),
@@ -538,8 +565,7 @@ def create_app(
             txn = await run_in_threadpool(sync.ingest_payment, store, payment, None)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        if txn.get("camera_id"):
-            submit_thumbnail_enrichment(txn["id"])
+        submit_thumbnail_enrichment(txn["id"])
         return JSONResponse({"ok": True})
 
     # -- static frontend ---------------------------------------------------------

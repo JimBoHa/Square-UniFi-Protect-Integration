@@ -5,11 +5,17 @@ import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from app.store import Store
-from app.sync import ingest_payment, parse_ts_ms, sync_payments
+from app.sync import (
+    ingest_payment,
+    parse_ts_ms,
+    retry_missing_thumbnails,
+    sync_payments,
+)
 
 CAMERA_ID = "cam1aaaaaaaaaaaaaaaaaaaaa"
 
@@ -314,6 +320,149 @@ def test_newer_timestamp_recaptures_camera_evidence(tmp_path):
     assert stored["ts_ms"] == corrected_ts_ms
     assert stored["camera_id"] == CAMERA_ID
     assert image == f"snapshot:{CAMERA_ID}:{corrected_ts_ms}".encode()
+
+
+def test_timestamp_correction_deletes_superseded_retry_thumbnail(tmp_path):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC_OLD", CAMERA_ID, "Front Counter")
+    original = _payment(
+        "2026-07-16T15:01:00.000Z",
+        amount=500,
+        currency="USD",
+        status="PENDING",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/pending",
+    )
+    corrected = _payment(
+        "2026-07-16T15:02:00.000Z",
+        amount=500,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/completed",
+    )
+    corrected["created_at"] = "2026-07-16T08:30:00.000Z"
+
+    try:
+        ingest_payment(store, original, protect=None)
+        assert retry_missing_thumbnails(store, _ProtectStub(), now=100) == 1
+        old_name = store.get_transaction("PAY_VERSIONED")["thumbnail_path"]
+        old_path = store.thumbnail_dir / old_name
+        assert old_path.is_file()
+
+        ingest_payment(store, corrected, protect=_ProtectStub())
+
+        saved = store.get_transaction("PAY_VERSIONED")
+        assert saved["thumbnail_path"] != old_name
+        assert not old_path.exists()
+        assert (store.thumbnail_dir / saved["thumbnail_path"]).is_file()
+    finally:
+        store.close()
+
+
+def _stored_thumbnail(
+    txn_id: str,
+    ts_ms: int,
+    updated_ts_ms: int,
+    thumbnail_path: str,
+) -> dict:
+    timestamp = "2026-07-16T15:00:00.000Z"
+    return {
+        "id": txn_id,
+        "created_at": timestamp,
+        "ts_ms": ts_ms,
+        "updated_at": timestamp,
+        "updated_ts_ms": updated_ts_ms,
+        "amount": 500,
+        "currency": "USD",
+        "status": "COMPLETED",
+        "location_id": "LOC_OLD",
+        "camera_id": CAMERA_ID,
+        "thumbnail_path": thumbnail_path,
+    }
+
+
+def test_superseded_thumbnail_cleanup_preserves_shared_reference(tmp_path):
+    store = Store(tmp_path / "data")
+    shared_path = store.thumbnail_dir / "shared.jpg"
+    replacement_path = store.thumbnail_dir / "replacement.jpg"
+    shared_path.write_bytes(b"shared")
+    replacement_path.write_bytes(b"replacement")
+    try:
+        store.upsert_transaction(_stored_thumbnail("PAY_A", 1000, 1000, "shared.jpg"))
+        store.upsert_transaction(_stored_thumbnail("PAY_B", 1000, 1000, "shared.jpg"))
+
+        store.upsert_transaction(
+            _stored_thumbnail("PAY_A", 2000, 2000, "replacement.jpg")
+        )
+
+        assert shared_path.is_file()
+        assert store.get_transaction("PAY_B")["thumbnail_path"] == "shared.jpg"
+    finally:
+        store.close()
+
+
+def test_superseded_thumbnail_cleanup_preserves_newer_race_winner(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    racing_store = Store(data_dir)
+    old_path = store.thumbnail_dir / "old.jpg"
+    old_path.write_bytes(b"old")
+    (store.thumbnail_dir / "replacement.jpg").write_bytes(b"replacement")
+    store.upsert_transaction(_stored_thumbnail("PAY_A", 1000, 1000, "old.jpg"))
+    unlink_if_unreferenced = store._unlink_thumbnail_if_unreferenced
+
+    def install_newer_winner(thumbnail_path: str) -> bool:
+        racing_store.upsert_transaction(
+            _stored_thumbnail("PAY_A", 3000, 3000, thumbnail_path)
+        )
+        return unlink_if_unreferenced(thumbnail_path)
+
+    monkeypatch.setattr(
+        store, "_unlink_thumbnail_if_unreferenced", install_newer_winner
+    )
+    try:
+        store.upsert_transaction(
+            _stored_thumbnail("PAY_A", 2000, 2000, "replacement.jpg")
+        )
+
+        assert old_path.is_file()
+        assert racing_store.get_transaction("PAY_A")["thumbnail_path"] == "old.jpg"
+    finally:
+        store.close()
+        racing_store.close()
+
+
+def test_superseded_thumbnail_delete_failure_does_not_rollback_update(
+    tmp_path, monkeypatch, caplog
+):
+    store = Store(tmp_path / "data")
+    old_path = store.thumbnail_dir / "old.jpg"
+    old_path.write_bytes(b"old")
+    (store.thumbnail_dir / "replacement.jpg").write_bytes(b"replacement")
+    store.upsert_transaction(_stored_thumbnail("PAY_A", 1000, 1000, "old.jpg"))
+    unlink = Path.unlink
+
+    def fail_old_thumbnail(path: Path, *args, **kwargs):
+        if path == old_path:
+            raise OSError("disk is read-only")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_old_thumbnail)
+    try:
+        store.upsert_transaction(
+            _stored_thumbnail("PAY_A", 2000, 2000, "replacement.jpg")
+        )
+
+        assert store.get_transaction("PAY_A")["thumbnail_path"] == "replacement.jpg"
+        assert old_path.is_file()
+        assert "Could not delete superseded thumbnail 'old.jpg'" in caplog.text
+    finally:
+        store.close()
 
 
 def test_store_migrates_legacy_transaction_schema_without_data_loss(tmp_path):

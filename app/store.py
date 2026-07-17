@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -11,6 +12,8 @@ import time
 from pathlib import Path
 
 from .security import CredentialCipher, hash_session_token
+
+logger = logging.getLogger("spi.store")
 
 SESSION_TTL_SECONDS = 12 * 3600
 ALARM_IDLE = "idle"
@@ -475,12 +478,14 @@ class Store:
         }
         values["updated_at"] = txn.get("updated_at") or txn["created_at"]
         values["updated_ts_ms"] = txn.get("updated_ts_ms", txn["ts_ms"])
+        superseded_thumbnail: str | None = None
 
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 existing = self._db.execute(
-                    "SELECT id, camera_id, ts_ms FROM transactions WHERE id = ?",
+                    "SELECT id, camera_id, ts_ms, thumbnail_path "
+                    "FROM transactions WHERE id = ?",
                     (txn["id"],),
                 ).fetchone()
                 self._db.execute(
@@ -513,6 +518,13 @@ class Store:
                     "SELECT camera_id, ts_ms, thumbnail_path FROM transactions WHERE id = ?",
                     (txn["id"],),
                 ).fetchone()
+                if (
+                    existing
+                    and existing["thumbnail_path"]
+                    and current
+                    and current["thumbnail_path"] != existing["thumbnail_path"]
+                ):
+                    superseded_thumbnail = existing["thumbnail_path"]
                 # Evidence changed when the camera or the sale time moved; a
                 # changed job must retry immediately instead of waiting out a
                 # backoff earned by different evidence.
@@ -573,7 +585,51 @@ class Store:
             except Exception:
                 self._db.rollback()
                 raise
+        if superseded_thumbnail:
+            try:
+                self._unlink_thumbnail_if_unreferenced(superseded_thumbnail)
+            except Exception as exc:
+                # Evidence replacement already committed. Cleanup failure must
+                # not turn a durable Square update into an API/sync failure.
+                logger.warning(
+                    "Could not delete superseded thumbnail %r: %s",
+                    superseded_thumbnail,
+                    exc,
+                )
         return existing is None
+
+    def _unlink_thumbnail_if_unreferenced(self, thumbnail_path: str) -> bool:
+        """Delete a local thumbnail only while no transaction references it."""
+        relative_path = Path(thumbnail_path)
+        if relative_path.name != thumbnail_path:
+            logger.warning(
+                "Refusing to delete non-local thumbnail path %r", thumbnail_path
+            )
+            return False
+        path = (self.thumbnail_dir / relative_path).resolve()
+        if self.thumbnail_dir.resolve() not in path.parents:
+            logger.warning(
+                "Refusing to delete thumbnail outside data directory %r",
+                thumbnail_path,
+            )
+            return False
+
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                referenced = self._db.execute(
+                    "SELECT 1 FROM transactions WHERE thumbnail_path = ? LIMIT 1",
+                    (thumbnail_path,),
+                ).fetchone()
+                if referenced:
+                    self._db.commit()
+                    return False
+                path.unlink(missing_ok=True)
+                self._db.commit()
+                return True
+            except Exception:
+                self._db.rollback()
+                raise
 
     def claim_thumbnail_retries(
         self,

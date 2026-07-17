@@ -156,18 +156,25 @@ $("#protect-disable-alarm").addEventListener("click", async () => {
 $("#square-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {
+    const webhookFields = squareWebhookRequestFields(
+      $("#square-webhook-key"),
+      $("#square-webhook-url"),
+      $("#square-clear-webhook"),
+    );
     const result = await api("/api/settings/square", {
       method: "PUT",
       body: JSON.stringify({
         access_token: $("#square-token").value.trim(),
         environment: $("#square-env").value,
-        webhook_signature_key: $("#square-webhook-key").value.trim(),
-        webhook_url: $("#square-webhook-url").value.trim(),
-        clear_webhook: $("#square-clear-webhook").checked,
+        ...webhookFields,
       }),
     });
     $("#square-token").value = "";
-    $("#square-webhook-key").value = "";
+    resetSquareWebhookFields(
+      $("#square-webhook-key"),
+      $("#square-webhook-url"),
+      $("#square-clear-webhook"),
+    );
     message(`Connected to Square (${result.locations.length} locations).`, "ok");
     loadSettingsView();
   } catch (err) {

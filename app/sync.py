@@ -39,6 +39,23 @@ def safe_thumbnail_name(payment_id: str) -> str:
     return f"{cleaned}.jpg"
 
 
+def versioned_thumbnail_name(
+    payment_id: str,
+    camera_id: str,
+    ts_ms: int,
+    updated_ts_ms: int,
+) -> str:
+    """Collision-resistant filename for one Square evidence version."""
+    cleaned = _SAFE_ID_RE.sub("", payment_id)[:48]
+    if not cleaned:
+        raise ValueError("Payment id yields no safe filename")
+    evidence = (
+        f"{payment_id}\0{camera_id}\0{int(ts_ms)}\0{int(updated_ts_ms)}".encode()
+    )
+    digest = hashlib.sha256(evidence).hexdigest()[:24]
+    return f"{cleaned}-{int(ts_ms)}-{digest}.jpg"
+
+
 def retry_thumbnail_name(
     payment_id: str,
     camera_id: str,
@@ -79,6 +96,7 @@ def _ingest_payment_with_status(
     stale_event = bool(existing and txn["updated_ts_ms"] < existing["updated_ts_ms"])
     ts_unchanged = bool(existing and existing["ts_ms"] == txn["ts_ms"])
 
+    captured_path = None
     if (
         existing
         and existing.get("camera_id")
@@ -101,13 +119,45 @@ def _ingest_payment_with_status(
         # overlap page.
         try:
             image = protect.get_snapshot(txn["camera_id"], ts_ms=txn["ts_ms"])
-            name = safe_thumbnail_name(txn["id"])
-            (store.thumbnail_dir / name).write_bytes(image)
+            name = versioned_thumbnail_name(
+                txn["id"],
+                txn["camera_id"],
+                txn["ts_ms"],
+                txn["updated_ts_ms"],
+            )
+            captured_path = store.thumbnail_dir / name
+            captured_path.write_bytes(image)
             txn["thumbnail_path"] = name
         except _THUMBNAIL_ERRORS as exc:
             logger.warning("Thumbnail capture failed for %s: %s", txn["id"], exc)
 
-    return txn, store.upsert_transaction(txn)
+    try:
+        is_new = store.upsert_transaction(txn)
+    except Exception:
+        if captured_path is not None:
+            try:
+                captured_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "Could not remove unattached thumbnail %s: %s",
+                    captured_path,
+                    exc,
+                )
+        raise
+
+    if captured_path is not None:
+        stored = store.get_transaction(txn["id"])
+        if not stored or stored.get("thumbnail_path") != captured_path.name:
+            try:
+                captured_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "Could not remove superseded thumbnail %s: %s",
+                    captured_path,
+                    exc,
+                )
+
+    return txn, is_new
 
 
 def ingest_payment(

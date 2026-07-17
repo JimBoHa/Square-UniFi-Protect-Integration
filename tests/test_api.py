@@ -834,6 +834,91 @@ def test_webhook_burst_acks_immediately_and_queue_drains_all(tmp_path):
         release_snapshots.set()
         app.state.store.close()
 
+
+def test_single_coalesced_webhook_drain_exhausts_due_batches(tmp_path):
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(protect_handler),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    release_executor = threading.Event()
+    executor_blocked = threading.Event()
+
+    def block_executor() -> None:
+        executor_blocked.set()
+        assert release_executor.wait(timeout=10)
+
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/protect",
+                json={
+                    "host": "192.168.1.1",
+                    "username": PROTECT_USER,
+                    "password": PROTECT_PASS,
+                    "api_key": PROTECT_API_KEY,
+                    "alarm_trigger_id": PROTECT_ALARM_TRIGGER_ID,
+                },
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/square",
+                json={
+                    "access_token": SQUARE_TOKEN,
+                    "environment": "production",
+                    "webhook_signature_key": WEBHOOK_KEY,
+                    "webhook_url": WEBHOOK_URL,
+                },
+            ).status_code == 200
+            assert isolated.put(
+                "/api/camera-mapping",
+                json={
+                    "mappings": [
+                        {
+                            "location_id": "LOC1",
+                            "camera_id": CAM1,
+                            "camera_name": "Front Counter",
+                        }
+                    ]
+                },
+            ).status_code == 200
+
+            blocker = isolated.app.state.thumbnail_executor.submit(block_executor)
+            assert executor_blocked.wait(timeout=3)
+
+            payment_ids = [f"PAY_BATCH_{index:02d}" for index in range(11)]
+            for payment_id in payment_ids:
+                body = make_webhook_event(
+                    payment_id, created_at="2099-07-16T16:00:00.000Z"
+                )
+                response = isolated.post(
+                    "/webhooks/square",
+                    content=body,
+                    headers={
+                        "x-square-hmacsha256-signature": _webhook_signature(body)
+                    },
+                )
+                assert response.status_code == 200
+
+            assert isolated.app.state.thumbnail_drain_queued is True
+            release_executor.set()
+            blocker.result(timeout=3)
+
+            for payment_id in payment_ids:
+                _wait_for_thumbnail(isolated, payment_id)
+                _wait_for_alarm_state(isolated, payment_id, "sent")
+            _wait_for_protect_jobs(isolated)
+            assert PROTECT_ALARM_CALLS == [PROTECT_ALARM_TRIGGER_ID] * 11
+    finally:
+        release_executor.set()
+        app.state.store.close()
+
 def test_square_settings_resave_leaves_webhook_config_untouched(configured):
     store = configured.app.state.store
     resp = configured.put(

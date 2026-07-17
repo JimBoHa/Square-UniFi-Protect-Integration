@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import os
 import secrets
+import tempfile
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -36,16 +37,40 @@ class CredentialCipher:
         if env_key:
             return env_key.encode()
         key_path = data_dir / KEY_FILENAME
-        if key_path.exists():
+        try:
             return key_path.read_bytes().strip()
+        except FileNotFoundError:
+            pass
+
         key = Fernet.generate_key()
         data_dir.mkdir(parents=True, exist_ok=True)
-        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{KEY_FILENAME}.", suffix=".tmp", dir=data_dir
+        )
+        temp_path = Path(temp_name)
         try:
-            os.write(fd, key)
+            try:
+                os.fchmod(fd, 0o600)
+                offset = 0
+                while offset < len(key):
+                    written = os.write(fd, key[offset:])
+                    if written <= 0:
+                        raise OSError("Could not write encryption key")
+                    offset += written
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+            try:
+                # A hard link publishes the fully written inode only if the
+                # destination does not yet exist. Concurrent losers read the
+                # winner instead of overwriting it with a different key.
+                os.link(temp_path, key_path)
+            except FileExistsError:
+                return key_path.read_bytes().strip()
+            return key
         finally:
-            os.close(fd)
-        return key
+            temp_path.unlink(missing_ok=True)
 
     def encrypt(self, plaintext: str) -> str:
         return self._fernet.encrypt(plaintext.encode()).decode()

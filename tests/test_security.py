@@ -221,6 +221,17 @@ def test_transaction_feed_refresh_is_visibility_aware_and_non_overlapping():
     assert "payload === lastTransactionPayload" in js
     assert 'id="txn-last-updated"' in html
 
+
+def test_transaction_amount_formatter_uses_currency_minor_units():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    formatter = (static_dir / "format.js").read_text()
+    html = (static_dir / "index.html").read_text()
+    assert "resolvedOptions().maximumFractionDigits" in formatter
+    assert "10 ** fractionDigits" in formatter
+    assert html.index('/format.js') < html.index('/app.js')
+
 def test_pos_device_mapping_ui_wiring():
     from pathlib import Path
 

@@ -463,8 +463,14 @@ class Store:
 
     # -- transactions ------------------------------------------------------
 
-    def upsert_transaction(self, txn: dict) -> bool:
-        """Insert or update a transaction. Returns True if it was new."""
+    def upsert_transaction(
+        self, txn: dict, *, replace_evidence: bool = False
+    ) -> bool:
+        """Insert or update a transaction. Returns True if it was new.
+
+        ``replace_evidence`` lets an authoritative source correction clear
+        nullable camera evidence instead of coalescing the prior values.
+        """
         values = {
             "camera_id": None,
             "thumbnail_path": None,
@@ -478,6 +484,7 @@ class Store:
         }
         values["updated_at"] = txn.get("updated_at") or txn["created_at"]
         values["updated_ts_ms"] = txn.get("updated_ts_ms", txn["ts_ms"])
+        values["replace_evidence"] = int(bool(replace_evidence))
         superseded_thumbnail: str | None = None
 
         with self._lock:
@@ -488,7 +495,7 @@ class Store:
                     "FROM transactions WHERE id = ?",
                     (txn["id"],),
                 ).fetchone()
-                self._db.execute(
+                applied = self._db.execute(
                     "INSERT INTO transactions (id, created_at, ts_ms, updated_at, updated_ts_ms, "
                     "amount, currency, status, location_id, device_id, device_name, card_last4, "
                     "receipt_url, camera_id, thumbnail_path, raw) "
@@ -501,14 +508,18 @@ class Store:
                     "currency=excluded.currency, status=excluded.status, "
                     "location_id=excluded.location_id, "
                     "device_id=COALESCE(NULLIF(excluded.device_id, ''), transactions.device_id), "
-                    "device_name=COALESCE(NULLIF(excluded.device_name, ''), "
-                    "transactions.device_name), "
+                    "device_name=CASE WHEN NULLIF(excluded.device_id, '') IS NOT NULL "
+                    "AND excluded.device_id != transactions.device_id "
+                    "THEN excluded.device_name ELSE COALESCE(NULLIF(excluded.device_name, ''), "
+                    "transactions.device_name) END, "
                     "card_last4=excluded.card_last4, "
                     "receipt_url=excluded.receipt_url, raw=excluded.raw, "
                     "camera_id=CASE WHEN excluded.ts_ms != transactions.ts_ms "
+                    "OR :replace_evidence = 1 "
                     "THEN excluded.camera_id ELSE COALESCE(excluded.camera_id, "
                     "transactions.camera_id) END, "
                     "thumbnail_path=CASE WHEN excluded.ts_ms != transactions.ts_ms "
+                    "OR :replace_evidence = 1 "
                     "THEN excluded.thumbnail_path ELSE COALESCE(excluded.thumbnail_path, "
                     "transactions.thumbnail_path) END "
                     "WHERE excluded.updated_ts_ms >= transactions.updated_ts_ms",
@@ -531,8 +542,10 @@ class Store:
                 evidence_changed = bool(
                     existing
                     and current
+                    and applied.rowcount == 1
                     and (
-                        existing["camera_id"] != current["camera_id"]
+                        replace_evidence
+                        or existing["camera_id"] != current["camera_id"]
                         or existing["ts_ms"] != current["ts_ms"]
                     )
                 )

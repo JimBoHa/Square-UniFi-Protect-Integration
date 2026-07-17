@@ -1210,7 +1210,9 @@ def test_sparse_payment_update_preserves_device_camera_evidence(configured, monk
     initial_payment = json.loads(initial_body)["data"]["object"]["payment"]
     ingest_payment(configured.app.state.store, initial_payment, protect=None)
 
-    sparse_body = make_webhook_event("PAY_SPARSE")
+    sparse_body = make_webhook_event(
+        "PAY_SPARSE", updated_at="2026-07-16T16:01:00.000Z"
+    )
     resp = configured.post(
         "/webhooks/square",
         content=sparse_body,

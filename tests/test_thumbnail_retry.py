@@ -636,6 +636,8 @@ def test_request_error_releases_job_and_continues_batch(tmp_path):
         assert protect.calls == 2
         assert store.get_transaction("P1")["thumbnail_path"] is None
         assert store.get_transaction("P2")["thumbnail_path"] is not None
+        assert store.has_due_thumbnail_retries(now=129) is False
+        assert store.has_due_thumbnail_retries(now=130) is True
         assert store.claim_thumbnail_retries(1, 10, now=129) == []
         assert store.claim_thumbnail_retries(1, 10, now=130)[0]["attempts"] == 1
     finally:

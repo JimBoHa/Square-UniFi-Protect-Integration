@@ -824,6 +824,21 @@ class Store:
                 raise
         return claimed
 
+    def has_due_thumbnail_retries(self, *, now: float | None = None) -> bool:
+        """Return whether an unleased thumbnail job is immediately runnable."""
+        due_at = time.time() if now is None else float(now)
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM thumbnail_retries r "
+                "JOIN transactions t ON t.id = r.transaction_id "
+                "WHERE t.camera_id IS NOT NULL AND t.thumbnail_path IS NULL "
+                "AND r.next_attempt_at <= ? "
+                "AND (r.lease_token IS NULL OR r.lease_expires_at <= ?) "
+                "LIMIT 1",
+                (due_at, due_at),
+            ).fetchone()
+        return row is not None
+
     def complete_thumbnail_retry(
         self,
         transaction_id: str,

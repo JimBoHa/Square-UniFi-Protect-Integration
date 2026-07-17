@@ -157,10 +157,26 @@ def create_app(
         try:
             # Sale alarms first: a slow snapshot request must not delay the
             # Alarm Manager automation for a completed sale.
-            sync.retry_pending_alarms(
-                store, protect, protect_settings["protect.alarm_trigger_id"]
-            )
-            sync.retry_missing_thumbnails(store, protect)
+            while (
+                sync.retry_pending_alarms(
+                    store,
+                    protect,
+                    protect_settings["protect.alarm_trigger_id"],
+                )
+                == sync.ALARM_RETRY_BATCH_SIZE
+            ):
+                # A full successful batch may have more immediately runnable
+                # alarms. A partial batch includes failures, so stop and wait
+                # for the next nudge instead of retrying a dead console here.
+                pass
+
+            while True:
+                sync.retry_missing_thumbnails(store, protect)
+                # Failed captures move into backoff and are intentionally not
+                # considered due. Continue only for runnable jobs beyond the
+                # bounded retry batch.
+                if not store.has_due_thumbnail_retries():
+                    break
         except Exception:
             logger.exception("Protect work drain failed")
         finally:

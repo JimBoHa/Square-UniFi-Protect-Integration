@@ -60,7 +60,9 @@ def test_legacy_location_mapping_migrates_to_device_aware_schema(tmp_path):
             CAM1,
             "PAY_LEGACY.jpg",
             '{"device_details":{"device_id":"TERM_LEGACY",'
-            '"device_name":"Legacy Register"}}',
+            '"device_name":"Legacy Register"},'
+            '"buyer_email_address":"buyer@example.com",'
+            '"note":"private order note"}',
         ),
     )
     db.execute(
@@ -103,10 +105,12 @@ def test_legacy_location_mapping_migrates_to_device_aware_schema(tmp_path):
         assert legacy_txn["device_id"] == "TERM_LEGACY"
         assert legacy_txn["device_name"] == "Legacy Register"
         assert legacy_txn["thumbnail_path"] == "PAY_LEGACY.jpg"
+        assert legacy_txn["raw"] == "{}"
         malformed_txn = store.get_transaction("PAY_MALFORMED")
         assert malformed_txn["device_id"] == ""
         assert malformed_txn["device_name"] == ""
         assert malformed_txn["thumbnail_path"] == "PAY_MALFORMED.jpg"
+        assert malformed_txn["raw"] == "{}"
 
         store.set_camera_mapping(
             "LOC1",
@@ -121,6 +125,10 @@ def test_legacy_location_mapping_migrates_to_device_aware_schema(tmp_path):
         assert store.camera_for_location("LOC2", "UNKNOWN")["camera_id"] == CAM_WILDCARD
     finally:
         store.close()
+
+    database_bytes = (data_dir / "spi.db").read_bytes()
+    assert b"buyer@example.com" not in database_bytes
+    assert b"private order note" not in database_bytes
 
 
 def test_observed_device_name_uses_newest_nonempty_transaction(tmp_path):

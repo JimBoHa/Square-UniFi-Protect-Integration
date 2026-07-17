@@ -687,7 +687,7 @@ def test_payment_from_api_uses_offline_client_timestamp():
 
     normalized = payment_from_api(payment)
     assert normalized["created_at"] == "2026-07-16T08:30:00Z"
-    assert normalized["raw"]["created_at"] == "2026-07-16T16:30:00Z"
+    assert "raw" not in normalized
     # Versioning stays anchored to the server clock, not the older client time.
     assert normalized["updated_at"] == "2026-07-16T16:30:00Z"
 

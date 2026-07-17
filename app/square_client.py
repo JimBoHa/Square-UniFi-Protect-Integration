@@ -167,5 +167,4 @@ def payment_from_api(payment: dict) -> dict:
         "device_name": device.get("device_name") or "",
         "card_last4": card.get("last_4", ""),
         "receipt_url": payment.get("receipt_url", ""),
-        "raw": payment,
     }

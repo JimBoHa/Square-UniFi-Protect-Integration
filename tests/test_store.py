@@ -1,6 +1,5 @@
 """Transaction versioning and database migration tests."""
 
-import json
 import sqlite3
 
 from app.store import Store
@@ -72,6 +71,22 @@ def test_newer_payment_refreshes_all_mutable_fields(tmp_path):
         card_last4="2222",
         receipt_url="https://square.example/completed",
     )
+    completed.update(
+        {
+            "buyer_email_address": "buyer@example.com",
+            "billing_address": {"address_line_1": "123 Private Street"},
+            "card_details": {
+                "card": {
+                    "last_4": "2222",
+                    "fingerprint": "CARD_FINGERPRINT_PRIVATE",
+                },
+                "wallet_details": {"brand": "WALLET_PRIVATE"},
+            },
+            "customer_id": "CUSTOMER_PRIVATE",
+            "note": "private order note",
+            "risk_evaluation": {"risk_level": "RISK_LEVEL_PRIVATE"},
+        }
+    )
 
     try:
         ingest_payment(store, pending, protect=_ProtectStub())
@@ -90,7 +105,15 @@ def test_newer_payment_refreshes_all_mutable_fields(tmp_path):
     assert stored["receipt_url"] == "https://square.example/completed"
     assert stored["camera_id"] == CAMERA_ID
     assert stored["thumbnail_path"] == "PAY_VERSIONED.jpg"
-    assert json.loads(stored["raw"]) == completed
+    assert stored["raw"] == "{}"
+    database_bytes = (tmp_path / "data" / "spi.db").read_bytes()
+    assert b"buyer@example.com" not in database_bytes
+    assert b"123 Private Street" not in database_bytes
+    assert b"CARD_FINGERPRINT_PRIVATE" not in database_bytes
+    assert b"WALLET_PRIVATE" not in database_bytes
+    assert b"CUSTOMER_PRIVATE" not in database_bytes
+    assert b"private order note" not in database_bytes
+    assert b"RISK_LEVEL_PRIVATE" not in database_bytes
 
 
 def test_older_payment_update_cannot_regress_state(tmp_path):
@@ -218,7 +241,7 @@ def test_newer_timestamp_recaptures_camera_evidence(tmp_path):
     assert image == f"snapshot:{CAMERA_ID}:{corrected_ts_ms}".encode()
 
 
-def test_store_migrates_legacy_transaction_schema_without_data_loss(tmp_path):
+def test_store_migrates_legacy_fields_and_scrubs_raw_payment(tmp_path):
     data_dir = tmp_path / "legacy"
     data_dir.mkdir()
     db = sqlite3.connect(data_dir / "spi.db")
@@ -261,7 +284,7 @@ def test_store_migrates_legacy_transaction_schema_without_data_loss(tmp_path):
             "https://square.example/legacy",
             "cam1aaaaaaaaaaaaaaaaaaaaa",
             "PAY_LEGACY.jpg",
-            '{"legacy": true}',
+            '{"legacy":true,"buyer_email_address":"buyer@example.com"}',
         ),
     )
     db.commit()
@@ -285,7 +308,7 @@ def test_store_migrates_legacy_transaction_schema_without_data_loss(tmp_path):
         "receipt_url": "https://square.example/legacy",
         "camera_id": "cam1aaaaaaaaaaaaaaaaaaaaa",
         "thumbnail_path": "PAY_LEGACY.jpg",
-        "raw": '{"legacy": true}',
+        "raw": "{}",
         "updated_at": created_at,
         "updated_ts_ms": ts_ms,
         "device_id": "",

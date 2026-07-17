@@ -12,6 +12,8 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.store import Store
+from app.sync import enrich_transaction_thumbnail, ingest_payment
 
 from .conftest import (
     ADMIN_PASSWORD,
@@ -25,6 +27,7 @@ from .conftest import (
 )
 
 CAM1 = "cam1aaaaaaaaaaaaaaaaaaaaa"
+CAM2 = "cam2bbbbbbbbbbbbbbbbbbbbb"
 
 
 # -- setup / login flow ------------------------------------------------------------
@@ -310,6 +313,58 @@ def test_webhook_ack_and_transaction_listing_do_not_wait_for_snapshot(tmp_path):
     finally:
         release_snapshot.set()
         app.state.store.close()
+
+
+def test_thumbnail_enrichment_retries_if_camera_changes_in_flight(tmp_path):
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+
+    class BlockingProtect:
+        def __init__(self):
+            self.calls = []
+
+        def get_snapshot(self, camera_id, ts_ms=None):
+            self.calls.append((camera_id, ts_ms))
+            if len(self.calls) == 1:
+                snapshot_started.set()
+                assert release_snapshot.wait(timeout=5)
+            return b"snapshot:" + camera_id.encode()
+
+    payment = {
+        "id": "PAY_CAMERA_RACE",
+        "created_at": "2026-07-16T16:00:00.000Z",
+        "amount_money": {"amount": 500, "currency": "USD"},
+        "status": "COMPLETED",
+        "location_id": "LOC1",
+    }
+    store = Store(tmp_path / "data")
+    protect = BlockingProtect()
+    try:
+        store.set_camera_mapping("LOC1", CAM1, "Front Counter")
+        ingest_payment(store, payment, None)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                enrich_transaction_thumbnail,
+                store,
+                payment["id"],
+                protect,
+            )
+            assert snapshot_started.wait(timeout=3)
+            store.set_camera_mapping("LOC1", CAM2, "Back Door")
+            ingest_payment(store, payment, None)
+            release_snapshot.set()
+            assert future.result(timeout=5) is True
+
+        txn = store.get_transaction(payment["id"])
+        assert txn["camera_id"] == CAM2
+        assert protect.calls == [(CAM1, txn["ts_ms"]), (CAM2, txn["ts_ms"])]
+        assert (store.thumbnail_dir / txn["thumbnail_path"]).read_bytes() == (
+            b"snapshot:" + CAM2.encode()
+        )
+    finally:
+        release_snapshot.set()
+        store.close()
 
 def test_webhook_ignores_non_payment_events(configured):
     body = json.dumps({"type": "inventory.count.updated", "data": {}}).encode()

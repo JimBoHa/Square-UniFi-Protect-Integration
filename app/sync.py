@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
@@ -27,6 +28,17 @@ def safe_thumbnail_name(payment_id: str) -> str:
     if not cleaned:
         raise ValueError("Payment id yields no safe filename")
     return f"{cleaned}.jpg"
+
+
+def evidence_thumbnail_name(txn_id: str, camera_id: str, ts_ms: int) -> str:
+    """Name asynchronous evidence uniquely by its camera and timestamp."""
+    cleaned = _SAFE_ID_RE.sub("", txn_id)[:48]
+    if not cleaned:
+        raise ValueError("Payment id yields no safe filename")
+    evidence_hash = hashlib.sha256(
+        f"{camera_id}\0{int(ts_ms)}".encode()
+    ).hexdigest()[:16]
+    return f"{cleaned}-{evidence_hash}.jpg"
 
 
 def ingest_payment(
@@ -61,18 +73,40 @@ def ingest_payment(
 def enrich_transaction_thumbnail(
     store: Store, txn_id: str, protect: ProtectClient
 ) -> bool:
-    """Capture and attach a thumbnail for a previously stored transaction."""
-    txn = store.get_transaction(txn_id)
-    if not txn or not txn.get("camera_id") or txn.get("thumbnail_path"):
-        return False
-    try:
-        image = protect.get_snapshot(txn["camera_id"], ts_ms=txn["ts_ms"])
-        name = safe_thumbnail_name(txn_id)
-        (store.thumbnail_dir / name).write_bytes(image)
-        return store.set_transaction_thumbnail(txn_id, name)
-    except (ProtectError, ValueError) as exc:
-        logger.warning("Thumbnail capture failed for %s: %s", txn_id, exc)
-        return False
+    """Capture evidence, retrying once if its camera changes in flight."""
+    for _attempt in range(2):
+        txn = store.get_transaction(txn_id)
+        if not txn or not txn.get("camera_id") or txn.get("thumbnail_path"):
+            return False
+        camera_id = txn["camera_id"]
+        ts_ms = txn["ts_ms"]
+        try:
+            image = protect.get_snapshot(camera_id, ts_ms=ts_ms)
+            name = evidence_thumbnail_name(txn_id, camera_id, ts_ms)
+            (store.thumbnail_dir / name).write_bytes(image)
+            if store.set_transaction_thumbnail(
+                txn_id,
+                name,
+                expected_camera_id=camera_id,
+                expected_ts_ms=ts_ms,
+            ):
+                return True
+        except (ProtectError, ValueError) as exc:
+            logger.warning("Thumbnail capture failed for %s: %s", txn_id, exc)
+            return False
+
+        current = store.get_transaction(txn_id)
+        if (
+            not current
+            or current.get("thumbnail_path")
+            or (
+                current.get("camera_id") == camera_id
+                and current.get("ts_ms") == ts_ms
+            )
+        ):
+            return False
+        logger.info("Camera evidence changed while enriching %s; retrying", txn_id)
+    return False
 
 
 def sync_payments(

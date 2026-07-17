@@ -157,13 +157,20 @@ class Store:
             ).fetchone()
         return dict(row) if row else None
 
-    def set_transaction_thumbnail(self, txn_id: str, thumbnail_path: str) -> bool:
-        """Attach a thumbnail if the transaction still has none."""
+    def set_transaction_thumbnail(
+        self,
+        txn_id: str,
+        thumbnail_path: str,
+        expected_camera_id: str,
+        expected_ts_ms: int,
+    ) -> bool:
+        """Attach a thumbnail only while its camera evidence still matches."""
         with self._lock:
             cursor = self._db.execute(
                 "UPDATE transactions SET thumbnail_path = ? "
-                "WHERE id = ? AND thumbnail_path IS NULL",
-                (thumbnail_path, txn_id),
+                "WHERE id = ? AND thumbnail_path IS NULL "
+                "AND camera_id = ? AND ts_ms = ?",
+                (thumbnail_path, txn_id, expected_camera_id, expected_ts_ms),
             )
             self._db.commit()
         return cursor.rowcount > 0

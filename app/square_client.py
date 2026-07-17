@@ -138,10 +138,20 @@ def payment_from_api(payment: dict) -> dict:
     )
     card = payment.get("card_details", {}).get("card", {})
     created_at = payment.get("created_at", "")
+    server_created_at = created_at
+    if payment.get("is_offline_payment") is True:
+        offline_details = payment.get("offline_payment_details")
+        client_created_at = (
+            offline_details.get("client_created_at")
+            if isinstance(offline_details, dict)
+            else None
+        )
+        if isinstance(client_created_at, str) and client_created_at.strip():
+            created_at = client_created_at.strip()
     return {
         "id": payment.get("id", ""),
         "created_at": created_at,
-        "updated_at": payment.get("updated_at") or created_at,
+        "updated_at": payment.get("updated_at") or server_created_at,
         "amount": int(display_amount),
         "currency": display_currency,
         "status": payment.get("status", ""),

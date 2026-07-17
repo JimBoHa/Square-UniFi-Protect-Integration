@@ -226,7 +226,17 @@ def create_app(
         now = time.time()
         with app.state.login_lock:
             prune_login_failures_locked(now)
-            if len(app.state.login_failures.get(key, ())) >= LOGIN_MAX_FAILURES:
+            attempts = app.state.login_failures.get(key)
+            if attempts is None and len(app.state.login_failures) >= LOGIN_FAILURE_KEY_LIMIT:
+                # Fail before the expensive password hash when a distributed
+                # attack has filled the bounded source map. Expired entries
+                # were pruned above, so legitimate new clients can retry once
+                # the short lockout window rolls forward.
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many failed login attempts; try again shortly",
+                )
+            if len(attempts or ()) >= LOGIN_MAX_FAILURES:
                 raise HTTPException(
                     status_code=429,
                     detail="Too many failed login attempts; try again shortly",

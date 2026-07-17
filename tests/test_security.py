@@ -82,9 +82,9 @@ def test_login_failure_map_prunes_expired_keys_and_throttles_at_capacity(
     )
     monkeypatch.setattr("app.main.LOGIN_FAILURE_KEY_LIMIT", 2)
 
-    # Full capacity does not block a valid password and the normal throttle
-    # check removes expired client keys.
-    assert client.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
+    # At capacity, fail before running an expensive password hash for an
+    # untracked source. The normal throttle check still removes expired keys.
+    assert client.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 429
     assert set(client.app.state.login_failures) == {"active-a", "active-b"}
 
     # A failing new source is throttled rather than left untracked or allowed

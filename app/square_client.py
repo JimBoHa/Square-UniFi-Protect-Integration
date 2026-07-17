@@ -106,9 +106,19 @@ def payment_from_api(payment: dict) -> dict:
     """Normalize a Square Payment object into our transaction shape."""
     amount = payment.get("amount_money", {})
     card = payment.get("card_details", {}).get("card", {})
+    created_at = payment.get("created_at", "")
+    if payment.get("is_offline_payment") is True:
+        offline_details = payment.get("offline_payment_details")
+        client_created_at = (
+            offline_details.get("client_created_at")
+            if isinstance(offline_details, dict)
+            else None
+        )
+        if isinstance(client_created_at, str) and client_created_at.strip():
+            created_at = client_created_at.strip()
     return {
         "id": payment.get("id", ""),
-        "created_at": payment.get("created_at", ""),
+        "created_at": created_at,
         "amount": int(amount.get("amount", 0)),
         "currency": amount.get("currency", "USD"),
         "status": payment.get("status", ""),

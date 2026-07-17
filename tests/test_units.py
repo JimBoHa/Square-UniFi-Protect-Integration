@@ -10,8 +10,9 @@ import pytest
 from app.deeplink import build_deep_link
 from app.protect_client import ProtectAuthError, ProtectClient, validate_camera_id, validate_host
 from app.security import CredentialCipher, hash_password, verify_password
-from app.square_client import SquareClient, verify_webhook_signature
-from app.sync import parse_ts_ms, safe_thumbnail_name
+from app.square_client import SquareClient, payment_from_api, verify_webhook_signature
+from app.store import Store
+from app.sync import parse_ts_ms, safe_thumbnail_name, sync_payments
 
 from .conftest import PROTECT_PASS, PROTECT_USER, protect_handler
 
@@ -186,6 +187,91 @@ def test_protect_relogin_on_expired_session():
 
 
 # -- Square client -------------------------------------------------------------------
+
+def test_payment_from_api_uses_offline_client_timestamp():
+    payment = {
+        "id": "PAY_OFFLINE",
+        "created_at": "2026-07-16T16:30:00Z",
+        "is_offline_payment": True,
+        "offline_payment_details": {"client_created_at": "2026-07-16T08:30:00Z"},
+    }
+
+    normalized = payment_from_api(payment)
+    assert normalized["created_at"] == "2026-07-16T08:30:00Z"
+    assert normalized["raw"]["created_at"] == "2026-07-16T16:30:00Z"
+
+@pytest.mark.parametrize(
+    "offline_details",
+    [None, {}, {"client_created_at": ""}, {"client_created_at": "   "}],
+)
+def test_payment_from_api_falls_back_when_offline_timestamp_missing(offline_details):
+    payment = {
+        "created_at": "2026-07-16T16:30:00Z",
+        "is_offline_payment": True,
+        "offline_payment_details": offline_details,
+    }
+
+    assert payment_from_api(payment)["created_at"] == "2026-07-16T16:30:00Z"
+
+def test_sync_uses_offline_client_timestamp_for_snapshot(tmp_path):
+    client_created_at = "2026-07-16T08:30:00Z"
+    payment = {
+        "id": "PAY_OFFLINE",
+        "created_at": "2026-07-16T16:30:00Z",
+        "is_offline_payment": True,
+        "offline_payment_details": {"client_created_at": client_created_at},
+        "amount_money": {"amount": 1200, "currency": "USD"},
+        "status": "COMPLETED",
+        "location_id": "LOC1",
+    }
+
+    class Square:
+        def list_payments(self, begin_time=None):
+            return [payment]
+
+    class RecordingProtect:
+        def __init__(self):
+            self.snapshot_calls = []
+
+        def get_snapshot(self, camera_id, ts_ms):
+            self.snapshot_calls.append((camera_id, ts_ms))
+            return b"snapshot"
+
+    store = Store(tmp_path / "data")
+    protect = RecordingProtect()
+    try:
+        store.set_camera_mapping("LOC1", "CAM1", "Register")
+
+        assert sync_payments(store, Square(), protect) == 1
+        expected_ts = parse_ts_ms(client_created_at)
+        assert protect.snapshot_calls == [("CAM1", expected_ts)]
+        transaction = store.get_transaction("PAY_OFFLINE")
+        assert transaction["created_at"] == client_created_at
+        assert transaction["ts_ms"] == expected_ts
+    finally:
+        store.close()
+
+def test_sync_skips_nonempty_malformed_offline_timestamp(tmp_path):
+    payment = {
+        "id": "PAY_BAD_TIME",
+        "created_at": "2026-07-16T16:30:00Z",
+        "is_offline_payment": True,
+        "offline_payment_details": {"client_created_at": "not-a-timestamp"},
+        "amount_money": {"amount": 1200, "currency": "USD"},
+        "status": "COMPLETED",
+        "location_id": "LOC1",
+    }
+
+    class Square:
+        def list_payments(self, begin_time=None):
+            return [payment]
+
+    store = Store(tmp_path / "data")
+    try:
+        assert sync_payments(store, Square(), None) == 0
+        assert store.get_transaction("PAY_BAD_TIME") is None
+    finally:
+        store.close()
 
 def test_square_pagination_follows_cursor():
     pages = {

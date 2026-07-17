@@ -561,6 +561,7 @@ def create_app(
                 for entry in body.mappings
             ]
         )
+        nudge_protect_work_queue()
         return {"ok": True, "count": len(body.mappings)}
 
     # -- transactions -------------------------------------------------------------

@@ -474,18 +474,67 @@ class Store:
     def replace_camera_mappings(
         self, mappings: list[tuple[str, str, str, str, str]]
     ) -> None:
-        """Replace every camera mapping in one SQLite transaction.
+        """Replace mappings and retarget pending evidence in one transaction.
 
         Each entry is (location_id, device_id, device_name, camera_id,
-        camera_name); device_id '' is the location-level fallback row.
+        camera_name); device_id '' is the location-level fallback row. Camera
+        assignments with captured thumbnails remain immutable historical
+        evidence.
         """
-        with self._lock, self._db:
-            self._db.execute("DELETE FROM camera_map")
-            self._db.executemany(
-                "INSERT INTO camera_map (location_id, device_id, device_name, "
-                "camera_id, camera_name) VALUES (?, ?, ?, ?, ?)",
-                mappings,
-            )
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._db.execute("DELETE FROM camera_map")
+                self._db.executemany(
+                    "INSERT INTO camera_map (location_id, device_id, device_name, "
+                    "camera_id, camera_name) VALUES (?, ?, ?, ?, ?)",
+                    mappings,
+                )
+                mapping_rows = self._db.execute(
+                    "SELECT location_id, device_id, camera_id FROM camera_map"
+                ).fetchall()
+                cameras = {
+                    (row["location_id"], row["device_id"]): row["camera_id"]
+                    for row in mapping_rows
+                }
+                pending = self._db.execute(
+                    "SELECT id, location_id, device_id, camera_id FROM transactions "
+                    "WHERE thumbnail_path IS NULL"
+                ).fetchall()
+                for txn in pending:
+                    exact_key = (txn["location_id"], txn["device_id"])
+                    location_key = (txn["location_id"], "")
+                    wildcard_key = ("*", "")
+                    if txn["device_id"] and exact_key in cameras:
+                        camera_id = cameras[exact_key]
+                    elif location_key in cameras:
+                        camera_id = cameras[location_key]
+                    else:
+                        camera_id = cameras.get(wildcard_key)
+
+                    if txn["camera_id"] == camera_id:
+                        continue
+                    self._db.execute(
+                        "UPDATE transactions SET camera_id = ? WHERE id = ?",
+                        (camera_id, txn["id"]),
+                    )
+                    if camera_id is None:
+                        self._db.execute(
+                            "DELETE FROM thumbnail_retries WHERE transaction_id = ?",
+                            (txn["id"],),
+                        )
+                    else:
+                        self._db.execute(
+                            "INSERT INTO thumbnail_retries (transaction_id) VALUES (?) "
+                            "ON CONFLICT(transaction_id) DO UPDATE SET attempts = 0, "
+                            "next_attempt_at = 0, lease_token = NULL, "
+                            "lease_expires_at = NULL, last_error = ''",
+                            (txn["id"],),
+                        )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
 
     # -- transactions ------------------------------------------------------
 

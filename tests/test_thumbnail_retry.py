@@ -28,7 +28,7 @@ def _stored_txn(
     txn_id: str,
     ts_ms: int,
     *,
-    camera_id: str = CAM_A,
+    camera_id: str | None = CAM_A,
     thumbnail_path: str | None = None,
 ) -> dict:
     return {
@@ -347,6 +347,78 @@ def test_camera_change_resets_retry_backoff(tmp_path):
         assert replacement["camera_id"] == CAM_B
         assert replacement["ts_ms"] == 1000
         assert replacement["attempts"] == 0
+    finally:
+        store.close()
+
+
+def test_mapping_save_retargets_pending_evidence_and_cancels_old_lease(tmp_path):
+    store = Store(tmp_path / "data")
+    try:
+        store.set_camera_mapping("LOC1", CAM_A, "Original camera")
+        pending_txn = _stored_txn("PENDING", 1000, camera_id=CAM_A)
+        pending_txn["device_id"] = "TERM_A"
+        store.upsert_transaction(pending_txn)
+        store.upsert_transaction(
+            _stored_txn(
+                "CAPTURED",
+                2000,
+                camera_id=CAM_A,
+                thumbnail_path="captured.jpg",
+            )
+        )
+
+        first = store.claim_thumbnail_retries(1, 10, now=100)[0]
+        assert _fail(store, first, 100)
+        leased = store.claim_thumbnail_retries(1, 10, now=110)[0]
+        assert leased["attempts"] == 1
+
+        store.replace_camera_mappings(
+            [("LOC1", "TERM_A", "Register A", CAM_B, "New camera")]
+        )
+
+        pending = store.get_transaction("PENDING")
+        captured = store.get_transaction("CAPTURED")
+        assert pending["camera_id"] == CAM_B
+        assert captured["camera_id"] == CAM_A
+        assert captured["thumbnail_path"] == "captured.jpg"
+        replacement = store.claim_thumbnail_retries(1, 10, now=110)[0]
+        assert replacement["camera_id"] == CAM_B
+        assert replacement["attempts"] == 0
+        assert replacement["lease_token"] != leased["lease_token"]
+    finally:
+        store.close()
+
+
+def test_mapping_save_assigns_previously_unmapped_evidence(tmp_path):
+    store = Store(tmp_path / "data")
+    try:
+        store.upsert_transaction(_stored_txn("P", 1000, camera_id=None))
+        assert store.claim_thumbnail_retries(1, 10, now=100) == []
+
+        store.replace_camera_mappings([("LOC1", "", "", CAM_B, "Selected camera")])
+
+        assert store.get_transaction("P")["camera_id"] == CAM_B
+        job = store.claim_thumbnail_retries(1, 10, now=100)[0]
+        assert job["camera_id"] == CAM_B
+        assert job["attempts"] == 0
+    finally:
+        store.close()
+
+
+def test_mapping_removal_clears_pending_camera_and_retry(tmp_path):
+    store = Store(tmp_path / "data")
+    try:
+        store.set_camera_mapping("LOC1", CAM_A, "Original camera")
+        store.upsert_transaction(_stored_txn("P", 1000, camera_id=CAM_A))
+        leased = store.claim_thumbnail_retries(1, 10, now=100)[0]
+
+        store.replace_camera_mappings([])
+
+        assert store.get_transaction("P")["camera_id"] is None
+        assert store.claim_thumbnail_retries(1, 10, now=100) == []
+        assert not store.complete_thumbnail_retry(
+            "P", leased["lease_token"], CAM_A, 1000, "old-camera.jpg"
+        )
     finally:
         store.close()
 

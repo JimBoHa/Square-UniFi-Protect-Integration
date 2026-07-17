@@ -359,9 +359,13 @@ def test_malicious_payment_fields_returned_as_json_not_html(configured):
 def test_frontend_never_uses_innerhtml():
     from pathlib import Path
 
-    js = (Path(__file__).parent.parent / "app" / "static" / "app.js").read_text()
-    assert "innerHTML" not in js
-    assert "document.write" not in js
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js_files = sorted(static_dir.glob("*.js"))
+    assert js_files, "expected frontend scripts in app/static"
+    for js_file in js_files:
+        js = js_file.read_text()
+        assert "innerHTML" not in js, js_file.name
+        assert "document.write" not in js, js_file.name
 
 def test_transaction_feed_refresh_is_visibility_aware_and_non_overlapping():
     from pathlib import Path

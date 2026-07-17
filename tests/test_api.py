@@ -348,6 +348,8 @@ def test_square_settings_malformed_response_returns_502(tmp_path, malformed):
             )
         if request.url.path == "/v2/locations":
             return httpx.Response(200, json={"locations": [{"id": "LOC1"}]})
+        if request.url.path == "/v2/merchants/me":
+            return httpx.Response(200, json={"merchant": {"id": "MERCHANT_TEST"}})
         return httpx.Response(200, json={"payments": ["private payment item"]})
 
     app = create_app(

@@ -242,6 +242,11 @@ def create_app(
     def set_square(body: SquareSettingsBody, _=authed) -> dict:
         if body.environment not in ("production", "sandbox"):
             raise HTTPException(status_code=422, detail="Invalid environment")
+        if bool(body.webhook_signature_key) != bool(body.webhook_url):
+            raise HTTPException(
+                status_code=422,
+                detail="Webhook signature key and notification URL must be provided together",
+            )
         client = SquareClient(
             body.access_token, environment=body.environment, transport=square_transport
         )
@@ -270,12 +275,15 @@ def create_app(
             client.close()
         store.set_setting("square.access_token", body.access_token, secret=True)
         store.set_setting("square.environment", body.environment)
-        if body.webhook_signature_key:
+        if body.webhook_signature_key and body.webhook_url:
             store.set_setting(
                 "square.webhook_signature_key", body.webhook_signature_key, secret=True
             )
-        if body.webhook_url:
             store.set_setting("square.webhook_url", body.webhook_url)
+        else:
+            store.delete_settings(
+                "square.webhook_signature_key", "square.webhook_url"
+            )
         return {"ok": True, "locations": locations}
 
     # -- cameras & mapping ------------------------------------------------------

@@ -204,6 +204,13 @@ class Store:
             row = self._db.execute("SELECT MAX(ts_ms) AS ts FROM transactions").fetchone()
         return row["ts"] if row and row["ts"] is not None else None
 
+    def latest_transaction_updated_ts(self) -> int | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT MAX(updated_ts_ms) AS ts FROM transactions"
+            ).fetchone()
+        return row["ts"] if row and row["ts"] is not None else None
+
     # -- sessions ----------------------------------------------------------
 
     def create_session(self, token: str) -> None:

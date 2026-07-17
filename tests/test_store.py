@@ -4,7 +4,7 @@ import json
 import sqlite3
 
 from app.store import Store
-from app.sync import ingest_payment, parse_ts_ms
+from app.sync import ingest_payment, parse_ts_ms, sync_payments
 
 CAMERA_ID = "cam1aaaaaaaaaaaaaaaaaaaaa"
 
@@ -12,6 +12,16 @@ CAMERA_ID = "cam1aaaaaaaaaaaaaaaaaaaaa"
 class _ProtectStub:
     def get_snapshot(self, camera_id, ts_ms=None):
         return f"snapshot:{camera_id}:{ts_ms}".encode()
+
+
+class _SquareStub:
+    def __init__(self, payments):
+        self.payments = payments
+        self.params = None
+
+    def list_payments(self, **params):
+        self.params = params
+        return self.payments
 
 
 def _payment(
@@ -109,6 +119,59 @@ def test_older_payment_update_cannot_regress_state(tmp_path):
         store.close()
 
     assert after == before
+
+
+def test_sync_polls_old_payment_by_updated_at(tmp_path):
+    store = Store(tmp_path / "data")
+    old_pending = _payment(
+        "2026-07-16T15:00:00.000Z",
+        amount=500,
+        currency="USD",
+        status="PENDING",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/pending",
+    )
+    old_pending["created_at"] = "2026-06-01T12:00:00.000Z"
+    recent_payment = _payment(
+        "2026-07-16T15:04:00.000Z",
+        amount=900,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_NEW",
+        card_last4="2222",
+        receipt_url="https://square.example/recent",
+    )
+    recent_payment["id"] = "PAY_RECENT"
+    recent_payment["created_at"] = "2026-07-16T14:59:00.000Z"
+    old_completed = _payment(
+        "2026-07-16T15:05:00.000Z",
+        amount=500,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/completed",
+    )
+    old_completed["created_at"] = old_pending["created_at"]
+    square = _SquareStub([old_completed])
+
+    try:
+        ingest_payment(store, old_pending, protect=None)
+        ingest_payment(store, recent_payment, protect=None)
+        assert sync_payments(store, square, protect=None) == 1
+        stored = store.get_transaction("PAY_VERSIONED")
+    finally:
+        store.close()
+
+    assert square.params == {
+        "updated_at_begin_time": "2026-07-16T14:59:00Z",
+        "sort_field": "UPDATED_AT",
+    }
+    assert stored["created_at"] == "2026-06-01T12:00:00.000Z"
+    assert stored["updated_at"] == "2026-07-16T15:05:00.000Z"
+    assert stored["status"] == "COMPLETED"
+    assert stored["receipt_url"] == "https://square.example/completed"
 
 
 def test_store_migrates_legacy_transaction_schema_without_data_loss(tmp_path):

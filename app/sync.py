@@ -63,13 +63,14 @@ def sync_payments(
     store: Store, square: SquareClient, protect: ProtectClient | None
 ) -> int:
     """Pull recent Square payments and ingest them. Returns count ingested."""
-    latest = store.latest_transaction_ts()
+    latest = store.latest_transaction_updated_ts()
     if latest:
         begin = datetime.fromtimestamp(latest / 1000, tz=timezone.utc) - timedelta(minutes=5)
     else:
         begin = datetime.now(tz=timezone.utc) - timedelta(hours=BACKFILL_HOURS)
     payments = square.list_payments(
-        begin_time=begin.isoformat(timespec="seconds").replace("+00:00", "Z")
+        updated_at_begin_time=begin.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        sort_field="UPDATED_AT",
     )
     count = 0
     for payment in payments:

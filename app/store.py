@@ -427,23 +427,29 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def _camera_for_location_locked(
+        self, location_id: str, device_id: str = ""
+    ) -> sqlite3.Row | None:
+        row = None
+        if device_id:
+            row = self._db.execute(
+                "SELECT * FROM camera_map WHERE location_id = ? AND device_id = ?",
+                (location_id, device_id),
+            ).fetchone()
+        if row is None:
+            row = self._db.execute(
+                "SELECT * FROM camera_map WHERE location_id = ? AND device_id = ''",
+                (location_id,),
+            ).fetchone()
+        if row is None:
+            row = self._db.execute(
+                "SELECT * FROM camera_map WHERE location_id = '*' AND device_id = ''"
+            ).fetchone()
+        return row
+
     def camera_for_location(self, location_id: str, device_id: str = "") -> dict | None:
         with self._lock:
-            row = None
-            if device_id:
-                row = self._db.execute(
-                    "SELECT * FROM camera_map WHERE location_id = ? AND device_id = ?",
-                    (location_id, device_id),
-                ).fetchone()
-            if row is None:
-                row = self._db.execute(
-                    "SELECT * FROM camera_map WHERE location_id = ? AND device_id = ''",
-                    (location_id,),
-                ).fetchone()
-            if row is None:
-                row = self._db.execute(
-                    "SELECT * FROM camera_map WHERE location_id = '*' AND device_id = ''"
-                ).fetchone()
+            row = self._camera_for_location_locked(location_id, device_id)
         return dict(row) if row else None
 
     def clear_camera_mappings(self) -> None:
@@ -597,14 +603,32 @@ class Store:
             if cursor.rowcount != 1:
                 return False
             txn = self._db.execute(
-                "SELECT camera_id FROM transactions WHERE id = ?", (txn_id,)
+                "SELECT location_id, device_id FROM transactions WHERE id = ?",
+                (txn_id,),
             ).fetchone()
-            if txn and txn["camera_id"]:
+            mapping = (
+                self._camera_for_location_locked(
+                    txn["location_id"], txn["device_id"]
+                )
+                if txn
+                else None
+            )
+            camera_id = mapping["camera_id"] if mapping else None
+            self._db.execute(
+                "UPDATE transactions SET camera_id = ? WHERE id = ?",
+                (camera_id, txn_id),
+            )
+            if camera_id:
                 self._db.execute(
                     "INSERT INTO thumbnail_retries (transaction_id) VALUES (?) "
                     "ON CONFLICT(transaction_id) DO UPDATE SET attempts = 0, "
                     "next_attempt_at = 0, lease_token = NULL, "
                     "lease_expires_at = NULL, last_error = ''",
+                    (txn_id,),
+                )
+            else:
+                self._db.execute(
+                    "DELETE FROM thumbnail_retries WHERE transaction_id = ?",
                     (txn_id,),
                 )
             return True

@@ -156,6 +156,97 @@ def test_missing_thumbnail_file_is_requeued_on_reingest(tmp_path):
         store.close()
 
 
+def test_reingest_reloads_evidence_after_missing_file_race(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    peer = Store(data_dir)
+    store.set_camera_mapping("LOC1", CAM_A, "Register")
+    payment = _payment("LOST", "2026-07-16T15:30:00.000Z")
+
+    class Protect:
+        def get_snapshot(self, camera_id, ts_ms=None):
+            return b"original"
+
+    try:
+        ingest_payment(store, payment, Protect())
+        original = store.get_transaction("LOST")
+        (store.thumbnail_dir / original["thumbnail_path"]).unlink()
+        requeue = store.requeue_missing_thumbnail
+
+        def lose_requeue_race(txn_id: str, expected_path: str) -> bool:
+            assert peer.requeue_missing_thumbnail(txn_id, expected_path)
+            job = peer.claim_thumbnail_retries(1, 10, now=0)[0]
+            current_path = "current.jpg"
+            (peer.thumbnail_dir / current_path).write_bytes(b"current")
+            assert peer.complete_thumbnail_retry(
+                txn_id,
+                job["lease_token"],
+                job["camera_id"],
+                job["ts_ms"],
+                current_path,
+            )
+            assert not requeue(txn_id, expected_path)
+            return False
+
+        monkeypatch.setattr(store, "requeue_missing_thumbnail", lose_requeue_race)
+        ingest_payment(store, payment, protect=None)
+
+        stored = store.get_transaction("LOST")
+        assert stored["thumbnail_path"] == "current.jpg"
+        assert (store.thumbnail_dir / stored["thumbnail_path"]).read_bytes() == b"current"
+        assert store.claim_thumbnail_retries(1, 10, now=0) == []
+    finally:
+        store.close()
+        peer.close()
+
+
+@pytest.mark.parametrize(
+    ("mappings", "expected_camera"),
+    [
+        (
+            [
+                ("LOC1", "TERM1", "Register", CAM_B, "Exact"),
+                ("LOC1", "", "", CAM_A, "Location"),
+                ("*", "", "", CAM_A, "Wildcard"),
+            ],
+            CAM_B,
+        ),
+        (
+            [
+                ("LOC1", "", "", CAM_B, "Location"),
+                ("*", "", "", CAM_A, "Wildcard"),
+            ],
+            CAM_B,
+        ),
+        ([("*", "", "", CAM_B, "Wildcard")], CAM_B),
+        ([], None),
+    ],
+    ids=("exact", "location", "wildcard", "unmapped"),
+)
+def test_missing_file_requeue_uses_current_mapping(
+    tmp_path, mappings, expected_camera
+):
+    store = Store(tmp_path / "data")
+    txn = _stored_txn("LOST", 1000, camera_id=CAM_A, thumbnail_path="lost.jpg")
+    txn["device_id"] = "TERM1"
+
+    try:
+        store.upsert_transaction(txn)
+        store.replace_camera_mappings(mappings)
+
+        assert store.requeue_missing_thumbnail("LOST", "lost.jpg")
+        stored = store.get_transaction("LOST")
+        jobs = store.claim_thumbnail_retries(1, 10, now=0)
+    finally:
+        store.close()
+
+    assert stored["thumbnail_path"] is None
+    assert stored["camera_id"] == expected_camera
+    assert [job["camera_id"] for job in jobs] == (
+        [expected_camera] if expected_camera else []
+    )
+
+
 def test_store_startup_requeues_missing_thumbnail_file(tmp_path):
     data_dir = tmp_path / "data"
     store = Store(data_dir)

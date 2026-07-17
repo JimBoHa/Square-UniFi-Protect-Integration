@@ -11,7 +11,8 @@ from app.deeplink import build_deep_link
 from app.protect_client import ProtectAuthError, ProtectClient, validate_camera_id, validate_host
 from app.security import CredentialCipher, hash_password, verify_password
 from app.square_client import SquareClient, verify_webhook_signature
-from app.sync import parse_ts_ms, safe_thumbnail_name
+from app.store import Store
+from app.sync import ingest_payment, parse_ts_ms, safe_thumbnail_name, sync_payments
 
 from .conftest import PROTECT_PASS, PROTECT_USER, protect_handler
 
@@ -115,6 +116,56 @@ def test_safe_thumbnail_name_rejects_empty():
     with pytest.raises(ValueError):
         safe_thumbnail_name("../../..")
 
+def test_sync_queries_every_location_with_its_own_watermark(tmp_path):
+    def payment(payment_id: str, created_at: str, location_id: str) -> dict:
+        return {
+            "id": payment_id,
+            "created_at": created_at,
+            "amount_money": {"amount": 100, "currency": "USD"},
+            "status": "COMPLETED",
+            "location_id": location_id,
+        }
+
+    first_payment = payment("PAY_LOC1", "2026-07-16T15:30:00Z", "LOC1")
+    second_payment = payment("PAY_LOC2", "2026-07-16T15:40:00Z", "LOC2")
+
+    class RecordingSquare:
+        def __init__(self):
+            self.calls = []
+
+        def list_locations(self):
+            return [{"id": "LOC1"}, {"id": "LOC2"}]
+
+        def list_payments(self, begin_time=None, location_id=None):
+            self.calls.append((location_id, begin_time))
+            if location_id == "LOC1":
+                return [first_payment]
+            return [first_payment, second_payment]
+
+    store = Store(tmp_path / "data")
+    try:
+        ingest_payment(
+            store,
+            payment("OLD_LOC1", "2026-07-15T12:00:00Z", "LOC1"),
+            None,
+        )
+        ingest_payment(
+            store,
+            payment("OLD_LOC2", "2026-07-10T08:00:00Z", "LOC2"),
+            None,
+        )
+        square = RecordingSquare()
+
+        assert sync_payments(store, square, None) == 2
+        assert square.calls == [
+            ("LOC1", "2026-07-15T11:55:00Z"),
+            ("LOC2", "2026-07-10T07:55:00Z"),
+        ]
+        assert store.get_transaction("PAY_LOC1") is not None
+        assert store.get_transaction("PAY_LOC2") is not None
+    finally:
+        store.close()
+
 
 # -- Square webhook signature ------------------------------------------------------
 
@@ -193,13 +244,17 @@ def test_square_pagination_follows_cursor():
         "next1": {"payments": [{"id": "P2"}]},
     }
 
+    requested_locations = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requested_locations.append(request.url.params.get("location_id"))
         cursor = request.url.params.get("cursor")
         return httpx.Response(200, json=pages[cursor])
 
     client = SquareClient("tok", transport=httpx.MockTransport(handler))
-    payments = client.list_payments()
+    payments = client.list_payments(location_id="LOC1")
     assert [p["id"] for p in payments] == ["P1", "P2"]
+    assert requested_locations == ["LOC1", "LOC1"]
     client.close()
 
 def test_square_rejects_bad_environment():

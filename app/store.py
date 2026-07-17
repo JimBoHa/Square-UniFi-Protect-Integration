@@ -167,9 +167,17 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def latest_transaction_ts(self) -> int | None:
+    def latest_transaction_ts(self, location_id: str | None = None) -> int | None:
         with self._lock:
-            row = self._db.execute("SELECT MAX(ts_ms) AS ts FROM transactions").fetchone()
+            if location_id is None:
+                row = self._db.execute(
+                    "SELECT MAX(ts_ms) AS ts FROM transactions"
+                ).fetchone()
+            else:
+                row = self._db.execute(
+                    "SELECT MAX(ts_ms) AS ts FROM transactions WHERE location_id = ?",
+                    (location_id,),
+                ).fetchone()
         return row["ts"] if row and row["ts"] is not None else None
 
     # -- sessions ----------------------------------------------------------

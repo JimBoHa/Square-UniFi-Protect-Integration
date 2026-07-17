@@ -68,7 +68,12 @@ class SquareClient:
             for loc in data.get("locations", [])
         ]
 
-    def list_payments(self, begin_time: str | None = None, limit: int = 100) -> list[dict]:
+    def list_payments(
+        self,
+        begin_time: str | None = None,
+        limit: int = 100,
+        location_id: str | None = None,
+    ) -> list[dict]:
         """Completed and pending payments, newest first, following pagination."""
         payments: list[dict] = []
         cursor: str | None = None
@@ -76,6 +81,8 @@ class SquareClient:
             params: dict = {"sort_order": "DESC", "limit": min(limit, 100)}
             if begin_time:
                 params["begin_time"] = begin_time
+            if location_id:
+                params["location_id"] = location_id
             if cursor:
                 params["cursor"] = cursor
             data = self._get("/v2/payments", params=params)

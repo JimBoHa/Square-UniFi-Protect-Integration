@@ -1,6 +1,7 @@
 """End-to-end API tests against mocked Square and UniFi Protect backends."""
 
 import base64
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -37,6 +38,21 @@ def test_setup_then_login(client):
 
 def test_setup_rejects_short_password(client):
     assert client.post("/api/setup", json={"password": "short"}).status_code == 422
+
+def test_concurrent_setup_has_single_winner(client):
+    passwords = ("first-admin-password", "second-admin-password")
+
+    def setup(password: str):
+        return password, client.post("/api/setup", json={"password": password})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(setup, passwords))
+
+    assert sorted(response.status_code for _, response in results) == [200, 409]
+    winner = next(password for password, response in results if response.status_code == 200)
+    loser = next(password for password, response in results if response.status_code == 409)
+    assert client.post("/api/login", json={"password": winner}).status_code == 200
+    assert client.post("/api/login", json={"password": loser}).status_code == 401
 
 def test_login_wrong_password(client):
     client.post("/api/setup", json={"password": ADMIN_PASSWORD})

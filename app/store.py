@@ -74,6 +74,17 @@ class Store:
             )
             self._db.commit()
 
+    def set_setting_if_absent(self, key: str, value: str, secret: bool = False) -> bool:
+        """Store a setting only if no caller has created the key."""
+        stored = self.cipher.encrypt(value) if secret else value
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT OR IGNORE INTO settings (key, value, encrypted) VALUES (?, ?, ?)",
+                (key, stored, int(secret)),
+            )
+            self._db.commit()
+        return cursor.rowcount == 1
+
     def get_setting(self, key: str) -> str | None:
         with self._lock:
             row = self._db.execute(

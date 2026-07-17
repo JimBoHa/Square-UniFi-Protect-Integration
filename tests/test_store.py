@@ -1,7 +1,9 @@
 """Transaction versioning and database migration tests."""
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -92,7 +94,7 @@ def test_newer_payment_refreshes_all_mutable_fields(tmp_path):
     assert stored["card_last4"] == "2222"
     assert stored["receipt_url"] == "https://square.example/completed"
     assert stored["camera_id"] == CAMERA_ID
-    assert stored["thumbnail_path"] == "PAY_VERSIONED.jpg"
+    assert stored["thumbnail_path"].startswith("PAY_VERSIONED-")
     assert json.loads(stored["raw"]) == completed
 
 
@@ -435,3 +437,67 @@ def test_stale_event_with_old_timestamp_cannot_overwrite_thumbnail_file(tmp_path
     assert after["ts_ms"] == corrected_ts_ms
     assert image_after == image_before
     assert image_after == f"snapshot:{CAMERA_ID}:{corrected_ts_ms}".encode()
+
+
+def test_concurrent_stale_capture_cannot_overwrite_current_evidence(tmp_path):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC_OLD", CAMERA_ID, "Front Counter")
+    stale = _payment(
+        "2026-07-16T15:01:00.000Z",
+        amount=500,
+        currency="USD",
+        status="PENDING",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/pending",
+    )
+    current = _payment(
+        "2026-07-16T15:02:00.000Z",
+        amount=725,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/completed",
+    )
+    stale["created_at"] = "2026-07-16T15:00:00.000Z"
+    current["created_at"] = "2026-07-16T15:00:01.000Z"
+    stale_ts_ms = parse_ts_ms(stale["created_at"])
+    current_ts_ms = parse_ts_ms(current["created_at"])
+    stale_started = threading.Event()
+    release_stale = threading.Event()
+
+    class RacingProtect:
+        def get_snapshot(self, camera_id, ts_ms=None):
+            if ts_ms == stale_ts_ms:
+                stale_started.set()
+                assert release_stale.wait(timeout=5)
+                return b"stale-frame"
+            assert ts_ms == current_ts_ms
+            assert stale_started.wait(timeout=5)
+            return b"current-frame"
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            stale_future = executor.submit(
+                ingest_payment, store, stale, RacingProtect()
+            )
+            assert stale_started.wait(timeout=5)
+            current_future = executor.submit(
+                ingest_payment, store, current, RacingProtect()
+            )
+            current_future.result(timeout=5)
+            release_stale.set()
+            stale_future.result(timeout=5)
+
+        stored = store.get_transaction("PAY_VERSIONED")
+        assert stored["ts_ms"] == current_ts_ms
+        assert (store.thumbnail_dir / stored["thumbnail_path"]).read_bytes() == (
+            b"current-frame"
+        )
+        assert [path.name for path in store.thumbnail_dir.iterdir()] == [
+            stored["thumbnail_path"]
+        ]
+    finally:
+        release_stale.set()
+        store.close()

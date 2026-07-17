@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -11,7 +13,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -27,6 +29,8 @@ from .protect_client import (
 from .security import hash_password, new_session_token, verify_password
 from .square_client import (
     SquareAuthError,
+    oauth_authorize_url,
+    oauth_exchange,
     SquareClient,
     SquareError,
     SquarePermissionError,
@@ -86,6 +90,11 @@ class CameraMappingEntry(BaseModel):
     camera_id: str = Field(min_length=1, max_length=64)
     camera_name: str = Field(default="", max_length=128)
 
+class SquareOAuthAppBody(BaseModel):
+    client_id: str = Field(min_length=8, max_length=128)
+    client_secret: str = Field(min_length=8, max_length=256)
+    environment: str = "production"
+
 class CameraMappingBody(BaseModel):
     mappings: list[CameraMappingEntry]
 
@@ -138,7 +147,57 @@ def create_app(
             api_key=settings["protect.api_key"],
         )
 
+    def _maybe_refresh_oauth_token() -> None:
+        oauth = store.get_settings(
+            (
+                "square.oauth_client_id",
+                "square.oauth_client_secret",
+                "square.refresh_token",
+                "square.token_expires_at",
+                "square.environment",
+            )
+        )
+        if not (
+            oauth["square.oauth_client_id"]
+            and oauth["square.oauth_client_secret"]
+            and oauth["square.refresh_token"]
+            and oauth["square.token_expires_at"]
+        ):
+            return
+        try:
+            expires = datetime.datetime.fromisoformat(
+                oauth["square.token_expires_at"].replace("Z", "+00:00")
+            )
+        except ValueError:
+            return
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if expires - now > datetime.timedelta(days=3):
+            return
+        try:
+            tokens = oauth_exchange(
+                oauth["square.environment"] or "production",
+                oauth["square.oauth_client_id"],
+                oauth["square.oauth_client_secret"],
+                refresh_token=oauth["square.refresh_token"],
+                transport=square_transport,
+            )
+        except SquareError as exc:
+            logger.warning("Square OAuth token refresh failed: %s", exc)
+            return
+        store.update_settings(
+            {
+                "square.access_token": (tokens["access_token"], True),
+                "square.refresh_token": (
+                    tokens.get("refresh_token")
+                    or oauth["square.refresh_token"],
+                    True,
+                ),
+                "square.token_expires_at": (tokens.get("expires_at", ""), False),
+            }
+        )
+
     def build_square() -> SquareClient | None:
+        _maybe_refresh_oauth_token()
         token = store.get_setting("square.access_token")
         if not token:
             return None
@@ -501,6 +560,79 @@ def create_app(
         # Blank webhook fields without clear_webhook leave any stored webhook
         # configuration untouched, so re-saving the access token is safe.
         return {"ok": True, "locations": locations}
+
+    @app.put("/api/settings/square/oauth-app")
+    def set_square_oauth_app(body: SquareOAuthAppBody, _=authed) -> dict:
+        """Store the Square application's OAuth client credentials."""
+        if body.environment not in ("production", "sandbox"):
+            raise HTTPException(status_code=422, detail="Invalid environment")
+        store.update_settings(
+            {
+                "square.oauth_client_id": (body.client_id.strip(), False),
+                "square.oauth_client_secret": (body.client_secret.strip(), True),
+                "square.environment": (body.environment, False),
+            }
+        )
+        return {"ok": True}
+
+    @app.get("/oauth/square/start")
+    def square_oauth_start(_=authed) -> RedirectResponse:
+        oauth = store.get_settings(
+            ("square.oauth_client_id", "square.environment")
+        )
+        if not oauth["square.oauth_client_id"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Save the Square application client id/secret first",
+            )
+        state = secrets.token_urlsafe(24)
+        store.set_setting("square.oauth_state", state)
+        return RedirectResponse(
+            oauth_authorize_url(
+                oauth["square.environment"] or "production",
+                oauth["square.oauth_client_id"],
+                state,
+            ),
+            status_code=302,
+        )
+
+    @app.get("/oauth/square/callback")
+    def square_oauth_callback(
+        code: str = "", state: str = "", _=authed
+    ) -> RedirectResponse:
+        expected_state = store.get_setting("square.oauth_state")
+        if not code or not expected_state or state != expected_state:
+            raise HTTPException(status_code=400, detail="Invalid OAuth state")
+        store.delete_setting("square.oauth_state")
+        oauth = store.get_settings(
+            (
+                "square.oauth_client_id",
+                "square.oauth_client_secret",
+                "square.environment",
+            )
+        )
+        try:
+            tokens = oauth_exchange(
+                oauth["square.environment"] or "production",
+                oauth["square.oauth_client_id"] or "",
+                oauth["square.oauth_client_secret"] or "",
+                code=code,
+                transport=square_transport,
+            )
+        except SquareAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except SquareError as exc:
+            raise HTTPException(status_code=502, detail=f"Could not reach Square: {exc}")
+        updates = {
+            "square.access_token": (tokens["access_token"], True),
+            "square.token_expires_at": (tokens.get("expires_at", ""), False),
+        }
+        if tokens.get("refresh_token"):
+            updates["square.refresh_token"] = (tokens["refresh_token"], True)
+        if tokens.get("merchant_id"):
+            updates["square.merchant_id"] = (tokens["merchant_id"], False)
+        store.update_settings(updates)
+        return RedirectResponse("/?square_oauth=connected", status_code=302)
 
     # -- cameras & mapping ------------------------------------------------------
 

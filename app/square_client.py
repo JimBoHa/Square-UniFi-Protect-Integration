@@ -239,3 +239,68 @@ def payment_from_api(payment: dict) -> dict:
         "card_last4": text_field(card, "last_4", "card_details.card.last_4"),
         "receipt_url": text_field(payment, "receipt_url"),
     }
+
+
+OAUTH_SCOPES = ("MERCHANT_PROFILE_READ", "PAYMENTS_READ")
+
+
+def oauth_authorize_url(environment: str, client_id: str, state: str) -> str:
+    """Square OAuth consent URL for the configured environment."""
+    if environment not in BASE_URLS:
+        raise ValueError("environment must be 'production' or 'sandbox'")
+    base = BASE_URLS[environment]
+    scope = "+".join(OAUTH_SCOPES)
+    return (
+        f"{base}/oauth2/authorize?client_id={client_id}"
+        f"&scope={scope}&session=false&state={state}"
+    )
+
+
+def oauth_exchange(
+    environment: str,
+    client_id: str,
+    client_secret: str,
+    *,
+    code: str | None = None,
+    refresh_token: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+    timeout: float = 15.0,
+) -> dict:
+    """Exchange an authorization code (or refresh token) for tokens.
+
+    Returns the token payload: access_token, refresh_token, expires_at,
+    merchant_id.
+    """
+    if environment not in BASE_URLS:
+        raise ValueError("environment must be 'production' or 'sandbox'")
+    body: dict = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    if code is not None:
+        body.update({"grant_type": "authorization_code", "code": code})
+    elif refresh_token is not None:
+        body.update({"grant_type": "refresh_token", "refresh_token": refresh_token})
+    else:
+        raise ValueError("code or refresh_token is required")
+    client = httpx.Client(
+        base_url=BASE_URLS[environment], transport=transport, timeout=timeout
+    )
+    try:
+        try:
+            resp = client.post("/oauth2/token", json=body)
+        except httpx.RequestError as exc:
+            raise SquareError("Network error while contacting Square") from exc
+    finally:
+        client.close()
+    if resp.status_code in (400, 401, 403):
+        raise SquareAuthError("Square rejected the OAuth request")
+    if resp.status_code >= 400:
+        raise SquareError(f"Square OAuth failed (HTTP {resp.status_code})")
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise SquareError("Square returned a non-JSON response") from exc
+    if not isinstance(data, dict) or not data.get("access_token"):
+        raise SquareError("Square returned an invalid OAuth response")
+    return data

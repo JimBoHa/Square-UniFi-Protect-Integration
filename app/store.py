@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import threading
 import time
@@ -40,6 +41,17 @@ CREATE TABLE IF NOT EXISTS transactions (
     raw TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_transactions_ts ON transactions (ts_ms DESC);
+CREATE TABLE IF NOT EXISTS thumbnail_retries (
+    transaction_id TEXT PRIMARY KEY,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    lease_token TEXT,
+    lease_expires_at REAL,
+    last_error TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_thumbnail_retries_due
+    ON thumbnail_retries (next_attempt_at, lease_expires_at);
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
     expires_at REAL NOT NULL
@@ -60,6 +72,19 @@ class Store:
         with self._lock:
             self._db.executescript(_SCHEMA)
             self._migrate_transactions()
+            # Upgrade existing databases: any transaction that already missed
+            # its thumbnail must enter the durable retry queue.
+            self._db.execute(
+                "INSERT OR IGNORE INTO thumbnail_retries (transaction_id) "
+                "SELECT id FROM transactions "
+                "WHERE camera_id IS NOT NULL AND thumbnail_path IS NULL"
+            )
+            self._db.execute(
+                "DELETE FROM thumbnail_retries WHERE NOT EXISTS ("
+                "SELECT 1 FROM transactions t "
+                "WHERE t.id = thumbnail_retries.transaction_id "
+                "AND t.camera_id IS NOT NULL AND t.thumbnail_path IS NULL)"
+            )
             self._db.commit()
 
     def _migrate_transactions(self) -> None:
@@ -193,32 +218,266 @@ class Store:
         values["updated_ts_ms"] = txn.get("updated_ts_ms", txn["ts_ms"])
 
         with self._lock:
-            existing = self._db.execute(
-                "SELECT id FROM transactions WHERE id = ?", (txn["id"],)
-            ).fetchone()
-            self._db.execute(
-                "INSERT INTO transactions (id, created_at, ts_ms, updated_at, updated_ts_ms, "
-                "amount, currency, status, location_id, card_last4, receipt_url, camera_id, "
-                "thumbnail_path, raw) VALUES (:id, :created_at, :ts_ms, :updated_at, "
-                ":updated_ts_ms, :amount, :currency, :status, :location_id, :card_last4, "
-                ":receipt_url, :camera_id, :thumbnail_path, :raw) "
-                "ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at, "
-                "ts_ms=excluded.ts_ms, updated_at=excluded.updated_at, "
-                "updated_ts_ms=excluded.updated_ts_ms, amount=excluded.amount, "
-                "currency=excluded.currency, status=excluded.status, "
-                "location_id=excluded.location_id, card_last4=excluded.card_last4, "
-                "receipt_url=excluded.receipt_url, raw=excluded.raw, "
-                "camera_id=CASE WHEN excluded.ts_ms != transactions.ts_ms "
-                "THEN excluded.camera_id ELSE COALESCE(excluded.camera_id, "
-                "transactions.camera_id) END, "
-                "thumbnail_path=CASE WHEN excluded.ts_ms != transactions.ts_ms "
-                "THEN excluded.thumbnail_path ELSE COALESCE(excluded.thumbnail_path, "
-                "transactions.thumbnail_path) END "
-                "WHERE excluded.updated_ts_ms >= transactions.updated_ts_ms",
-                values,
-            )
-            self._db.commit()
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._db.execute(
+                    "SELECT id, camera_id, ts_ms FROM transactions WHERE id = ?",
+                    (txn["id"],),
+                ).fetchone()
+                self._db.execute(
+                    "INSERT INTO transactions (id, created_at, ts_ms, updated_at, updated_ts_ms, "
+                    "amount, currency, status, location_id, card_last4, receipt_url, camera_id, "
+                    "thumbnail_path, raw) VALUES (:id, :created_at, :ts_ms, :updated_at, "
+                    ":updated_ts_ms, :amount, :currency, :status, :location_id, :card_last4, "
+                    ":receipt_url, :camera_id, :thumbnail_path, :raw) "
+                    "ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at, "
+                    "ts_ms=excluded.ts_ms, updated_at=excluded.updated_at, "
+                    "updated_ts_ms=excluded.updated_ts_ms, amount=excluded.amount, "
+                    "currency=excluded.currency, status=excluded.status, "
+                    "location_id=excluded.location_id, card_last4=excluded.card_last4, "
+                    "receipt_url=excluded.receipt_url, raw=excluded.raw, "
+                    "camera_id=CASE WHEN excluded.ts_ms != transactions.ts_ms "
+                    "THEN excluded.camera_id ELSE COALESCE(excluded.camera_id, "
+                    "transactions.camera_id) END, "
+                    "thumbnail_path=CASE WHEN excluded.ts_ms != transactions.ts_ms "
+                    "THEN excluded.thumbnail_path ELSE COALESCE(excluded.thumbnail_path, "
+                    "transactions.thumbnail_path) END "
+                    "WHERE excluded.updated_ts_ms >= transactions.updated_ts_ms",
+                    values,
+                )
+                current = self._db.execute(
+                    "SELECT camera_id, ts_ms, thumbnail_path FROM transactions WHERE id = ?",
+                    (txn["id"],),
+                ).fetchone()
+                # Evidence changed when the camera or the sale time moved; a
+                # changed job must retry immediately instead of waiting out a
+                # backoff earned by different evidence.
+                evidence_changed = bool(
+                    existing
+                    and current
+                    and (
+                        existing["camera_id"] != current["camera_id"]
+                        or existing["ts_ms"] != current["ts_ms"]
+                    )
+                )
+                if current and current["camera_id"] and not current["thumbnail_path"]:
+                    if evidence_changed:
+                        self._db.execute(
+                            "INSERT INTO thumbnail_retries (transaction_id) VALUES (?) "
+                            "ON CONFLICT(transaction_id) DO UPDATE SET attempts = 0, "
+                            "next_attempt_at = 0, lease_token = NULL, "
+                            "lease_expires_at = NULL, last_error = ''",
+                            (txn["id"],),
+                        )
+                    else:
+                        self._db.execute(
+                            "INSERT OR IGNORE INTO thumbnail_retries (transaction_id) "
+                            "VALUES (?)",
+                            (txn["id"],),
+                        )
+                else:
+                    self._db.execute(
+                        "DELETE FROM thumbnail_retries WHERE transaction_id = ?",
+                        (txn["id"],),
+                    )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
         return existing is None
+
+    def claim_thumbnail_retries(
+        self,
+        limit: int,
+        lease_seconds: float,
+        *,
+        now: float | None = None,
+    ) -> list[dict]:
+        """Lease a bounded batch of due thumbnail jobs.
+
+        ``BEGIN IMMEDIATE`` serializes claimers across Store instances and
+        processes. Each row gets a unique token so an expired worker cannot
+        commit over a newer claim.
+        """
+        limit = max(1, min(int(limit), 100))
+        lease_seconds = max(1.0, float(lease_seconds))
+        claimed_at = time.time() if now is None else float(now)
+        claimed: list[dict] = []
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._db.execute(
+                    "SELECT r.transaction_id, r.attempts, t.camera_id, t.ts_ms "
+                    "FROM thumbnail_retries r "
+                    "JOIN transactions t ON t.id = r.transaction_id "
+                    "WHERE t.camera_id IS NOT NULL AND t.thumbnail_path IS NULL "
+                    "AND r.next_attempt_at <= ? "
+                    "AND (r.lease_token IS NULL OR r.lease_expires_at <= ?) "
+                    "ORDER BY r.next_attempt_at, t.ts_ms, r.transaction_id LIMIT ?",
+                    (claimed_at, claimed_at, limit),
+                ).fetchall()
+                for row in rows:
+                    token = secrets.token_hex(16)
+                    updated = self._db.execute(
+                        "UPDATE thumbnail_retries "
+                        "SET lease_token = ?, lease_expires_at = ? "
+                        "WHERE transaction_id = ? "
+                        "AND next_attempt_at <= ? "
+                        "AND (lease_token IS NULL OR lease_expires_at <= ?)",
+                        (
+                            token,
+                            claimed_at + lease_seconds,
+                            row["transaction_id"],
+                            claimed_at,
+                            claimed_at,
+                        ),
+                    )
+                    if updated.rowcount == 1:
+                        claimed.append(
+                            {
+                                "transaction_id": row["transaction_id"],
+                                "camera_id": row["camera_id"],
+                                "ts_ms": row["ts_ms"],
+                                "attempts": row["attempts"],
+                                "lease_token": token,
+                            }
+                        )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return claimed
+
+    def complete_thumbnail_retry(
+        self,
+        transaction_id: str,
+        lease_token: str,
+        camera_id: str,
+        ts_ms: int,
+        thumbnail_path: str,
+    ) -> bool:
+        """Attach retry evidence only when token, camera, and time still match."""
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                retry = self._db.execute(
+                    "SELECT 1 FROM thumbnail_retries "
+                    "WHERE transaction_id = ? AND lease_token = ?",
+                    (transaction_id, lease_token),
+                ).fetchone()
+                if retry is None:
+                    self._db.commit()
+                    return False
+
+                updated = self._db.execute(
+                    "UPDATE transactions SET thumbnail_path = ? "
+                    "WHERE id = ? AND camera_id = ? AND ts_ms = ? "
+                    "AND thumbnail_path IS NULL",
+                    (thumbnail_path, transaction_id, camera_id, int(ts_ms)),
+                )
+                if updated.rowcount == 1:
+                    self._db.execute(
+                        "DELETE FROM thumbnail_retries "
+                        "WHERE transaction_id = ? AND lease_token = ?",
+                        (transaction_id, lease_token),
+                    )
+                    self._db.commit()
+                    return True
+
+                self._requeue_changed_thumbnail_locked(transaction_id, lease_token)
+                self._db.commit()
+                return False
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def fail_thumbnail_retry(
+        self,
+        transaction_id: str,
+        lease_token: str,
+        camera_id: str,
+        ts_ms: int,
+        error: str,
+        *,
+        now: float | None = None,
+        base_delay_seconds: float = 30.0,
+        max_delay_seconds: float = 3600.0,
+    ) -> bool:
+        """Release a claimed job with exponential, capped retry backoff."""
+        failed_at = time.time() if now is None else float(now)
+        base_delay_seconds = max(1.0, float(base_delay_seconds))
+        max_delay_seconds = max(base_delay_seconds, float(max_delay_seconds))
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                retry = self._db.execute(
+                    "SELECT attempts FROM thumbnail_retries "
+                    "WHERE transaction_id = ? AND lease_token = ?",
+                    (transaction_id, lease_token),
+                ).fetchone()
+                if retry is None:
+                    self._db.commit()
+                    return False
+
+                txn = self._db.execute(
+                    "SELECT camera_id, ts_ms, thumbnail_path FROM transactions WHERE id = ?",
+                    (transaction_id,),
+                ).fetchone()
+                same_evidence = bool(
+                    txn
+                    and txn["camera_id"] == camera_id
+                    and txn["ts_ms"] == int(ts_ms)
+                    and not txn["thumbnail_path"]
+                )
+                if not same_evidence:
+                    self._requeue_changed_thumbnail_locked(transaction_id, lease_token)
+                    self._db.commit()
+                    return True
+
+                attempts = int(retry["attempts"]) + 1
+                delay = min(
+                    base_delay_seconds * (2 ** min(attempts - 1, 30)),
+                    max_delay_seconds,
+                )
+                updated = self._db.execute(
+                    "UPDATE thumbnail_retries SET attempts = ?, next_attempt_at = ?, "
+                    "lease_token = NULL, lease_expires_at = NULL, last_error = ? "
+                    "WHERE transaction_id = ? AND lease_token = ?",
+                    (
+                        attempts,
+                        failed_at + delay,
+                        str(error)[:1000],
+                        transaction_id,
+                        lease_token,
+                    ),
+                )
+                self._db.commit()
+                return updated.rowcount == 1
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def _requeue_changed_thumbnail_locked(
+        self, transaction_id: str, lease_token: str
+    ) -> None:
+        """Reset changed evidence immediately, or discard a finished/stale job."""
+        txn = self._db.execute(
+            "SELECT camera_id, thumbnail_path FROM transactions WHERE id = ?",
+            (transaction_id,),
+        ).fetchone()
+        if txn and txn["camera_id"] and not txn["thumbnail_path"]:
+            self._db.execute(
+                "UPDATE thumbnail_retries SET attempts = 0, next_attempt_at = 0, "
+                "lease_token = NULL, lease_expires_at = NULL, last_error = '' "
+                "WHERE transaction_id = ? AND lease_token = ?",
+                (transaction_id, lease_token),
+            )
+        else:
+            self._db.execute(
+                "DELETE FROM thumbnail_retries "
+                "WHERE transaction_id = ? AND lease_token = ?",
+                (transaction_id, lease_token),
+            )
 
     def get_transaction(self, txn_id: str) -> dict | None:
         with self._lock:

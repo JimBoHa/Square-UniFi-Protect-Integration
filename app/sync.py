@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
 from datetime import datetime, timedelta, timezone
+
+import httpx
 
 from .protect_client import ProtectClient, ProtectError
 from .square_client import SquareClient, payment_from_api
@@ -15,6 +18,11 @@ logger = logging.getLogger("spi.sync")
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_\-]")
 BACKFILL_HOURS = 24
+THUMBNAIL_RETRY_BATCH_SIZE = 10
+THUMBNAIL_RETRY_LEASE_SECONDS = 5 * 60
+THUMBNAIL_RETRY_BASE_DELAY_SECONDS = 30
+THUMBNAIL_RETRY_MAX_DELAY_SECONDS = 60 * 60
+_THUMBNAIL_ERRORS = (ProtectError, httpx.RequestError, ValueError, OSError)
 
 
 def parse_ts_ms(created_at: str) -> int:
@@ -27,6 +35,21 @@ def safe_thumbnail_name(payment_id: str) -> str:
     if not cleaned:
         raise ValueError("Payment id yields no safe filename")
     return f"{cleaned}.jpg"
+
+
+def retry_thumbnail_name(
+    payment_id: str,
+    camera_id: str,
+    ts_ms: int,
+    lease_token: str,
+) -> str:
+    """Unique filename bound to claimed camera/time evidence."""
+    cleaned = _SAFE_ID_RE.sub("", payment_id)[:48]
+    if not cleaned:
+        raise ValueError("Payment id yields no safe filename")
+    evidence = f"{payment_id}\0{camera_id}\0{int(ts_ms)}\0{lease_token}".encode()
+    digest = hashlib.sha256(evidence).hexdigest()[:24]
+    return f"{cleaned}-{int(ts_ms)}-{digest}.jpg"
 
 
 def _ingest_payment_with_status(
@@ -47,24 +70,34 @@ def _ingest_payment_with_status(
     # A stale out-of-order event is ignored by the versioned upsert, so it must
     # not overwrite the on-disk thumbnail with a wrong-time frame either.
     stale_event = bool(existing and txn["updated_ts_ms"] < existing["updated_ts_ms"])
-    already_has_current_thumb = bool(
-        existing
-        and existing.get("thumbnail_path")
-        and existing.get("ts_ms") == txn["ts_ms"]
-    )
+    ts_unchanged = bool(existing and existing["ts_ms"] == txn["ts_ms"])
 
     if (
+        existing
+        and existing.get("camera_id")
+        and existing.get("thumbnail_path")
+        and (ts_unchanged or stale_event)
+    ):
+        # Camera and thumbnail form one historical evidence record. A later
+        # location remap applies to new/missing evidence, never to this pair.
+        txn["camera_id"] = existing["camera_id"]
+        txn["thumbnail_path"] = existing["thumbnail_path"]
+    elif (
         protect is not None
         and txn["camera_id"]
         and not stale_event
-        and not already_has_current_thumb
+        and (existing is None or not ts_unchanged)
     ):
+        # Capture inline only for brand-new transactions or corrected sale
+        # times. Existing misses belong to the durable retry queue; fetching
+        # them here would bypass its next_attempt_at backoff on every Square
+        # overlap page.
         try:
             image = protect.get_snapshot(txn["camera_id"], ts_ms=txn["ts_ms"])
             name = safe_thumbnail_name(txn["id"])
             (store.thumbnail_dir / name).write_bytes(image)
             txn["thumbnail_path"] = name
-        except (ProtectError, ValueError, OSError) as exc:
+        except _THUMBNAIL_ERRORS as exc:
             logger.warning("Thumbnail capture failed for %s: %s", txn["id"], exc)
 
     return txn, store.upsert_transaction(txn)
@@ -78,47 +111,119 @@ def ingest_payment(
     return txn
 
 
+def retry_missing_thumbnails(
+    store: Store,
+    protect: ProtectClient,
+    *,
+    batch_size: int = THUMBNAIL_RETRY_BATCH_SIZE,
+    now: float | None = None,
+) -> int:
+    """Retry a bounded batch independently of Square's current payment window."""
+    batch_size = max(0, min(int(batch_size), 100))
+    completed = 0
+    for _ in range(batch_size):
+        jobs = store.claim_thumbnail_retries(
+            1,
+            THUMBNAIL_RETRY_LEASE_SECONDS,
+            now=now,
+        )
+        if not jobs:
+            break
+        job = jobs[0]
+        path = None
+        try:
+            image = protect.get_snapshot(job["camera_id"], ts_ms=job["ts_ms"])
+            name = retry_thumbnail_name(
+                job["transaction_id"],
+                job["camera_id"],
+                job["ts_ms"],
+                job["lease_token"],
+            )
+            path = store.thumbnail_dir / name
+            path.write_bytes(image)
+            attached = store.complete_thumbnail_retry(
+                job["transaction_id"],
+                job["lease_token"],
+                job["camera_id"],
+                job["ts_ms"],
+                name,
+            )
+            if attached:
+                completed += 1
+            else:
+                path.unlink(missing_ok=True)
+        except _THUMBNAIL_ERRORS as exc:
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            store.fail_thumbnail_retry(
+                job["transaction_id"],
+                job["lease_token"],
+                job["camera_id"],
+                job["ts_ms"],
+                str(exc),
+                now=now,
+                base_delay_seconds=THUMBNAIL_RETRY_BASE_DELAY_SECONDS,
+                max_delay_seconds=THUMBNAIL_RETRY_MAX_DELAY_SECONDS,
+            )
+            logger.warning(
+                "Thumbnail retry failed for %s: %s", job["transaction_id"], exc
+            )
+    return completed
+
+
 def sync_payments(
     store: Store, square: SquareClient, protect: ProtectClient | None
 ) -> int:
     """Pull recent Square payments and ingest them. Returns count ingested."""
     count = 0
     seen_payment_ids: set[str] = set()
-    for location in square.list_locations():
-        location_id = location.get("id", "")
-        if not location_id:
-            logger.warning("Skipping Square location without an id")
-            continue
-
-        # Watermark on Square's updated_at so delayed completions, refunds, and
-        # other state changes to older payments are still reconciled.
-        latest = store.latest_transaction_updated_ts(location_id=location_id)
-        if latest:
-            begin = datetime.fromtimestamp(latest / 1000, tz=timezone.utc) - timedelta(
-                minutes=5
-            )
-        else:
-            begin = datetime.now(tz=timezone.utc) - timedelta(hours=BACKFILL_HOURS)
-        payments = square.list_payments(
-            updated_at_begin_time=begin.isoformat(timespec="seconds").replace(
-                "+00:00", "Z"
-            ),
-            sort_field="UPDATED_AT",
-            location_id=location_id,
-        )
-
-        for payment in payments:
-            payment_id = payment.get("id", "")
-            if payment_id and payment_id in seen_payment_ids:
+    try:
+        for location in square.list_locations():
+            location_id = location.get("id", "")
+            if not location_id:
+                logger.warning("Skipping Square location without an id")
                 continue
+
+            # Watermark on Square's updated_at so delayed completions, refunds,
+            # and other state changes to older payments are still reconciled.
+            latest = store.latest_transaction_updated_ts(location_id=location_id)
+            if latest:
+                begin = datetime.fromtimestamp(
+                    latest / 1000, tz=timezone.utc
+                ) - timedelta(minutes=5)
+            else:
+                begin = datetime.now(tz=timezone.utc) - timedelta(hours=BACKFILL_HOURS)
+            payments = square.list_payments(
+                updated_at_begin_time=begin.isoformat(timespec="seconds").replace(
+                    "+00:00", "Z"
+                ),
+                sort_field="UPDATED_AT",
+                location_id=location_id,
+            )
+
+            for payment in payments:
+                payment_id = payment.get("id", "")
+                if payment_id and payment_id in seen_payment_ids:
+                    continue
+                try:
+                    _txn, is_new = _ingest_payment_with_status(store, payment, protect)
+                    if is_new:
+                        count += 1
+                    if payment_id:
+                        seen_payment_ids.add(payment_id)
+                except ValueError as exc:
+                    logger.warning("Skipping malformed payment: %s", exc)
+    finally:
+        # Retry persisted misses after fresh payments. This still runs when
+        # Square listing fails, and never contributes to the ingested count.
+        if protect is not None:
             try:
-                _txn, is_new = _ingest_payment_with_status(store, payment, protect)
-                if is_new:
-                    count += 1
-                if payment_id:
-                    seen_payment_ids.add(payment_id)
-            except ValueError as exc:
-                logger.warning("Skipping malformed payment: %s", exc)
+                retry_missing_thumbnails(store, protect)
+            except Exception as exc:
+                logger.warning("Thumbnail retry batch failed: %s", exc)
     return count
 
 

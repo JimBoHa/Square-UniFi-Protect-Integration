@@ -17,15 +17,19 @@ timeline near that timestamp.
   API before saving.
 - **Connect your UniFi Protect console** — local-account credentials for your
   UniFi OS console (Dream Machine, NVR, etc.), verified on save.
-- **Choose the POS camera** — for each Square location, pick which Protect
-  camera watches the register, with a live snapshot preview.
+- **Choose the POS camera per register** — map each observed Square POS device
+  to its own Protect camera, with per-location fallbacks and a live snapshot
+  preview. Multi-register stores get the right footage for each terminal.
 - **Transaction feed** — payments appear in the companion app with timestamp,
-  amount, card last-4, status, and a camera thumbnail.
+  tip-inclusive amount, card last-4, status, and a camera thumbnail; the feed
+  auto-refreshes while visible.
 - **Click through to footage** — clicking a thumbnail uses the configured URL
   template to open the Protect timeline near the transaction timestamp.
-- **Real-time + backfill** — a Square webhook receiver ingests payments the
-  moment they happen (HMAC-SHA256 signature verified), and a background poller
-  backfills/refreshes via the Square Payments API.
+- **Real-time + backfill** — a Square webhook receiver acknowledges deliveries
+  immediately (HMAC-SHA256 signature verified) and captures footage
+  asynchronously, while a background poller reconciles every Square location
+  by update time. Missed thumbnails persist in a durable retry queue with
+  backoff, so a Protect outage never permanently loses evidence.
 
 ## Protect integration boundary
 
@@ -102,7 +106,7 @@ from the internet; everything else can stay LAN-only.
 ## Development
 
 ```bash
-.venv/bin/python -m pytest        # 91 functional + security tests
+.venv/bin/python -m pytest        # functional + security tests
 ```
 
 Tests run against mocked Square and UniFi Protect APIs. Passing tests do not

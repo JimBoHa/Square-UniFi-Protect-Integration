@@ -405,29 +405,39 @@ def sync_payments(
                 ) - timedelta(minutes=5)
             else:
                 begin = datetime.now(tz=timezone.utc) - timedelta(hours=BACKFILL_HOURS)
-            payments = square.list_payments(
-                updated_at_begin_time=begin.isoformat(timespec="seconds").replace(
+            payment_query = {
+                "updated_at_begin_time": begin.isoformat(timespec="seconds").replace(
                     "+00:00", "Z"
                 ),
-                sort_field="UPDATED_AT",
+                "sort_field": "UPDATED_AT",
                 # Keep the durable watermark behind any unprocessed result if
                 # ingestion is interrupted partway through the response.
-                sort_order="ASC",
-                location_id=location_id,
-            )
+                "sort_order": "ASC",
+                "location_id": location_id,
+            }
+            iter_pages = getattr(square, "iter_payment_pages", None)
+            if callable(iter_pages):
+                payment_pages = iter_pages(**payment_query)
+            else:
+                # Preserve compatibility with lightweight Square test doubles
+                # and callers that implement the former list-only interface.
+                payment_pages = (square.list_payments(**payment_query),)
 
-            for payment in payments:
-                payment_id = payment.get("id", "")
-                if payment_id and payment_id in seen_payment_ids:
-                    continue
-                try:
-                    _txn, is_new = _ingest_payment_with_status(store, payment, protect)
-                    if is_new:
-                        count += 1
-                    if payment_id:
-                        seen_payment_ids.add(payment_id)
-                except ValueError as exc:
-                    logger.warning("Skipping malformed payment: %s", exc)
+            for payments in payment_pages:
+                for payment in payments:
+                    payment_id = payment.get("id", "")
+                    if payment_id and payment_id in seen_payment_ids:
+                        continue
+                    try:
+                        _txn, is_new = _ingest_payment_with_status(
+                            store, payment, protect
+                        )
+                        if is_new:
+                            count += 1
+                        if payment_id:
+                            seen_payment_ids.add(payment_id)
+                    except ValueError as exc:
+                        logger.warning("Skipping malformed payment: %s", exc)
     finally:
         # Durable Protect work runs even when Square listing fails, and never
         # contributes to the ingested count: first any pending sale alarms,

@@ -926,6 +926,100 @@ def test_square_pagination_exhausts_cursor_pages_by_default():
     assert request_limits == [100, 100]
     client.close()
 
+
+def test_square_payment_page_iterator_honors_total_limit():
+    pages = {
+        None: {
+            "payments": [{"id": "P0"}, {"id": "P1"}, {"id": "P2"}],
+            "cursor": "next1",
+        },
+        "next1": {
+            # Deliberately over-return to verify the client still enforces the
+            # caller's total limit rather than trusting the provider page size.
+            "payments": [{"id": "P3"}, {"id": "P4"}],
+            "cursor": "unused",
+        },
+    }
+    request_limits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_limits.append(int(request.url.params["limit"]))
+        return httpx.Response(200, json=pages[request.url.params.get("cursor")])
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        payment_pages = list(client.iter_payment_pages(limit=4))
+    finally:
+        client.close()
+
+    assert [[payment["id"] for payment in page] for page in payment_pages] == [
+        ["P0", "P1", "P2"],
+        ["P3"],
+    ]
+    assert request_limits == [4, 1]
+
+
+def test_square_payment_page_iterator_rejects_repeated_cursor():
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            json={"payments": [{"id": f"P{requests}"}], "cursor": "loop"},
+        )
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    pages = client.iter_payment_pages()
+    try:
+        assert [payment["id"] for payment in next(pages)] == ["P1"]
+        with pytest.raises(SquareError, match="repeated pagination cursor"):
+            next(pages)
+    finally:
+        client.close()
+
+    assert requests == 2
+
+
+def test_sync_persists_page_before_later_square_failure(tmp_path):
+    first_payment = {
+        "id": "P_FIRST_PAGE",
+        "created_at": "2026-07-17T20:00:00Z",
+        "updated_at": "2026-07-17T20:00:00Z",
+        "amount_money": {"amount": 100, "currency": "USD"},
+        "status": "COMPLETED",
+        "location_id": "LOC1",
+    }
+    payment_cursors = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/locations":
+            return httpx.Response(200, json={"locations": [{"id": "LOC1"}]})
+        cursor = request.url.params.get("cursor")
+        payment_cursors.append(cursor)
+        if cursor is None:
+            return httpx.Response(
+                200,
+                json={"payments": [first_payment], "cursor": "next1"},
+            )
+        return httpx.Response(
+            503,
+            json={"errors": [{"code": "SERVICE_UNAVAILABLE"}]},
+        )
+
+    store = Store(tmp_path / "data")
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match="HTTP 503"):
+            sync_payments(store, client, None)
+        assert store.get_transaction("P_FIRST_PAGE") is not None
+        assert payment_cursors == [None, "next1"]
+    finally:
+        client.close()
+        store.close()
+
+
 def test_square_pagination_rejects_repeated_cursor():
     requests = 0
 

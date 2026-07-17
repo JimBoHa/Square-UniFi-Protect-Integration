@@ -62,11 +62,19 @@ up everything on first run, starts the app, and opens the dashboard in your
 browser. Keep the Terminal window it opens in the background; closing it stops
 the app.
 
-**Any platform (terminal):**
+**Linux or macOS (terminal):**
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/uvicorn app.main:app --factory --host 0.0.0.0 --port 8000
+```
+
+**Windows (PowerShell):**
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --factory --host 0.0.0.0 --port 8000
 ```
 
 Open `http://<host>:8000`, then:
@@ -96,6 +104,7 @@ Open `http://<host>:8000`, then:
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
 | `SPI_DATA_DIR` | `./data` | SQLite DB, encryption key, thumbnails |
+| `SPI_PORT` | `8000` | Port used by `Start Square Protect.command` |
 | `SPI_POLL_INTERVAL` | `60` | Seconds between Square polls |
 | `SPI_DISABLE_POLLER` | `0` | Set `1` to disable background polling |
 | `SPI_COOKIE_SECURE` | `0` | Set `1` when serving over HTTPS |

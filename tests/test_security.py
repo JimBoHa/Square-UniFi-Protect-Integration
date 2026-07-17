@@ -11,7 +11,13 @@ from app.main import SQUARE_WEBHOOK_MAX_BODY_BYTES
 from app.store import Store
 from app.sync import ingest_payment
 
-from .conftest import ADMIN_PASSWORD, PROTECT_PASS, SQUARE_TOKEN, WEBHOOK_KEY
+from .conftest import (
+    ADMIN_PASSWORD,
+    PROTECT_PASS,
+    SQUARE_MERCHANT_ID,
+    SQUARE_TOKEN,
+    WEBHOOK_KEY,
+)
 from .test_api import make_webhook_event
 
 PROTECTED_ENDPOINTS = [
@@ -330,6 +336,7 @@ def test_malicious_payment_fields_returned_as_json_not_html(configured):
 
     payload = json.dumps(
         {
+            "merchant_id": SQUARE_MERCHANT_ID,
             "type": "payment.updated",
             "data": {
                 "object": {

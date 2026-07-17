@@ -77,6 +77,15 @@ class SquareClient:
             for loc in data.get("locations", [])
         ]
 
+    def merchant_id(self) -> str:
+        """Return the merchant bound to this access token."""
+        data = self._get("/v2/merchants/me")
+        merchant = data.get("merchant") if isinstance(data, dict) else None
+        merchant_id = merchant.get("id", "") if isinstance(merchant, dict) else ""
+        if not merchant_id:
+            raise SquareError("Square did not return the access token's merchant id")
+        return merchant_id
+
     def list_payments(
         self,
         begin_time: str | None = None,

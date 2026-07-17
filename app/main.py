@@ -435,6 +435,7 @@ def create_app(
         try:
             try:
                 locations = client.list_locations()
+                merchant_id = client.merchant_id()
             except SquarePermissionError as exc:
                 raise HTTPException(
                     status_code=403,
@@ -458,6 +459,7 @@ def create_app(
         settings_updates = {
             "square.access_token": (body.access_token, True),
             "square.environment": (body.environment, False),
+            "square.merchant_id": (merchant_id, False),
         }
         delete_keys = ()
         if body.webhook_signature_key and body.webhook_url:
@@ -660,8 +662,15 @@ def create_app(
 
     @app.post("/webhooks/square")
     async def square_webhook(request: Request) -> JSONResponse:
-        signature_key = store.get_setting("square.webhook_signature_key")
-        webhook_url = store.get_setting("square.webhook_url")
+        square_settings = store.get_settings(
+            (
+                "square.webhook_signature_key",
+                "square.webhook_url",
+                "square.merchant_id",
+            )
+        )
+        signature_key = square_settings["square.webhook_signature_key"]
+        webhook_url = square_settings["square.webhook_url"]
         if not signature_key or not webhook_url:
             raise HTTPException(status_code=403, detail="Webhook not configured")
         body = await read_square_webhook_body(request)
@@ -674,7 +683,13 @@ def create_app(
             event = _json.loads(body)
         except ValueError:
             raise HTTPException(status_code=422, detail="Invalid JSON payload")
-        event_data = event.get("data") if isinstance(event, dict) else None
+        if (
+            not isinstance(event, dict)
+            or not square_settings["square.merchant_id"]
+            or event.get("merchant_id") != square_settings["square.merchant_id"]
+        ):
+            return JSONResponse({"ok": True, "ignored": True})
+        event_data = event.get("data")
         event_object = (
             event_data.get("object") if isinstance(event_data, dict) else None
         )

@@ -77,7 +77,8 @@ Open `http://<host>:8000`, then:
    (Developer Dashboard → your application → Credentials). Optionally add your
    webhook signature key and notification URL for real-time ingestion
    (subscribe the webhook to `payment.updated` pointing at
-   `https://<your-host>/webhooks/square`).
+   `https://<your-host>/webhooks/square`). Existing installations must reconnect
+   Square once after upgrading so webhook events can be bound to that merchant.
 4. **Settings → POS camera** — pick the camera that watches each location's
    register.
 5. Open **Transactions** — press *Sync now* for an immediate backfill; the

@@ -137,6 +137,7 @@ $("#protect-form").addEventListener("submit", async (e) => {
     const alarm = result.alarm_configured ? " Alarm trigger enabled." : "";
     message(`Connected to UniFi Protect (${result.cameras} cameras found).${alarm}`, "ok");
     loadSettingsView();
+    void refreshProtectStatus();
   } catch (err) {
     message(err.message, "error");
   }
@@ -175,7 +176,31 @@ $("#square-form").addEventListener("submit", async (e) => {
   }
 });
 
+function setConnStatus(id, state, text) {
+  const el = $(id);
+  el.hidden = false;
+  el.className = `conn-status ${state}`;
+  el.querySelector(".conn-text").textContent = text;
+}
+
+async function refreshProtectStatus() {
+  setConnStatus("#protect-status", "checking", "Checking…");
+  try {
+    const health = await api("/api/health/protect");
+    if (!health.configured) {
+      setConnStatus("#protect-status", "", "Not connected");
+    } else if (health.ok) {
+      setConnStatus("#protect-status", "ok", health.detail);
+    } else {
+      setConnStatus("#protect-status", "bad", health.detail);
+    }
+  } catch (err) {
+    setConnStatus("#protect-status", "bad", err.message);
+  }
+}
+
 async function loadSettingsView() {
+  void refreshProtectStatus();
   const rows = $("#mapping-rows");
   rows.textContent = "";
   let cameras = [], locations = [], mappings = [], devices = [];

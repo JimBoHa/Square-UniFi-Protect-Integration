@@ -1613,3 +1613,60 @@ def test_webhook_ignores_non_payment_events(configured):
     )
     assert resp.status_code == 200
     assert resp.json().get("ignored") is True
+
+
+# -- connection health indicators ---------------------------------------------------
+
+def test_protect_health_unconfigured(authed):
+    health = authed.get("/api/health/protect").json()
+    assert health == {"configured": False, "ok": False, "detail": "Not configured"}
+
+def test_protect_health_connected(configured):
+    health = configured.get("/api/health/protect").json()
+    assert health["configured"] is True
+    assert health["ok"] is True
+    assert health["cameras"] == 2
+    assert "Connected" in health["detail"]
+
+def test_protect_health_reports_outage(tmp_path):
+    calls = {"n": 0}
+
+    def flaky_protect(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] > 2:  # healthy during settings save, down afterwards
+            raise httpx.ConnectError("console offline", request=request)
+        return protect_handler(request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(flaky_protect),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+            assert isolated.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
+            assert isolated.put(
+                "/api/settings/protect",
+                json={"host": "192.168.1.1", "username": PROTECT_USER, "password": PROTECT_PASS},
+            ).status_code == 200
+            health = isolated.get("/api/health/protect").json()
+        assert health["configured"] is True
+        assert health["ok"] is False
+        assert "console offline" not in health["detail"]  # no raw upstream detail
+    finally:
+        app.state.store.close()
+
+def test_protect_health_requires_auth(client):
+    assert client.get("/api/health/protect").status_code == 401
+
+def test_protect_status_indicator_ui_wiring():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js = (static_dir / "app.js").read_text()
+    html = (static_dir / "index.html").read_text()
+    assert 'api("/api/health/protect")' in js
+    assert "refreshProtectStatus" in js
+    assert 'id="protect-status"' in html

@@ -38,7 +38,11 @@
 
     <!-- Settings -->
     <section id="view-settings" hidden>
-      <h2>UniFi Protect console</h2>
+      <h2>UniFi Protect console
+        <span id="protect-status" class="conn-status" role="status" hidden>
+          <span class="conn-dot"></span><span class="conn-text"></span>
+        </span>
+      </h2>
       <form id="protect-form">
         <label>Host / IP <input id="protect-host" placeholder="192.168.1.1" required></label>
         <label>Username <input id="protect-username" autocomplete="off" required></label>

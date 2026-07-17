@@ -14,6 +14,15 @@ import httpx
 
 HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?(?::\d{1,5})?$")
 CAMERA_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
+_SNAPSHOT_CONTENT_TYPES = frozenset(
+    {
+        "image/jpeg",
+        "image/jpg",
+        "image/pjpeg",
+        "application/octet-stream",
+        "binary/octet-stream",
+    }
+)
 
 
 class ProtectError(Exception):
@@ -22,6 +31,27 @@ class ProtectError(Exception):
 
 class ProtectAuthError(ProtectError):
     pass
+
+
+def _validated_snapshot_bytes(resp: httpx.Response) -> bytes:
+    """Return a complete JPEG response or reject an upstream error document."""
+    content_type = (
+        resp.headers.get("content-type", "").partition(";")[0].strip().lower()
+    )
+    if content_type and content_type not in _SNAPSHOT_CONTENT_TYPES:
+        raise ProtectError("UniFi Protect snapshot response was not a JPEG")
+
+    content = resp.content
+    # Protect may omit Content-Type or use application/octet-stream, so the
+    # JPEG start/end markers are the authoritative payload check. Trailing
+    # bytes are allowed because JPEG decoders permit data after the EOI marker.
+    if (
+        len(content) < 4
+        or not content.startswith(b"\xff\xd8")
+        or content.find(b"\xff\xd9", 2) == -1
+    ):
+        raise ProtectError("UniFi Protect snapshot response contained invalid JPEG data")
+    return content
 
 
 def validate_host(host: str) -> str:
@@ -200,7 +230,7 @@ class ProtectClient:
                 raise_for_status=False,
             )
             if 200 <= resp.status_code < 300:
-                return resp.content
+                return _validated_snapshot_bytes(resp)
             content_type = resp.headers.get("content-type", "")
             if resp.status_code == 404 and "json" in content_type:
                 # Firmware supports the endpoint but has no recorded frame at
@@ -222,7 +252,7 @@ class ProtectClient:
         resp = self._request(
             "GET", f"/proxy/protect/api/cameras/{camera_id}/snapshot", params=params
         )
-        return resp.content
+        return _validated_snapshot_bytes(resp)
 
     def get_integration_info(self) -> dict:
         """Verify API-key access and return official Protect application metadata."""

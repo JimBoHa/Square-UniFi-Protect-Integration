@@ -31,6 +31,9 @@ def validate_host(host: str) -> str:
             "Protect host must be a hostname or IP address (optionally with :port), "
             "without scheme or path"
         )
+    _, separator, port = host.rpartition(":")
+    if separator and not 1 <= int(port) <= 65535:
+        raise ValueError("Protect host port must be between 1 and 65535")
     return host
 
 

@@ -87,6 +87,14 @@ def test_protect_host_rejects_url_injection(authed, host):
     )
     assert resp.status_code == 422
 
+def test_protect_host_rejects_out_of_range_port(authed):
+    resp = authed.put(
+        "/api/settings/protect",
+        json={"host": "unifi.local:99999", "username": "u", "password": "p"},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "Protect host port must be between 1 and 65535"
+
 def test_camera_preview_rejects_malformed_ids(configured):
     assert configured.get("/api/camera-preview/..%2F..%2Fetc").status_code in (404, 422)
     assert configured.get("/api/camera-preview/cam%20id").status_code == 422

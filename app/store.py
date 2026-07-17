@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
     ts_ms INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_ts_ms INTEGER NOT NULL,
     amount INTEGER NOT NULL,
     currency TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -57,7 +59,27 @@ class Store:
         self._db.row_factory = sqlite3.Row
         with self._lock:
             self._db.executescript(_SCHEMA)
+            self._migrate_transactions()
             self._db.commit()
+
+    def _migrate_transactions(self) -> None:
+        """Add transaction version columns without replacing existing tables."""
+        columns = {
+            row["name"]
+            for row in self._db.execute("PRAGMA table_info(transactions)").fetchall()
+        }
+        if "updated_at" not in columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN updated_at "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+            self._db.execute("UPDATE transactions SET updated_at = created_at")
+        if "updated_ts_ms" not in columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN updated_ts_ms "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._db.execute("UPDATE transactions SET updated_ts_ms = ts_ms")
 
     def close(self) -> None:
         self._db.close()
@@ -158,27 +180,37 @@ class Store:
 
     def upsert_transaction(self, txn: dict) -> bool:
         """Insert or update a transaction. Returns True if it was new."""
+        values = {
+            "camera_id": None,
+            "thumbnail_path": None,
+            "location_id": "",
+            "card_last4": "",
+            "receipt_url": "",
+            "raw": json.dumps(txn.get("raw", {})),
+            **{k: v for k, v in txn.items() if k != "raw"},
+        }
+        values["updated_at"] = txn.get("updated_at") or txn["created_at"]
+        values["updated_ts_ms"] = txn.get("updated_ts_ms", txn["ts_ms"])
+
         with self._lock:
             existing = self._db.execute(
                 "SELECT id FROM transactions WHERE id = ?", (txn["id"],)
             ).fetchone()
             self._db.execute(
-                "INSERT INTO transactions (id, created_at, ts_ms, amount, currency, status, "
-                "location_id, card_last4, receipt_url, camera_id, thumbnail_path, raw) "
-                "VALUES (:id, :created_at, :ts_ms, :amount, :currency, :status, :location_id, "
-                ":card_last4, :receipt_url, :camera_id, :thumbnail_path, :raw) "
-                "ON CONFLICT(id) DO UPDATE SET status=excluded.status, "
-                "camera_id=COALESCE(excluded.camera_id, camera_id), "
-                "thumbnail_path=COALESCE(excluded.thumbnail_path, thumbnail_path)",
-                {
-                    "camera_id": None,
-                    "thumbnail_path": None,
-                    "location_id": "",
-                    "card_last4": "",
-                    "receipt_url": "",
-                    "raw": json.dumps(txn.get("raw", {})),
-                    **{k: v for k, v in txn.items() if k != "raw"},
-                },
+                "INSERT INTO transactions (id, created_at, ts_ms, updated_at, updated_ts_ms, "
+                "amount, currency, status, location_id, card_last4, receipt_url, camera_id, "
+                "thumbnail_path, raw) VALUES (:id, :created_at, :ts_ms, :updated_at, "
+                ":updated_ts_ms, :amount, :currency, :status, :location_id, :card_last4, "
+                ":receipt_url, :camera_id, :thumbnail_path, :raw) "
+                "ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at, "
+                "updated_ts_ms=excluded.updated_ts_ms, amount=excluded.amount, "
+                "currency=excluded.currency, status=excluded.status, "
+                "location_id=excluded.location_id, card_last4=excluded.card_last4, "
+                "receipt_url=excluded.receipt_url, raw=excluded.raw, "
+                "camera_id=COALESCE(excluded.camera_id, transactions.camera_id), "
+                "thumbnail_path=COALESCE(excluded.thumbnail_path, transactions.thumbnail_path) "
+                "WHERE excluded.updated_ts_ms >= transactions.updated_ts_ms",
+                values,
             )
             self._db.commit()
         return existing is None

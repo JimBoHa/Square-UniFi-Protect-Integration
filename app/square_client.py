@@ -137,9 +137,11 @@ def payment_from_api(payment: dict) -> dict:
         display_money.get("currency") or amount_money.get("currency") or "USD"
     )
     card = payment.get("card_details", {}).get("card", {})
+    created_at = payment.get("created_at", "")
     return {
         "id": payment.get("id", ""),
-        "created_at": payment.get("created_at", ""),
+        "created_at": created_at,
+        "updated_at": payment.get("updated_at") or created_at,
         "amount": int(display_amount),
         "currency": display_currency,
         "status": payment.get("status", ""),

@@ -37,6 +37,7 @@ def _ingest_payment_with_status(
     if not txn["id"] or not txn["created_at"]:
         raise ValueError("Payment missing id or created_at")
     txn["ts_ms"] = parse_ts_ms(txn["created_at"])
+    txn["updated_ts_ms"] = parse_ts_ms(txn["updated_at"])
 
     mapping = store.camera_for_location(txn["location_id"])
     txn["camera_id"] = mapping["camera_id"] if mapping else None

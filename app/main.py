@@ -51,6 +51,7 @@ PROTECT_SETTING_KEYS = (
     "protect.alarm_trigger_id",
 )
 MAX_CAMERA_MAPPINGS = 500
+PRIVATE_NO_STORE = "private, no-store"
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +542,11 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(exc))
         finally:
             client.close()
-        return Response(content=image, media_type="image/jpeg")
+        return Response(
+            content=image,
+            media_type="image/jpeg",
+            headers={"Cache-Control": PRIVATE_NO_STORE},
+        )
 
     @app.get("/api/camera-mapping")
     def get_mapping(_=authed) -> list[dict]:
@@ -628,6 +633,7 @@ def create_app(
         _=authed,
     ) -> list[dict]:
         rows, snapshot_rowid = store.list_transactions_page(limit, offset, snapshot)
+        response.headers["Cache-Control"] = PRIVATE_NO_STORE
         # Preserve the existing list response while issuing an optional
         # snapshot boundary for clients that paginate across live inserts.
         response.headers["X-Transaction-Snapshot"] = str(snapshot_rowid)
@@ -643,7 +649,11 @@ def create_app(
             if store.requeue_missing_thumbnail(txn_id, txn["thumbnail_path"]):
                 nudge_protect_work_queue()
             raise HTTPException(status_code=404, detail="Thumbnail not found")
-        return FileResponse(path, media_type="image/jpeg")
+        return FileResponse(
+            path,
+            media_type="image/jpeg",
+            headers={"Cache-Control": PRIVATE_NO_STORE},
+        )
 
     def run_sync() -> int:
         square = build_square()

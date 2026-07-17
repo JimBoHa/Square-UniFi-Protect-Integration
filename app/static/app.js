@@ -4,9 +4,14 @@
 
 const $ = (sel) => document.querySelector(sel);
 const TRANSACTION_REFRESH_MS = 15000;
+const TRANSACTION_PAGE_SIZE = 100;
 
 let transactionRefreshTimer = null;
 let transactionLoadInFlight = false;
+let transactionPendingOffset = null;
+let transactionOffset = 0;
+let transactionHasNext = false;
+let transactionPageCount = 0;
 let lastTransactionPayload = null;
 
 function show(viewId) {
@@ -56,7 +61,7 @@ async function boot() {
 function enterApp() {
   $("#nav").hidden = false;
   show("#view-transactions");
-  loadTransactions();
+  loadTransactions({ reset: true });
   loadSettingsView();
   startTransactionRefresh();
 }
@@ -277,7 +282,9 @@ function transactionViewIsVisible() {
 }
 
 function refreshTransactionsIfVisible() {
-  if (transactionViewIsVisible()) loadTransactions();
+  // Offset pages would shift when new sales arrive. Keep older pages stable;
+  // returning to the newest page resumes the normal live refresh.
+  if (transactionViewIsVisible() && transactionOffset === 0) loadTransactions();
 }
 
 function startTransactionRefresh() {
@@ -304,23 +311,24 @@ function formatAmount(cents, currency) {
   }
 }
 
-async function loadTransactions() {
-  if (transactionLoadInFlight) return;
-  transactionLoadInFlight = true;
-  let txns;
-  try {
-    txns = await api("/api/transactions?limit=100");
-  } catch (err) {
-    message(err.message, "error");
-    return;
-  } finally {
-    transactionLoadInFlight = false;
+function updateTransactionPagination(loading = false) {
+  $("#txn-prev").disabled = loading || transactionOffset === 0;
+  $("#txn-next").disabled = loading || !transactionHasNext;
+  const status = $("#txn-page-status");
+  if (loading) {
+    status.textContent = "Loading transaction page…";
+  } else if (!transactionPageCount) {
+    status.textContent = "No transactions to show";
+  } else {
+    const first = transactionOffset + 1;
+    const last = transactionOffset + transactionPageCount;
+    const oldest = transactionHasNext ? "" : " · oldest reached";
+    const paused = transactionOffset > 0 ? " · auto-refresh paused" : "";
+    status.textContent = `Showing transactions ${first}–${last}${oldest}${paused}`;
   }
-  $("#txn-last-updated").textContent =
-    `Last updated ${new Date().toLocaleTimeString()}`;
-  const payload = JSON.stringify(txns);
-  if (payload === lastTransactionPayload) return;
-  lastTransactionPayload = payload;
+}
+
+function renderTransactions(txns) {
   const list = $("#txn-list");
   list.textContent = "";
   if (!txns.length) {
@@ -377,12 +385,77 @@ async function loadTransactions() {
   }
 }
 
+async function loadTransactions({ reset = false, offset = transactionOffset } = {}) {
+  const requestedOffset = reset ? 0 : Math.max(0, offset);
+  if (transactionLoadInFlight) {
+    // Coalesce refreshes but retain the latest requested page. In particular,
+    // a sync reset cannot be lost behind an older in-flight page request.
+    transactionPendingOffset = requestedOffset;
+    return;
+  }
+  transactionLoadInFlight = true;
+  updateTransactionPagination(true);
+  let page = null;
+  try {
+    page = await api(
+      `/api/transactions?limit=${TRANSACTION_PAGE_SIZE + 1}&offset=${requestedOffset}`,
+    );
+  } catch (err) {
+    message(err.message, "error");
+  } finally {
+    transactionLoadInFlight = false;
+  }
+
+  // Ignore a response when a newer page/reset request arrived while it was
+  // loading. The queued request below becomes the only rendered result.
+  if (page && transactionPendingOffset === null) {
+    const txns = page.slice(0, TRANSACTION_PAGE_SIZE);
+    if (!txns.length && requestedOffset > 0) {
+      transactionPendingOffset = Math.max(0, requestedOffset - TRANSACTION_PAGE_SIZE);
+    } else {
+      transactionOffset = requestedOffset;
+      transactionHasNext = page.length > TRANSACTION_PAGE_SIZE;
+      transactionPageCount = txns.length;
+      $("#txn-last-updated").textContent =
+        `Last updated ${new Date().toLocaleTimeString()}`;
+      const payload = JSON.stringify({
+        offset: transactionOffset,
+        hasNext: transactionHasNext,
+        transactions: txns,
+      });
+      if (payload !== lastTransactionPayload) {
+        lastTransactionPayload = payload;
+        renderTransactions(txns);
+      }
+    }
+  }
+  updateTransactionPagination(false);
+
+  if (transactionPendingOffset !== null) {
+    const pendingOffset = transactionPendingOffset;
+    transactionPendingOffset = null;
+    void loadTransactions({ offset: pendingOffset });
+  }
+}
+
+$("#txn-prev").addEventListener("click", () => {
+  if (transactionLoadInFlight || transactionOffset === 0) return;
+  void loadTransactions({
+    offset: Math.max(0, transactionOffset - TRANSACTION_PAGE_SIZE),
+  });
+});
+
+$("#txn-next").addEventListener("click", () => {
+  if (transactionLoadInFlight || !transactionHasNext) return;
+  void loadTransactions({ offset: transactionOffset + TRANSACTION_PAGE_SIZE });
+});
+
 $("#sync-now").addEventListener("click", async () => {
   message("Syncing…", "");
   try {
     const result = await api("/api/sync", { method: "POST" });
     message(`Synced ${result.ingested} transactions.`, "ok");
-    loadTransactions();
+    await loadTransactions({ reset: true });
   } catch (err) {
     message(err.message, "error");
   }

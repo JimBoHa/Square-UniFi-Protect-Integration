@@ -769,7 +769,8 @@ class Store:
         offset = max(0, int(offset))
         with self._lock:
             rows = self._db.execute(
-                "SELECT * FROM transactions ORDER BY ts_ms DESC LIMIT ? OFFSET ?",
+                "SELECT * FROM transactions "
+                "ORDER BY ts_ms DESC, id DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
         return [dict(r) for r in rows]

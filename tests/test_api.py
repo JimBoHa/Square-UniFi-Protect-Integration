@@ -385,6 +385,40 @@ def test_sync_is_idempotent(configured):
     assert second.json()["ingested"] == 0
     assert len(configured.get("/api/transactions").json()) == 2
 
+
+def test_transactions_api_supports_page_lookahead_and_offset(authed):
+    store = authed.app.state.store
+    for index in range(102):
+        store.upsert_transaction(
+            {
+                "id": f"PAY_PAGE_{index:03d}",
+                "created_at": "2026-07-16T15:30:00.000Z",
+                # Equal timestamps verify the secondary id ordering keeps
+                # offset pages deterministic and non-overlapping.
+                "ts_ms": 1784215800000,
+                "amount": index,
+                "currency": "USD",
+                "status": "COMPLETED",
+                "location_id": "LOC1",
+            }
+        )
+
+    first_response = authed.get("/api/transactions?limit=101&offset=0")
+    second_response = authed.get("/api/transactions?limit=101&offset=100")
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    first_with_lookahead = first_response.json()
+    second_page = second_response.json()
+
+    assert len(first_with_lookahead) == 101
+    assert len(second_page) == 2
+    first_page = first_with_lookahead[:100]
+    assert first_with_lookahead[100]["id"] == second_page[0]["id"]
+    assert {txn["id"] for txn in first_page}.isdisjoint(
+        txn["id"] for txn in second_page
+    )
+    assert second_page[-1]["id"] == "PAY_PAGE_000"
+
 def test_transactions_without_camera_mapping_still_listed(authed):
     authed.put(
         "/api/settings/square",

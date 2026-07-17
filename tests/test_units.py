@@ -660,6 +660,31 @@ def test_payment_from_api_falls_back_to_amount_money():
     assert normalized["amount"] == 1000
     assert normalized["currency"] == "EUR"
 
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("amount_money", []),
+        ("total_money", "invalid"),
+        ("card_details", []),
+        ("card_details", {"card": []}),
+        ("device_details", []),
+        ("offline_payment_details", []),
+        ("amount_money", {"amount": "500", "currency": "USD"}),
+        ("amount_money", {"amount": 500, "currency": []}),
+    ],
+)
+def test_payment_from_api_rejects_malformed_nested_fields(field, value):
+    payment = {
+        "id": "PAY_BAD_NESTED",
+        "created_at": "2026-07-16T16:30:00Z",
+        "amount_money": {"amount": 500, "currency": "USD"},
+        field: value,
+    }
+
+    with pytest.raises(ValueError, match="Payment"):
+        payment_from_api(payment)
+
 def test_payment_from_api_uses_selected_currency_with_safe_fallback():
     selected_currency = payment_from_api(
         {

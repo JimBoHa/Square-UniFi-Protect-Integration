@@ -167,6 +167,22 @@ def test_webhook_rejects_tampered_body(configured):
     assert resp.status_code == 401
 
 
+def test_webhook_rejects_malformed_nested_payment(configured):
+    from .test_api import _webhook_signature
+
+    event = json.loads(make_webhook_event())
+    event["data"]["object"]["payment"]["device_details"] = []
+    body = json.dumps(event).encode()
+    resp = configured.post(
+        "/webhooks/square",
+        content=body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "Payment device_details must be an object"
+
+
 # -- stored XSS surface -----------------------------------------------------------------
 
 def test_malicious_payment_fields_returned_as_json_not_html(configured):

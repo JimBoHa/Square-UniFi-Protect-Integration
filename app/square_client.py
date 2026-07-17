@@ -109,7 +109,13 @@ class SquareClient:
             if cursor:
                 params["cursor"] = cursor
             data = self._get("/v2/payments", params=params)
-            payments.extend(data.get("payments", []))
+            page = data.get("payments", [])
+            try:
+                for payment in page:
+                    payment_from_api(payment)
+            except (TypeError, ValueError) as exc:
+                raise SquareError("Square returned invalid payment data") from exc
+            payments.extend(page)
             cursor = data.get("cursor")
             if not cursor or (limit is not None and len(payments) >= limit):
                 break
@@ -134,38 +140,68 @@ def verify_webhook_signature(
 
 def payment_from_api(payment: dict) -> dict:
     """Normalize a Square Payment object into our transaction shape."""
-    amount_money = payment.get("amount_money") or {}
-    display_money = payment.get("total_money") or amount_money
+    if not isinstance(payment, dict):
+        raise ValueError("Payment must be an object")
+
+    def object_field(parent: dict, key: str, label: str | None = None) -> dict:
+        value = parent.get(key)
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f"Payment {label or key} must be an object")
+        return value
+
+    def text_field(parent: dict, key: str, label: str | None = None) -> str:
+        value = parent.get(key)
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError(f"Payment {label or key} must be a string")
+        return value
+
+    amount_money = object_field(payment, "amount_money")
+    total_money = object_field(payment, "total_money")
+    display_money = total_money or amount_money
     display_amount = display_money.get("amount")
     if display_amount is None:
-        display_amount = amount_money.get("amount") or 0
-    display_currency = (
-        display_money.get("currency") or amount_money.get("currency") or "USD"
-    )
-    card = payment.get("card_details", {}).get("card", {})
-    device = payment.get("device_details") or {}
-    created_at = payment.get("created_at", "")
+        display_amount = amount_money.get("amount")
+    if display_amount is None:
+        display_amount = 0
+    if isinstance(display_amount, bool) or not isinstance(display_amount, int):
+        raise ValueError("Payment amount must be an integer")
+    display_currency = display_money.get("currency")
+    if display_currency is None or display_currency == "":
+        display_currency = amount_money.get("currency")
+    if display_currency is None or display_currency == "":
+        display_currency = "USD"
+    if not isinstance(display_currency, str):
+        raise ValueError("Payment currency must be a string")
+    card_details = object_field(payment, "card_details")
+    card = object_field(card_details, "card", "card_details.card")
+    device = object_field(payment, "device_details")
+    offline_details = object_field(payment, "offline_payment_details")
+    created_at = text_field(payment, "created_at")
     server_created_at = created_at
     if payment.get("is_offline_payment") is True:
-        offline_details = payment.get("offline_payment_details")
-        client_created_at = (
-            offline_details.get("client_created_at")
-            if isinstance(offline_details, dict)
-            else None
-        )
-        if isinstance(client_created_at, str) and client_created_at.strip():
+        client_created_at = offline_details.get("client_created_at")
+        if client_created_at is not None and not isinstance(client_created_at, str):
+            raise ValueError(
+                "Payment offline_payment_details.client_created_at must be a string"
+            )
+        if client_created_at and client_created_at.strip():
             created_at = client_created_at.strip()
+    updated_at = text_field(payment, "updated_at") or server_created_at
     return {
-        "id": payment.get("id", ""),
+        "id": text_field(payment, "id"),
         "created_at": created_at,
-        "updated_at": payment.get("updated_at") or server_created_at,
-        "amount": int(display_amount),
+        "updated_at": updated_at,
+        "amount": display_amount,
         "currency": display_currency,
-        "status": payment.get("status", ""),
-        "location_id": payment.get("location_id", ""),
-        "device_id": device.get("device_id") or "",
-        "device_name": device.get("device_name") or "",
-        "card_last4": card.get("last_4", ""),
-        "receipt_url": payment.get("receipt_url", ""),
+        "status": text_field(payment, "status"),
+        "location_id": text_field(payment, "location_id"),
+        "device_id": text_field(device, "device_id", "device_details.device_id"),
+        "device_name": text_field(device, "device_name", "device_details.device_name"),
+        "card_last4": text_field(card, "last_4", "card_details.card.last_4"),
+        "receipt_url": text_field(payment, "receipt_url"),
         "raw": payment,
     }

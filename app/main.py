@@ -48,6 +48,7 @@ PROTECT_SETTING_KEYS = (
     "protect.api_key",
     "protect.alarm_trigger_id",
 )
+MAX_CAMERA_MAPPINGS = 500
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +481,23 @@ def create_app(
 
     @app.put("/api/camera-mapping")
     def set_mapping(body: CameraMappingBody, _=authed) -> dict:
+        if len(body.mappings) > MAX_CAMERA_MAPPINGS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Camera mappings cannot exceed {MAX_CAMERA_MAPPINGS} entries",
+            )
+        targets: set[tuple[str, str]] = set()
         for entry in body.mappings:
+            target = (entry.location_id, entry.device_id)
+            if target in targets:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Duplicate camera mapping for the same location_id and "
+                        "device_id"
+                    ),
+                )
+            targets.add(target)
             try:
                 validate_camera_id(entry.camera_id)
             except ValueError as exc:

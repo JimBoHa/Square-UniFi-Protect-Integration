@@ -335,6 +335,48 @@ def test_camera_mapping_accepts_255_character_device_name(configured):
     assert resp.status_code == 200
     assert configured.get("/api/camera-mapping").json()[0]["device_name"] == device_name
 
+
+def test_camera_mapping_rejects_duplicate_target_without_mutation(configured):
+    existing = configured.get("/api/camera-mapping").json()
+    resp = configured.put(
+        "/api/camera-mapping",
+        json={
+            "mappings": [
+                {
+                    "location_id": "LOC_DUPLICATE",
+                    "device_id": "TERM_A",
+                    "camera_id": CAM1,
+                },
+                {
+                    "location_id": "LOC_DUPLICATE",
+                    "device_id": "TERM_A",
+                    "camera_id": CAM2,
+                },
+            ]
+        },
+    )
+
+    assert resp.status_code == 422
+    assert "Duplicate camera mapping" in resp.text
+    assert configured.get("/api/camera-mapping").json() == existing
+
+
+def test_camera_mapping_rejects_more_than_500_entries_without_mutation(configured):
+    existing = configured.get("/api/camera-mapping").json()
+    resp = configured.put(
+        "/api/camera-mapping",
+        json={
+            "mappings": [
+                {"location_id": f"LOC{index}", "camera_id": CAM1}
+                for index in range(501)
+            ]
+        },
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "Camera mappings cannot exceed 500 entries"
+    assert configured.get("/api/camera-mapping").json() == existing
+
 def test_camera_preview_returns_jpeg(configured):
     resp = configured.get(f"/api/camera-preview/{CAM1}")
     assert resp.status_code == 200

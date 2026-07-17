@@ -791,6 +791,19 @@ class Store:
                 )
             return True
 
+    def queue_depths(self) -> dict:
+        """Pending work counts for the status dashboard."""
+        with self._lock:
+            thumbs = self._db.execute(
+                "SELECT COUNT(*) AS n FROM thumbnail_retries"
+            ).fetchone()["n"]
+            alarms = self._db.execute(
+                "SELECT COUNT(*) AS n FROM transactions "
+                "WHERE UPPER(status) = 'COMPLETED' AND alarm_state = ?",
+                (ALARM_IDLE,),
+            ).fetchone()["n"]
+        return {"thumbnails_pending": thumbs, "alarms_pending": alarms}
+
     def claim_thumbnail_retries(
         self,
         limit: int,

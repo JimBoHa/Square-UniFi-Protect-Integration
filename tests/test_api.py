@@ -1613,3 +1613,62 @@ def test_webhook_ignores_non_payment_events(configured):
     )
     assert resp.status_code == 200
     assert resp.json().get("ignored") is True
+
+
+# -- status dashboard ---------------------------------------------------------------
+
+def test_dashboard_requires_auth(client):
+    assert client.get("/api/dashboard").status_code == 401
+
+def test_dashboard_unconfigured(authed):
+    data = authed.get("/api/dashboard").json()
+    assert data["protect"]["configured"] is False
+    assert data["square"]["configured"] is False
+    assert data["webhook"] == {"configured": False, "last_event_ms": None}
+    assert data["queues"] == {"thumbnails_pending": 0, "alarms_pending": 0}
+
+def test_dashboard_connected_with_webhook_freshness(configured):
+    body = make_webhook_event("PAY_DASH")
+    assert configured.post(
+        "/webhooks/square",
+        content=body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+    ).status_code == 200
+    _wait_for_protect_jobs(configured)
+
+    data = configured.get("/api/dashboard").json()
+    assert data["protect"]["ok"] is True
+    assert "cameras" in data["protect"]["detail"]
+    assert data["square"]["ok"] is True
+    assert data["webhook"]["configured"] is True
+    assert isinstance(data["webhook"]["last_event_ms"], int)
+    assert data["queues"]["thumbnails_pending"] == 0
+
+def test_dashboard_counts_pending_queue_work(configured):
+    store = configured.app.state.store
+    store.upsert_transaction(
+        {
+            "id": "PAY_QUEUED_TILE",
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "ts_ms": 1784215800000,
+            "amount": 100,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+            "camera_id": CAM1,
+            "thumbnail_path": None,
+        }
+    )
+    data = configured.get("/api/dashboard").json()
+    assert data["queues"]["thumbnails_pending"] == 1
+
+def test_dashboard_tiles_ui_wiring():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js = (static_dir / "app.js").read_text()
+    html = (static_dir / "index.html").read_text()
+    assert 'api("/api/dashboard")' in js
+    assert "startDashboardRefresh" in js
+    for tile in ("protect", "square", "webhook", "queues"):
+        assert f'data-tile="{tile}"' in html

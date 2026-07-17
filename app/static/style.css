@@ -75,3 +75,18 @@ button[type="submit"], #save-mapping, #sync-now {
   .pagination .hint { order: -1; flex-basis: 100%; max-width: none; }
   .pagination button { flex: 1 1 0; }
 }
+
+.tiles {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem; margin-bottom: 1.25rem;
+}
+.tile {
+  border: 1px solid var(--border); border-radius: 10px; padding: 0.7rem 0.9rem;
+  border-left-width: 4px;
+}
+.tile.ok { border-left-color: #2a9d3a; }
+.tile.bad { border-left-color: #d33; }
+.tile.idle { border-left-color: #999; }
+.tile-title { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.7; }
+.tile-value { font-weight: 600; margin-top: 0.15rem; }
+.tile-hint { font-size: 0.78rem; opacity: 0.75; margin-top: 0.15rem; }

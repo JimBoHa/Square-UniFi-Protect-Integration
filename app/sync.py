@@ -44,9 +44,13 @@ def ingest_payment(
     txn["thumbnail_path"] = None
 
     existing = store.get_transaction(txn["id"])
-    already_has_thumb = bool(existing and existing.get("thumbnail_path"))
+    already_has_current_thumb = bool(
+        existing
+        and existing.get("thumbnail_path")
+        and existing.get("ts_ms") == txn["ts_ms"]
+    )
 
-    if protect is not None and txn["camera_id"] and not already_has_thumb:
+    if protect is not None and txn["camera_id"] and not already_has_current_thumb:
         try:
             image = protect.get_snapshot(txn["camera_id"], ts_ms=txn["ts_ms"])
             name = safe_thumbnail_name(txn["id"])

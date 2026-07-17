@@ -89,7 +89,13 @@ def retry_thumbnail_name(
 
 
 def _ingest_payment_with_status(
-    store: Store, payment: dict, protect: ProtectClient | None
+    store: Store,
+    payment: dict,
+    protect: ProtectClient | None,
+    *,
+    expected_merchant_id: str | None = None,
+    expected_environment: str | None = None,
+    expected_account_revision: str | None = None,
 ) -> tuple[dict, bool]:
     """Store one Square payment and return it with insertion status."""
     txn = payment_from_api(payment)
@@ -105,9 +111,25 @@ def _ingest_payment_with_status(
             store.thumbnail_dir.resolve() not in path.parents
             or not path.is_file()
         ):
-            if store.requeue_missing_thumbnail(
-                txn["id"], existing["thumbnail_path"]
+            if (
+                expected_merchant_id is None
+                and expected_environment is None
+                and expected_account_revision is None
             ):
+                # Keep the legacy two-argument Store call for embedders and
+                # tests that wrap this method without the optional fence.
+                requeued = store.requeue_missing_thumbnail(
+                    txn["id"], existing["thumbnail_path"]
+                )
+            else:
+                requeued = store.requeue_missing_thumbnail(
+                    txn["id"],
+                    existing["thumbnail_path"],
+                    expected_merchant_id=expected_merchant_id,
+                    expected_environment=expected_environment,
+                    expected_account_revision=expected_account_revision,
+                )
+            if requeued:
                 existing["thumbnail_path"] = None
             else:
                 # Another worker changed the evidence after our read. Base all
@@ -192,7 +214,13 @@ def _ingest_payment_with_status(
             logger.warning("Thumbnail capture failed for %s: %s", txn["id"], exc)
 
     try:
-        is_new = store.upsert_transaction(txn, replace_evidence=source_changed)
+        is_new = store.upsert_transaction(
+            txn,
+            replace_evidence=source_changed,
+            expected_merchant_id=expected_merchant_id,
+            expected_environment=expected_environment,
+            expected_account_revision=expected_account_revision,
+        )
     except Exception:
         if captured_path is not None:
             try:
@@ -221,10 +249,23 @@ def _ingest_payment_with_status(
 
 
 def ingest_payment(
-    store: Store, payment: dict, protect: ProtectClient | None
+    store: Store,
+    payment: dict,
+    protect: ProtectClient | None,
+    *,
+    expected_merchant_id: str | None = None,
+    expected_environment: str | None = None,
+    expected_account_revision: str | None = None,
 ) -> dict:
     """Store one Square payment and return its normalized transaction."""
-    txn, _is_new = _ingest_payment_with_status(store, payment, protect)
+    txn, _is_new = _ingest_payment_with_status(
+        store,
+        payment,
+        protect,
+        expected_merchant_id=expected_merchant_id,
+        expected_environment=expected_environment,
+        expected_account_revision=expected_account_revision,
+    )
     return txn
 
 
@@ -385,6 +426,9 @@ def sync_payments(
     square: SquareClient,
     protect: ProtectClient | None,
     alarm_trigger_id: str | None = None,
+    expected_merchant_id: str | None = None,
+    expected_environment: str | None = None,
+    expected_account_revision: str | None = None,
 ) -> int:
     """Pull recent Square payments and ingest them. Returns count ingested."""
     count = 0
@@ -421,7 +465,14 @@ def sync_payments(
                 if payment_id and payment_id in seen_payment_ids:
                     continue
                 try:
-                    _txn, is_new = _ingest_payment_with_status(store, payment, protect)
+                    _txn, is_new = _ingest_payment_with_status(
+                        store,
+                        payment,
+                        protect,
+                        expected_merchant_id=expected_merchant_id,
+                        expected_environment=expected_environment,
+                        expected_account_revision=expected_account_revision,
+                    )
                     if is_new:
                         count += 1
                     if payment_id:

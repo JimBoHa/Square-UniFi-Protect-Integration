@@ -34,6 +34,11 @@ button[type="submit"], #save-mapping, #sync-now {
 }
 .toolbar { display: flex; align-items: center; justify-content: space-between; }
 .hint { opacity: 0.7; font-size: 0.85rem; }
+.destructive-warning {
+  padding: 0.75rem; border: 1px solid #c33; border-radius: 6px;
+  background: color-mix(in srgb, #c33 10%, transparent); font-size: 0.9rem;
+}
+.destructive-warning p { margin: 0.35rem 0 0.75rem; }
 #message { min-height: 1.5rem; font-size: 0.9rem; }
 #message.error { color: #d33; }
 #message.ok { color: #2a9d3a; }

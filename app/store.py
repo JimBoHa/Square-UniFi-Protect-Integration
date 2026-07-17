@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass
+import errno
 import json
 import logging
 import os
@@ -13,6 +16,16 @@ from pathlib import Path
 
 from .security import CredentialCipher, hash_session_token
 
+try:  # POSIX advisory locks.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised by the Windows-backend test
+    _fcntl = None
+
+try:  # Windows byte-range locks.
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - unavailable on POSIX
+    _msvcrt = None
+
 logger = logging.getLogger("spi.store")
 
 SESSION_TTL_SECONDS = 12 * 3600
@@ -21,6 +34,44 @@ ALARM_IN_PROGRESS = "in_progress"
 ALARM_SENT = "sent"
 ALARM_CLAIM_LEASE_SECONDS = 60
 ALARM_ENABLED_AFTER_SETTING = "protect.alarm_enabled_after_ms"
+SQUARE_POLL_WATERMARK_TABLE = "square_poll_watermarks"
+PROTECT_EVIDENCE_RETIRED_TABLE = "protect_evidence_retired"
+SQUARE_ACCOUNT_REVISION_SETTING = "square.account_revision"
+ORPHAN_THUMBNAIL_CLEANUP_SETTING = "maintenance.orphan_thumbnail_cleanup_pending"
+
+# Windows' msvcrt backend offers only exclusive byte-range locks. A short-lived
+# gate plus independent reader slots provides shared-reader/exclusive-writer
+# semantics without a platform-specific dependency. The writer keeps the gate
+# while draining every reader slot, so new readers cannot starve it.
+_WINDOWS_LOCK_GATE_BYTE = 0
+_WINDOWS_LOCK_READER_START = 1
+_WINDOWS_LOCK_READER_SLOTS = 128
+_WINDOWS_LOCK_FILE_BYTES = _WINDOWS_LOCK_READER_START + _WINDOWS_LOCK_READER_SLOTS
+_WINDOWS_LOCK_RETRY_SECONDS = 0.01
+_WINDOWS_LOCK_BUSY_ERRNOS = {
+    errno.EACCES,
+    errno.EAGAIN,
+    getattr(errno, "EDEADLK", errno.EACCES),
+}
+
+
+class SquareAccountSwitchRequired(Exception):
+    """A different or unknown prior Square account needs explicit consent."""
+
+    def __init__(self, confirmation_token: str):
+        super().__init__("Confirm the Square account switch before replacing local data")
+        self.confirmation_token = confirmation_token
+
+
+class SquareAccountChanged(Exception):
+    """Reject work that started with credentials for an older Square account."""
+
+
+@dataclass(frozen=True)
+class SquareAccountConfiguration:
+    switched: bool
+    account_revision: str
+    evidence_cleanup_pending: bool
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -76,6 +127,86 @@ CREATE TABLE IF NOT EXISTS sessions (
 """
 
 
+def _windows_try_lock_byte(fd: int, offset: int) -> bool:
+    """Attempt one Windows byte-range lock without waiting."""
+    if _msvcrt is None:  # pragma: no cover - guarded by integration_guard
+        raise RuntimeError("Windows file locking is unavailable")
+    os.lseek(fd, offset, os.SEEK_SET)
+    try:
+        _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+    except OSError as exc:
+        # CPython reports a sharing violation as EACCES; the extra errno and
+        # winerror values cover alternative Windows runtimes.
+        if exc.errno in _WINDOWS_LOCK_BUSY_ERRNOS or getattr(
+            exc, "winerror", None
+        ) in (33, 36, 158):
+            return False
+        raise
+    return True
+
+
+def _windows_lock_byte(fd: int, offset: int) -> None:
+    while not _windows_try_lock_byte(fd, offset):
+        time.sleep(_WINDOWS_LOCK_RETRY_SECONDS)
+
+
+def _windows_unlock_byte(fd: int, offset: int) -> None:
+    if _msvcrt is None:  # pragma: no cover - guarded by integration_guard
+        raise RuntimeError("Windows file locking is unavailable")
+    os.lseek(fd, offset, os.SEEK_SET)
+    _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+
+
+def _acquire_windows_integration_lock(
+    fd: int, *, exclusive: bool
+) -> tuple[tuple[int, ...], bool]:
+    """Return (reader slots, gate-held) for the acquired Windows lock."""
+    slots: list[int] = []
+    gate_held = False
+    try:
+        _windows_lock_byte(fd, _WINDOWS_LOCK_GATE_BYTE)
+        gate_held = True
+        if exclusive:
+            for slot in range(
+                _WINDOWS_LOCK_READER_START, _WINDOWS_LOCK_FILE_BYTES
+            ):
+                _windows_lock_byte(fd, slot)
+                slots.append(slot)
+        else:
+            while not slots:
+                for slot in range(
+                    _WINDOWS_LOCK_READER_START, _WINDOWS_LOCK_FILE_BYTES
+                ):
+                    if _windows_try_lock_byte(fd, slot):
+                        slots.append(slot)
+                        break
+                if not slots:
+                    # Do not monopolize the gate if every reader slot is busy.
+                    _windows_unlock_byte(fd, _WINDOWS_LOCK_GATE_BYTE)
+                    gate_held = False
+                    time.sleep(_WINDOWS_LOCK_RETRY_SECONDS)
+                    _windows_lock_byte(fd, _WINDOWS_LOCK_GATE_BYTE)
+                    gate_held = True
+            _windows_unlock_byte(fd, _WINDOWS_LOCK_GATE_BYTE)
+            gate_held = False
+        return tuple(slots), gate_held
+    except Exception:
+        for slot in reversed(slots):
+            _windows_unlock_byte(fd, slot)
+        if gate_held:
+            _windows_unlock_byte(fd, _WINDOWS_LOCK_GATE_BYTE)
+        raise
+
+
+def _release_windows_integration_lock(
+    fd: int, slots: tuple[int, ...], gate_held: bool
+) -> None:
+    for slot in reversed(slots):
+        _windows_unlock_byte(fd, slot)
+    if gate_held:
+        _windows_unlock_byte(fd, _WINDOWS_LOCK_GATE_BYTE)
+
+
 class Store:
     def __init__(self, data_dir: Path):
         self.data_dir = Path(data_dir)
@@ -88,6 +219,10 @@ class Store:
             if path.is_file() and not path.is_symlink():
                 path.chmod(0o600)
         self.cipher = CredentialCipher(self.data_dir)
+        # Square and Protect work share one reader/writer lock. Provider
+        # switches therefore cannot overlap in-flight evidence work or acquire
+        # provider-specific locks in opposing orders across processes.
+        self._integration_lock_path = self.data_dir / ".provider-state.lock"
         key_path = self.data_dir / "secret.key"
         if key_path.is_file() and not key_path.is_symlink():
             key_path.chmod(0o600)
@@ -127,11 +262,70 @@ class Store:
                     "AND t.camera_id IS NOT NULL AND t.thumbnail_path IS NULL)"
                 )
                 self._release_expired_alarm_claims_locked()
+                if self._db.execute(
+                    "SELECT 1 FROM settings WHERE key LIKE 'square.%' LIMIT 1"
+                ).fetchone() and not self._db.execute(
+                    "SELECT 1 FROM settings WHERE key = ?",
+                    (SQUARE_ACCOUNT_REVISION_SETTING,),
+                ).fetchone():
+                    # Give upgraded installations an account generation before
+                    # any webhook or sync can snapshot the legacy settings.
+                    self._db.execute(
+                        "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, 0)",
+                        (
+                            SQUARE_ACCOUNT_REVISION_SETTING,
+                            secrets.token_urlsafe(24),
+                        ),
+                    )
             except Exception:
                 self._db.rollback()
                 raise
             else:
                 self._db.commit()
+        if self.get_setting(ORPHAN_THUMBNAIL_CLEANUP_SETTING) is not None:
+            try:
+                with self.integration_guard(exclusive=True):
+                    self.remove_orphan_thumbnails()
+            except Exception as exc:
+                logger.warning("Could not resume orphan thumbnail cleanup: %s", exc)
+
+    @contextmanager
+    def integration_guard(self, *, exclusive: bool = False):
+        """Coordinate provider work across threads, Store objects, and processes."""
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(self._integration_lock_path, flags, 0o600)
+        windows_lock: tuple[tuple[int, ...], bool] | None = None
+        posix_locked = False
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            if _fcntl is not None:
+                operation = _fcntl.LOCK_EX if exclusive else _fcntl.LOCK_SH
+                _fcntl.flock(fd, operation)
+                posix_locked = True
+            elif _msvcrt is not None:
+                windows_lock = _acquire_windows_integration_lock(
+                    fd, exclusive=exclusive
+                )
+            else:  # Fail closed instead of silently losing account isolation.
+                raise RuntimeError("No supported cross-process file-lock backend")
+            yield
+        finally:
+            try:
+                if posix_locked and _fcntl is not None:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                if windows_lock is not None:
+                    _release_windows_integration_lock(fd, *windows_lock)
+            finally:
+                # Closing is the fail-safe release for every OS lock still
+                # associated with this descriptor if explicit unlock failed.
+                os.close(fd)
+
+    @contextmanager
+    def square_account_guard(self, *, exclusive: bool = False):
+        """Backward-compatible name for the shared provider-state guard."""
+        with self.integration_guard(exclusive=exclusive):
+            yield
 
     def _thumbnail_file_exists(self, name: str) -> bool:
         path = (self.thumbnail_dir / name).resolve()
@@ -425,6 +619,340 @@ class Store:
             )
             self._db.commit()
 
+    def _setting_value_locked(self, key: str) -> str | None:
+        row = self._db.execute(
+            "SELECT value, encrypted FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self.cipher.decrypt(row["value"]) if row["encrypted"] else row["value"]
+
+    def _table_exists_locked(self, table_name: str) -> bool:
+        row = self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        return row is not None
+
+    def _has_square_account_data_locked(self) -> bool:
+        """Detect legacy account data that has no merchant identity setting."""
+        if self._db.execute(
+            "SELECT 1 FROM settings WHERE key LIKE 'square.%' LIMIT 1"
+        ).fetchone():
+            return True
+        for table_name in ("transactions", "camera_map"):
+            if self._db.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone():
+                return True
+        for table_name in (
+            SQUARE_POLL_WATERMARK_TABLE,
+            PROTECT_EVIDENCE_RETIRED_TABLE,
+        ):
+            if self._table_exists_locked(table_name) and self._db.execute(
+                f"SELECT 1 FROM {table_name} LIMIT 1"
+            ).fetchone():
+                return True
+        # Legacy or interrupted installations can leave evidence files after
+        # losing their database references. Treat managed regular files as
+        # unidentified account data so first-time credentials cannot silently
+        # inherit them.
+        for path in self.thumbnail_dir.iterdir():
+            if path.is_file() and not path.is_symlink():
+                return True
+        return False
+
+    def _assert_square_merchant_locked(self, expected_merchant_id: str | None) -> None:
+        if expected_merchant_id is None:
+            return
+        if self._setting_value_locked("square.merchant_id") != expected_merchant_id:
+            raise SquareAccountChanged("Square account changed while work was in progress")
+
+    def _assert_square_environment_locked(
+        self, expected_environment: str | None
+    ) -> None:
+        if expected_environment is None:
+            return
+        current_environment = self._setting_value_locked("square.environment")
+        if current_environment is None:
+            current_environment = "production"
+        if current_environment != expected_environment:
+            raise SquareAccountChanged("Square account changed while work was in progress")
+
+    def _assert_square_account_revision_locked(
+        self, expected_account_revision: str | None
+    ) -> None:
+        if expected_account_revision is None:
+            return
+        if (
+            self._setting_value_locked(SQUARE_ACCOUNT_REVISION_SETTING)
+            != expected_account_revision
+        ):
+            raise SquareAccountChanged(
+                "Square account changed; reload settings before saving camera mappings"
+            )
+
+    def _square_switch_confirmation_token(
+        self,
+        current_revision: str,
+        new_environment: str,
+        new_merchant_id: str,
+    ) -> str:
+        payload = json.dumps(
+            {
+                "version": 1,
+                "current_revision": current_revision,
+                "new_environment": new_environment,
+                "new_merchant_id": new_merchant_id,
+                "issued_at": int(time.time()),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return self.cipher.encrypt(payload)
+
+    def _square_switch_confirmation_matches(
+        self,
+        token: str,
+        current_revision: str,
+        new_environment: str,
+        new_merchant_id: str,
+    ) -> bool:
+        if not token:
+            return False
+        try:
+            payload = json.loads(self.cipher.decrypt(token))
+            issued_at = int(payload["issued_at"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return bool(
+            payload.get("version") == 1
+            and payload.get("current_revision") == current_revision
+            and payload.get("new_environment") == new_environment
+            and payload.get("new_merchant_id") == new_merchant_id
+            and 0 <= time.time() - issued_at <= 10 * 60
+        )
+
+    def configure_square_account(
+        self,
+        *,
+        merchant_id: str,
+        access_token: str,
+        environment: str,
+        webhook_signature_key: str | None = None,
+        webhook_url: str | None = None,
+        clear_webhook: bool = False,
+        confirm_account_switch: bool = False,
+        account_switch_confirmation_token: str = "",
+    ) -> SquareAccountConfiguration:
+        """Configure one merchant while excluding cross-process account work."""
+        with self.integration_guard(exclusive=True):
+            switched = self._configure_square_account(
+                merchant_id=merchant_id,
+                access_token=access_token,
+                environment=environment,
+                webhook_signature_key=webhook_signature_key,
+                webhook_url=webhook_url,
+                clear_webhook=clear_webhook,
+                confirm_account_switch=confirm_account_switch,
+                account_switch_confirmation_token=(
+                    account_switch_confirmation_token
+                ),
+            )
+            revision = self.square_account_revision()
+            if revision is None:
+                raise RuntimeError("Square account revision was not persisted")
+            return SquareAccountConfiguration(
+                switched=switched,
+                account_revision=revision,
+                evidence_cleanup_pending=(
+                    self.orphan_thumbnail_cleanup_pending()
+                ),
+            )
+
+    def _configure_square_account(
+        self,
+        *,
+        merchant_id: str,
+        access_token: str,
+        environment: str,
+        webhook_signature_key: str | None = None,
+        webhook_url: str | None = None,
+        clear_webhook: bool = False,
+        confirm_account_switch: bool = False,
+        account_switch_confirmation_token: str = "",
+    ) -> bool:
+        """Save Square credentials and atomically isolate a changed account.
+
+        Returns whether this replaced a different (or unidentified legacy)
+        account. Database evidence is removed in the same transaction as the
+        credential change. Files cannot participate in SQLite transactions,
+        so unreferenced thumbnails are removed only after a successful commit.
+        """
+        if bool(webhook_signature_key) != bool(webhook_url):
+            raise ValueError(
+                "Webhook signature key and notification URL must be provided together"
+            )
+        if clear_webhook and webhook_signature_key:
+            raise ValueError(
+                "clear_webhook cannot be combined with new webhook credentials"
+            )
+        updates = [
+            ("square.access_token", self.cipher.encrypt(access_token), 1),
+            ("square.environment", environment, 0),
+            ("square.merchant_id", merchant_id, 0),
+        ]
+        if webhook_signature_key is not None and webhook_url is not None:
+            updates.extend(
+                (
+                    (
+                        "square.webhook_signature_key",
+                        self.cipher.encrypt(webhook_signature_key),
+                        1,
+                    ),
+                    ("square.webhook_url", webhook_url, 0),
+                )
+            )
+
+        switched = False
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                current_merchant_id = self._setting_value_locked(
+                    "square.merchant_id"
+                )
+                current_environment = self._setting_value_locked(
+                    "square.environment"
+                )
+                if current_environment is None and current_merchant_id is not None:
+                    # Pre-environment releases implicitly used production.
+                    current_environment = "production"
+                current_revision = self._setting_value_locked(
+                    SQUARE_ACCOUNT_REVISION_SETTING
+                ) or f"legacy:{current_environment or ''}:{current_merchant_id or ''}"
+                switched = (
+                    current_merchant_id != merchant_id
+                    or bool(
+                        current_environment
+                        and current_environment != environment
+                    )
+                    if current_merchant_id is not None
+                    else self._has_square_account_data_locked()
+                )
+                confirmed_switch = bool(
+                    switched
+                    and confirm_account_switch
+                    and self._square_switch_confirmation_matches(
+                        account_switch_confirmation_token,
+                        current_revision,
+                        environment,
+                        merchant_id,
+                    )
+                )
+                if switched and not confirmed_switch:
+                    raise SquareAccountSwitchRequired(
+                        self._square_switch_confirmation_token(
+                            current_revision, environment, merchant_id
+                        )
+                    )
+
+                if switched:
+                    # Delete children explicitly because older databases did
+                    # not enable SQLite foreign-key enforcement.
+                    self._db.execute("DELETE FROM thumbnail_retries")
+                    if self._table_exists_locked(PROTECT_EVIDENCE_RETIRED_TABLE):
+                        # Protect console isolation tracks transaction IDs
+                        # whose old-console evidence must stay retired. A new
+                        # merchant may legitimately reuse a payment ID, so the
+                        # retirement state is Square-account-owned too.
+                        self._db.execute(
+                            f"DELETE FROM {PROTECT_EVIDENCE_RETIRED_TABLE}"
+                        )
+                    self._db.execute("DELETE FROM transactions")
+                    self._db.execute("DELETE FROM camera_map")
+                    if self._table_exists_locked(SQUARE_POLL_WATERMARK_TABLE):
+                        self._db.execute(
+                            f"DELETE FROM {SQUARE_POLL_WATERMARK_TABLE}"
+                        )
+                    # Webhook signatures and any future Square-owned state
+                    # must never cross merchant boundaries. Submitted webhook
+                    # credentials below are inserted for the new account.
+                    self._db.execute(
+                        "DELETE FROM settings WHERE key LIKE 'square.%'"
+                    )
+                    self._db.execute(
+                        "INSERT INTO settings (key, value, encrypted) VALUES (?, '1', 0) "
+                        "ON CONFLICT(key) DO UPDATE SET value='1', encrypted=0",
+                        (ORPHAN_THUMBNAIL_CLEANUP_SETTING,),
+                    )
+                elif clear_webhook:
+                    self._db.execute(
+                        "DELETE FROM settings WHERE key IN (?, ?)",
+                        ("square.webhook_signature_key", "square.webhook_url"),
+                    )
+
+                if switched or self._setting_value_locked(
+                    SQUARE_ACCOUNT_REVISION_SETTING
+                ) is None:
+                    updates.append(
+                        (
+                            SQUARE_ACCOUNT_REVISION_SETTING,
+                            secrets.token_urlsafe(24),
+                            0,
+                        )
+                    )
+
+                self._db.executemany(
+                    "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                    "encrypted=excluded.encrypted",
+                    updates,
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+
+        if switched or self.orphan_thumbnail_cleanup_pending():
+            try:
+                self.remove_orphan_thumbnails()
+            except Exception as exc:
+                # Account isolation is already durable in SQLite. A cleanup
+                # failure must not imply that the credential switch rolled back.
+                logger.warning("Could not scan orphan thumbnails after account switch: %s", exc)
+        return switched
+
+    def remove_orphan_thumbnails(self) -> int:
+        """Remove regular local files only when no transaction references them."""
+        removed = 0
+        failed = False
+        for path in self.thumbnail_dir.iterdir():
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                removed += int(self._unlink_thumbnail_if_unreferenced(path.name))
+            except OSError as exc:
+                failed = True
+                logger.warning("Could not delete orphan thumbnail %r: %s", path.name, exc)
+        if not failed:
+            self.delete_setting(ORPHAN_THUMBNAIL_CLEANUP_SETTING)
+        return removed
+
+    def orphan_thumbnail_cleanup_pending(self) -> bool:
+        return self.get_setting(ORPHAN_THUMBNAIL_CLEANUP_SETTING) is not None
+
+    def retry_orphan_thumbnail_cleanup(self) -> bool:
+        """Retry a durable provider cleanup and return whether it remains pending."""
+        if not self.orphan_thumbnail_cleanup_pending():
+            return False
+        with self.integration_guard(exclusive=True):
+            # Another process may have completed the scan while this process
+            # waited for the provider-state writer lock.
+            if self.orphan_thumbnail_cleanup_pending():
+                self.remove_orphan_thumbnails()
+        return self.orphan_thumbnail_cleanup_pending()
+
+    def square_account_revision(self) -> str | None:
+        return self.get_setting(SQUARE_ACCOUNT_REVISION_SETTING)
+
     # -- camera mapping ----------------------------------------------------
 
     def set_camera_mapping(
@@ -484,7 +1012,22 @@ class Store:
             self._db.commit()
 
     def replace_camera_mappings(
-        self, mappings: list[tuple[str, str, str, str, str]]
+        self,
+        mappings: list[tuple[str, str, str, str, str]],
+        *,
+        expected_account_revision: str | None = None,
+    ) -> None:
+        with self.integration_guard():
+            self._replace_camera_mappings(
+                mappings,
+                expected_account_revision=expected_account_revision,
+            )
+
+    def _replace_camera_mappings(
+        self,
+        mappings: list[tuple[str, str, str, str, str]],
+        *,
+        expected_account_revision: str | None = None,
     ) -> None:
         """Replace mappings and retarget pending evidence in one transaction.
 
@@ -496,6 +1039,9 @@ class Store:
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
+                self._assert_square_account_revision_locked(
+                    expected_account_revision
+                )
                 self._db.execute("DELETE FROM camera_map")
                 self._db.executemany(
                     "INSERT INTO camera_map (location_id, device_id, device_name, "
@@ -551,7 +1097,13 @@ class Store:
     # -- transactions ------------------------------------------------------
 
     def upsert_transaction(
-        self, txn: dict, *, replace_evidence: bool = False
+        self,
+        txn: dict,
+        *,
+        replace_evidence: bool = False,
+        expected_merchant_id: str | None = None,
+        expected_environment: str | None = None,
+        expected_account_revision: str | None = None,
     ) -> bool:
         """Insert or update a transaction. Returns True if it was new.
 
@@ -580,6 +1132,11 @@ class Store:
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
+                self._assert_square_merchant_locked(expected_merchant_id)
+                self._assert_square_environment_locked(expected_environment)
+                self._assert_square_account_revision_locked(
+                    expected_account_revision
+                )
                 existing = self._db.execute(
                     "SELECT id, camera_id, ts_ms, thumbnail_path, status "
                     "FROM transactions WHERE id = ?",
@@ -723,12 +1280,9 @@ class Store:
                 "Refusing to delete non-local thumbnail path %r", thumbnail_path
             )
             return False
-        path = (self.thumbnail_dir / relative_path).resolve()
-        if self.thumbnail_dir.resolve() not in path.parents:
-            logger.warning(
-                "Refusing to delete thumbnail outside data directory %r",
-                thumbnail_path,
-            )
+        path = self.thumbnail_dir / relative_path
+        if path.is_symlink():
+            logger.warning("Refusing to delete symlink thumbnail %r", thumbnail_path)
             return False
 
         with self._lock:
@@ -748,48 +1302,69 @@ class Store:
                 self._db.rollback()
                 raise
 
-    def requeue_missing_thumbnail(self, txn_id: str, expected_path: str) -> bool:
+    def requeue_missing_thumbnail(
+        self,
+        txn_id: str,
+        expected_path: str,
+        *,
+        expected_merchant_id: str | None = None,
+        expected_environment: str | None = None,
+        expected_account_revision: str | None = None,
+    ) -> bool:
         """Clear a vanished file reference and schedule immediate recapture."""
-        with self._lock, self._db:
-            if self._thumbnail_file_exists(expected_path):
-                return False
-            cursor = self._db.execute(
-                "UPDATE transactions SET thumbnail_path = NULL "
-                "WHERE id = ? AND thumbnail_path = ?",
-                (txn_id, expected_path),
-            )
-            if cursor.rowcount != 1:
-                return False
-            txn = self._db.execute(
-                "SELECT location_id, device_id FROM transactions WHERE id = ?",
-                (txn_id,),
-            ).fetchone()
-            mapping = (
-                self._camera_for_location_locked(
-                    txn["location_id"], txn["device_id"]
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_square_merchant_locked(expected_merchant_id)
+                self._assert_square_environment_locked(expected_environment)
+                self._assert_square_account_revision_locked(
+                    expected_account_revision
                 )
-                if txn
-                else None
-            )
-            camera_id = mapping["camera_id"] if mapping else None
-            self._db.execute(
-                "UPDATE transactions SET camera_id = ? WHERE id = ?",
-                (camera_id, txn_id),
-            )
-            if camera_id:
-                self._db.execute(
-                    "INSERT INTO thumbnail_retries (transaction_id) VALUES (?) "
-                    "ON CONFLICT(transaction_id) DO UPDATE SET attempts = 0, "
-                    "next_attempt_at = 0, lease_token = NULL, "
-                    "lease_expires_at = NULL, last_error = ''",
+                if self._thumbnail_file_exists(expected_path):
+                    self._db.commit()
+                    return False
+                cursor = self._db.execute(
+                    "UPDATE transactions SET thumbnail_path = NULL "
+                    "WHERE id = ? AND thumbnail_path = ?",
+                    (txn_id, expected_path),
+                )
+                if cursor.rowcount != 1:
+                    self._db.commit()
+                    return False
+                txn = self._db.execute(
+                    "SELECT location_id, device_id FROM transactions WHERE id = ?",
                     (txn_id,),
+                ).fetchone()
+                mapping = (
+                    self._camera_for_location_locked(
+                        txn["location_id"], txn["device_id"]
+                    )
+                    if txn
+                    else None
                 )
-            else:
+                camera_id = mapping["camera_id"] if mapping else None
                 self._db.execute(
-                    "DELETE FROM thumbnail_retries WHERE transaction_id = ?",
-                    (txn_id,),
+                    "UPDATE transactions SET camera_id = ? WHERE id = ?",
+                    (camera_id, txn_id),
                 )
-            return True
+                if camera_id:
+                    self._db.execute(
+                        "INSERT INTO thumbnail_retries (transaction_id) VALUES (?) "
+                        "ON CONFLICT(transaction_id) DO UPDATE SET attempts = 0, "
+                        "next_attempt_at = 0, lease_token = NULL, "
+                        "lease_expires_at = NULL, last_error = ''",
+                        (txn_id,),
+                    )
+                else:
+                    self._db.execute(
+                        "DELETE FROM thumbnail_retries WHERE transaction_id = ?",
+                        (txn_id,),
+                    )
+                self._db.commit()
+                return True
+            except Exception:
+                self._db.rollback()
+                raise
 
     def claim_thumbnail_retries(
         self,

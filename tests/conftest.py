@@ -177,6 +177,7 @@ def configured(authed):
         },
     )
     assert resp.status_code == 200, resp.text
+    authed.headers["X-Square-Account-Revision"] = resp.json()["account_revision"]
     resp = authed.put(
         "/api/camera-mapping",
         json={

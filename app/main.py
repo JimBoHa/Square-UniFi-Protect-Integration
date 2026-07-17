@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -51,6 +52,22 @@ PROTECT_SETTING_KEYS = (
     "protect.alarm_trigger_id",
 )
 MAX_CAMERA_MAPPINGS = 500
+MIN_POLL_INTERVAL_SECONDS = 1.0
+
+
+def _parse_poll_interval(value: str) -> float:
+    """Return a safe poll interval or fail before starting background work."""
+    try:
+        interval = float(value)
+    except ValueError as exc:
+        raise ValueError(
+            "SPI_POLL_INTERVAL must be a finite number of at least 1 second"
+        ) from exc
+    if not math.isfinite(interval) or interval < MIN_POLL_INTERVAL_SECONDS:
+        raise ValueError(
+            "SPI_POLL_INTERVAL must be a finite number of at least 1 second"
+        )
+    return interval
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +117,13 @@ def create_app(
     square_transport=None,
     enable_poller: bool | None = None,
 ) -> FastAPI:
+    if enable_poller is None:
+        enable_poller = os.environ.get("SPI_DISABLE_POLLER", "0") != "1"
+    poll_interval = (
+        _parse_poll_interval(os.environ.get("SPI_POLL_INTERVAL", "60"))
+        if enable_poller
+        else None
+    )
     data_dir = Path(data_dir or os.environ.get("SPI_DATA_DIR", "./data"))
     store = Store(data_dir)
     app = FastAPI(title="Square UniFi Protect Integration", docs_url=None, redoc_url=None)
@@ -117,9 +141,6 @@ def create_app(
     app.state.thumbnail_drain_queued = False
 
     cookie_secure = os.environ.get("SPI_COOKIE_SECURE", "0") == "1"
-    if enable_poller is None:
-        enable_poller = os.environ.get("SPI_DISABLE_POLLER", "0") != "1"
-
     # -- client construction from stored settings ---------------------------
 
     def build_protect(settings: dict[str, str | None] | None = None) -> ProtectClient | None:
@@ -750,9 +771,8 @@ def create_app(
 
     # -- background poller ---------------------------------------------------------
 
-    if enable_poller:
-        interval = float(os.environ.get("SPI_POLL_INTERVAL", "60"))
-        poller = sync.Poller(run_sync, interval_seconds=interval)
+    if poll_interval is not None:
+        poller = sync.Poller(run_sync, interval_seconds=poll_interval)
         app.state.poller = poller
 
         @app.on_event("startup")

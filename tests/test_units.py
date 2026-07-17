@@ -789,6 +789,26 @@ def test_square_pagination_exhausts_cursor_pages_by_default():
     assert request_limits == [100, 100]
     client.close()
 
+def test_square_pagination_rejects_repeated_cursor():
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            json={"payments": [{"id": f"P{requests}"}], "cursor": "loop"},
+        )
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match="repeated pagination cursor"):
+            client.list_payments()
+    finally:
+        client.close()
+
+    assert requests == 2
+
 def test_square_pagination_honors_explicit_total_limit():
     first_page = [{"id": f"P{i}"} for i in range(100)]
     pages = {

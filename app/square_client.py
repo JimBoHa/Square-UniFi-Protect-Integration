@@ -95,6 +95,7 @@ class SquareClient:
 
         payments: list[dict] = []
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         while True:
             remaining = limit - len(payments) if limit is not None else 100
             params: dict = {"sort_order": "DESC", "limit": min(remaining, 100)}
@@ -110,9 +111,13 @@ class SquareClient:
                 params["cursor"] = cursor
             data = self._get("/v2/payments", params=params)
             payments.extend(data.get("payments", []))
-            cursor = data.get("cursor")
-            if not cursor or (limit is not None and len(payments) >= limit):
+            next_cursor = data.get("cursor")
+            if not next_cursor or (limit is not None and len(payments) >= limit):
                 break
+            if next_cursor in seen_cursors:
+                raise SquareError("Square returned a repeated pagination cursor")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
         return payments if limit is None else payments[:limit]
 
 

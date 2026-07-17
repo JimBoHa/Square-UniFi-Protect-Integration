@@ -236,9 +236,8 @@ class ProtectClient:
 
         Modern Protect firmware (verified on 7.1.87) serves recorded frames
         from ``recording-snapshot?ts=`` and silently ignores ``ts`` on the
-        live ``snapshot`` endpoint, so the recording endpoint must be
-        preferred — falling back to a live frame would attach wrong-time
-        evidence. Frames become available roughly ten seconds behind live;
+        live ``snapshot`` endpoint, so historical requests never fall back to
+        that endpoint. Frames become available roughly ten seconds behind live;
         "no recording yet/anymore" raises ProtectError so the durable retry
         queue can back off and try again.
         """
@@ -265,11 +264,12 @@ class ProtectClient:
                     f"(HTTP {resp.status_code})"
                 )
             # Plain 404 (HTML): older firmware without recording-snapshot.
-            # Fall through to the legacy snapshot endpoint, which honored
-            # ``ts`` on some of those versions.
+            # snapshot?ts is not a safe fallback because some Protect versions
+            # ignore ts and return a live frame with a successful response.
+            raise ProtectError(
+                "Historical snapshots require Protect recording-snapshot support"
+            )
         params: dict = {"w": width}
-        if ts_ms is not None:
-            params["ts"] = int(ts_ms)
         resp = self._request(
             "GET", f"/proxy/protect/api/cameras/{camera_id}/snapshot", params=params
         )

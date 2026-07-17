@@ -105,8 +105,9 @@ Protect 7.1.87) is
 > firmware). Recorded frames become available roughly ten seconds behind
 > live; a sale ingested in real time gets its thumbnail on the first retry
 > pass rather than a wrong-time live frame. On older firmware without
-> `recording-snapshot`, the integration falls back to the legacy `snapshot?ts`
-> query, which some of those versions honored.
+> `recording-snapshot`, historical thumbnails remain pending: the integration
+> deliberately refuses the legacy `snapshot?ts` fallback because some Protect
+> versions silently return a live frame. Live camera previews remain available.
 
 > **Alarm delivery semantics:** each completed transaction is atomically claimed
 > and marked delivered after Protect accepts the trigger. Failed requests are

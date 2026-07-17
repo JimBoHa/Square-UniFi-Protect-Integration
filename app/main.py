@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from . import deeplink, sync
 from .protect_client import (
@@ -47,6 +47,7 @@ PROTECT_SETTING_KEYS = (
     "protect.api_key",
     "protect.alarm_trigger_id",
 )
+MAX_CAMERA_MAPPINGS = 500
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +84,22 @@ class CameraMappingEntry(BaseModel):
     camera_name: str = Field(default="", max_length=128)
 
 class CameraMappingBody(BaseModel):
-    mappings: list[CameraMappingEntry]
+    mappings: list[CameraMappingEntry] = Field(max_length=MAX_CAMERA_MAPPINGS)
+
+    @field_validator("mappings")
+    @classmethod
+    def unique_targets(
+        cls, mappings: list[CameraMappingEntry]
+    ) -> list[CameraMappingEntry]:
+        targets: set[tuple[str, str]] = set()
+        for mapping in mappings:
+            target = (mapping.location_id, mapping.device_id)
+            if target in targets:
+                raise ValueError(
+                    "Duplicate camera mapping for the same location_id and device_id"
+                )
+            targets.add(target)
+        return mappings
 
 
 # ---------------------------------------------------------------------------

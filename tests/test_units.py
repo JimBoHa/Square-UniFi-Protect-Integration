@@ -16,7 +16,12 @@ from app.protect_client import (
     validate_host,
 )
 from app.security import CredentialCipher, hash_password, verify_password
-from app.square_client import SquareClient, SquareError, verify_webhook_signature
+from app.square_client import (
+    SquareClient,
+    SquareError,
+    SquarePermissionError,
+    verify_webhook_signature,
+)
 from app.sync import parse_ts_ms, safe_thumbnail_name
 
 from .conftest import PROTECT_PASS, PROTECT_USER, protect_handler
@@ -252,4 +257,13 @@ def test_square_transport_error_is_normalized():
     assert str(exc_info.value) == "Network error while contacting Square"
     assert "sensitive Square connection details" not in str(exc_info.value)
     assert isinstance(exc_info.value.__cause__, httpx.RequestError)
+    client.close()
+
+def test_square_permission_error_is_distinct():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"errors": [{"code": "FORBIDDEN"}]})
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    with pytest.raises(SquarePermissionError):
+        client.list_payments(limit=1)
     client.close()

@@ -24,6 +24,10 @@ class SquareAuthError(SquareError):
     pass
 
 
+class SquarePermissionError(SquareError):
+    pass
+
+
 class SquareClient:
     def __init__(
         self,
@@ -56,6 +60,8 @@ class SquareClient:
             raise SquareError("Network error while contacting Square") from exc
         if resp.status_code == 401:
             raise SquareAuthError("Square rejected the access token")
+        if resp.status_code == 403:
+            raise SquarePermissionError("Square rejected the token's permissions")
         if resp.status_code >= 400:
             raise SquareError(f"Square request {path} failed (HTTP {resp.status_code})")
         return resp.json()

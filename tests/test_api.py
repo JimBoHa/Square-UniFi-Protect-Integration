@@ -10,6 +10,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.square_client import SquareClient, SquarePermissionError
 
 from .conftest import (
     ADMIN_PASSWORD,
@@ -96,6 +97,36 @@ def test_square_settings_validates_token(authed):
         json={"access_token": "bad-token", "environment": "production"},
     )
     assert resp.status_code == 401
+    assert authed.get("/api/status").json()["square_configured"] is False
+
+def test_square_settings_requires_payments_read_permission(authed, monkeypatch):
+    def reject_payment_read(_self, begin_time=None, limit=100):
+        raise SquarePermissionError("scope missing")
+
+    monkeypatch.setattr(SquareClient, "list_payments", reject_payment_read)
+    resp = authed.put(
+        "/api/settings/square",
+        json={"access_token": SQUARE_TOKEN, "environment": "production"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == (
+        "Square access token must grant PAYMENTS_READ permission"
+    )
+    assert authed.get("/api/status").json()["square_configured"] is False
+
+def test_square_settings_reports_profile_permission_separately(authed, monkeypatch):
+    def reject_profile_read(_self):
+        raise SquarePermissionError("scope missing")
+
+    monkeypatch.setattr(SquareClient, "list_locations", reject_profile_read)
+    resp = authed.put(
+        "/api/settings/square",
+        json={"access_token": SQUARE_TOKEN, "environment": "production"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == (
+        "Square access token must grant MERCHANT_PROFILE_READ permission"
+    )
     assert authed.get("/api/status").json()["square_configured"] is False
 
 def test_square_settings_success(authed):

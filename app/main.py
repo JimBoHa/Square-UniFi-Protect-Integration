@@ -26,6 +26,7 @@ from .square_client import (
     SquareAuthError,
     SquareClient,
     SquareError,
+    SquarePermissionError,
     verify_webhook_signature,
 )
 from .store import Store
@@ -245,7 +246,22 @@ def create_app(
             body.access_token, environment=body.environment, transport=square_transport
         )
         try:
-            locations = client.list_locations()
+            try:
+                locations = client.list_locations()
+            except SquarePermissionError as exc:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "Square access token must grant MERCHANT_PROFILE_READ permission"
+                    ),
+                ) from exc
+            try:
+                client.list_payments(limit=1)
+            except SquarePermissionError as exc:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Square access token must grant PAYMENTS_READ permission",
+                ) from exc
         except SquareAuthError as exc:
             raise HTTPException(status_code=401, detail=str(exc))
         except (SquareError, OSError) as exc:

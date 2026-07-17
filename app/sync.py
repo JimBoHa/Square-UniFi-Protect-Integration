@@ -51,7 +51,7 @@ def _ingest_payment_with_status(
             name = safe_thumbnail_name(txn["id"])
             (store.thumbnail_dir / name).write_bytes(image)
             txn["thumbnail_path"] = name
-        except (ProtectError, ValueError) as exc:
+        except (ProtectError, ValueError, OSError) as exc:
             logger.warning("Thumbnail capture failed for %s: %s", txn["id"], exc)
 
     return txn, store.upsert_transaction(txn)

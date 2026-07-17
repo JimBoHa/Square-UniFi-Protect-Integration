@@ -331,6 +331,18 @@ def test_snapshot_transport_error_stores_transaction_without_thumbnail(tmp_path)
     finally:
         app.state.store.close()
 
+def test_sync_persists_transactions_when_thumbnail_write_fails(configured, tmp_path):
+    configured.app.state.store.thumbnail_dir = tmp_path / "missing" / "thumbnails"
+
+    resp = configured.post("/api/sync")
+
+    assert resp.status_code == 200
+    assert resp.json()["ingested"] == 2
+    txns = configured.get("/api/transactions").json()
+    assert len(txns) == 2
+    assert all(txn["thumbnail_url"] is None for txn in txns)
+    assert all(txn["deep_link"] is not None for txn in txns)
+
 def test_thumbnail_missing_returns_404(configured):
     assert configured.get("/api/thumbnails/NOPE").status_code == 404
 

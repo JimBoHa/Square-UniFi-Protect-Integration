@@ -164,6 +164,93 @@ def test_newer_device_correction_requeues_camera_evidence(tmp_path):
     assert image == f"snapshot:{CAMERA_B}:{corrected['ts_ms']}".encode()
 
 
+def test_device_correction_without_name_clears_previous_device_name(tmp_path):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping(
+        "LOC_OLD",
+        CAMERA_ID,
+        "Register A camera",
+        device_id="TERM_A",
+        device_name="Register A",
+    )
+    store.set_camera_mapping(
+        "LOC_OLD",
+        CAMERA_B,
+        "Register B camera",
+        device_id="TERM_B",
+        device_name="Register B",
+    )
+    original = _payment(
+        "2026-07-16T15:01:00.000Z",
+        amount=500,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/original",
+        device_id="TERM_A",
+        device_name="Register A",
+    )
+    corrected = _payment(
+        "2026-07-16T15:02:00.000Z",
+        amount=500,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/corrected",
+        device_id="TERM_B",
+    )
+    corrected["device_details"].pop("device_name")
+
+    try:
+        ingest_payment(store, original, protect=None)
+        ingest_payment(store, corrected, protect=None)
+        stored = store.get_transaction("PAY_VERSIONED")
+    finally:
+        store.close()
+
+    assert stored["device_id"] == "TERM_B"
+    assert stored["device_name"] == ""
+    assert stored["camera_id"] == CAMERA_B
+
+
+def test_same_device_update_without_name_preserves_device_name(tmp_path):
+    store = Store(tmp_path / "data")
+    original = _payment(
+        "2026-07-16T15:01:00.000Z",
+        amount=500,
+        currency="USD",
+        status="PENDING",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/original",
+        device_id="TERM_A",
+        device_name="Register A",
+    )
+    sparse = _payment(
+        "2026-07-16T15:02:00.000Z",
+        amount=500,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/completed",
+        device_id="TERM_A",
+    )
+    sparse["device_details"].pop("device_name")
+
+    try:
+        ingest_payment(store, original, protect=None)
+        ingest_payment(store, sparse, protect=None)
+        stored = store.get_transaction("PAY_VERSIONED")
+    finally:
+        store.close()
+
+    assert stored["device_id"] == "TERM_A"
+    assert stored["device_name"] == "Register A"
+
+
 def test_newer_location_correction_recaptures_camera_evidence(tmp_path):
     store = Store(tmp_path / "data")
     store.set_camera_mapping("LOC_OLD", CAMERA_ID, "Old location")

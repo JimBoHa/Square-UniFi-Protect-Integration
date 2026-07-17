@@ -29,10 +29,10 @@ def safe_thumbnail_name(payment_id: str) -> str:
     return f"{cleaned}.jpg"
 
 
-def ingest_payment(
+def _ingest_payment_with_status(
     store: Store, payment: dict, protect: ProtectClient | None
-) -> bool:
-    """Store one Square payment and return whether it was newly inserted."""
+) -> tuple[dict, bool]:
+    """Store one Square payment and return it with insertion status."""
     txn = payment_from_api(payment)
     if not txn["id"] or not txn["created_at"]:
         raise ValueError("Payment missing id or created_at")
@@ -54,7 +54,15 @@ def ingest_payment(
         except (ProtectError, ValueError) as exc:
             logger.warning("Thumbnail capture failed for %s: %s", txn["id"], exc)
 
-    return store.upsert_transaction(txn)
+    return txn, store.upsert_transaction(txn)
+
+
+def ingest_payment(
+    store: Store, payment: dict, protect: ProtectClient | None
+) -> dict:
+    """Store one Square payment and return its normalized transaction."""
+    txn, _is_new = _ingest_payment_with_status(store, payment, protect)
+    return txn
 
 
 def sync_payments(
@@ -72,7 +80,8 @@ def sync_payments(
     count = 0
     for payment in payments:
         try:
-            if ingest_payment(store, payment, protect):
+            _txn, is_new = _ingest_payment_with_status(store, payment, protect)
+            if is_new:
                 count += 1
         except ValueError as exc:
             logger.warning("Skipping malformed payment: %s", exc)

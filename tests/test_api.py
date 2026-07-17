@@ -223,6 +223,41 @@ def test_square_settings_success(authed):
         {"id": "LOC1", "name": "Main Store", "status": "ACTIVE"}
     ]
 
+
+def test_square_client_build_uses_one_settings_snapshot(authed, monkeypatch):
+    resp = authed.put(
+        "/api/settings/square",
+        json={"access_token": SQUARE_TOKEN, "environment": "sandbox"},
+    )
+    assert resp.status_code == 200
+    store = authed.app.state.store
+    original_get_setting = store.get_setting
+
+    def switch_account_after_token_read(key):
+        value = original_get_setting(key)
+        if key == "square.access_token":
+            store.update_settings(
+                {
+                    "square.access_token": ("replacement-token", True),
+                    "square.environment": ("production", False),
+                }
+            )
+        return value
+
+    constructed = {}
+
+    def capture_client(_self, access_token, environment="production", **_kwargs):
+        constructed.update(token=access_token, environment=environment)
+
+    monkeypatch.setattr(store, "get_setting", switch_account_after_token_read)
+    monkeypatch.setattr(SquareClient, "__init__", capture_client)
+    monkeypatch.setattr(SquareClient, "list_locations", lambda _self: [])
+    monkeypatch.setattr(SquareClient, "close", lambda _self: None)
+
+    assert authed.get("/api/locations").status_code == 200
+    assert constructed == {"token": SQUARE_TOKEN, "environment": "sandbox"}
+
+
 def test_square_settings_require_complete_webhook_pair(authed):
     resp = authed.put(
         "/api/settings/square",

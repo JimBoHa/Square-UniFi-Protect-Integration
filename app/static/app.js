@@ -3,6 +3,11 @@
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
+const TRANSACTION_REFRESH_MS = 15000;
+
+let transactionRefreshTimer = null;
+let transactionLoadInFlight = false;
+let lastTransactionPayload = null;
 
 function show(viewId) {
   for (const sec of document.querySelectorAll("main > section")) sec.hidden = true;
@@ -53,6 +58,7 @@ function enterApp() {
   show("#view-transactions");
   loadTransactions();
   loadSettingsView();
+  startTransactionRefresh();
 }
 
 // ---------------------------------------------------------------- auth
@@ -88,6 +94,7 @@ $("#login-form").addEventListener("submit", async (e) => {
 
 $("#logout-btn").addEventListener("click", async () => {
   try { await api("/api/logout", { method: "POST" }); } catch { /* session gone */ }
+  stopTransactionRefresh();
   $("#nav").hidden = true;
   show("#view-login");
 });
@@ -217,6 +224,31 @@ $("#save-mapping").addEventListener("click", async () => {
 
 // ---------------------------------------------------------------- transactions
 
+function transactionViewIsVisible() {
+  return document.visibilityState === "visible" &&
+    !$("#nav").hidden && !$("#view-transactions").hidden;
+}
+
+function refreshTransactionsIfVisible() {
+  if (transactionViewIsVisible()) loadTransactions();
+}
+
+function startTransactionRefresh() {
+  if (transactionRefreshTimer !== null) return;
+  transactionRefreshTimer = window.setInterval(
+    refreshTransactionsIfVisible,
+    TRANSACTION_REFRESH_MS,
+  );
+}
+
+function stopTransactionRefresh() {
+  if (transactionRefreshTimer === null) return;
+  window.clearInterval(transactionRefreshTimer);
+  transactionRefreshTimer = null;
+}
+
+document.addEventListener("visibilitychange", refreshTransactionsIfVisible);
+
 function formatAmount(cents, currency) {
   try {
     return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(cents / 100);
@@ -226,13 +258,22 @@ function formatAmount(cents, currency) {
 }
 
 async function loadTransactions() {
+  if (transactionLoadInFlight) return;
+  transactionLoadInFlight = true;
   let txns;
   try {
     txns = await api("/api/transactions?limit=100");
   } catch (err) {
     message(err.message, "error");
     return;
+  } finally {
+    transactionLoadInFlight = false;
   }
+  $("#txn-last-updated").textContent =
+    `Last updated ${new Date().toLocaleTimeString()}`;
+  const payload = JSON.stringify(txns);
+  if (payload === lastTransactionPayload) return;
+  lastTransactionPayload = payload;
   const list = $("#txn-list");
   list.textContent = "";
   if (!txns.length) {

@@ -59,7 +59,30 @@ def test_legacy_location_mapping_migrates_to_device_aware_schema(tmp_path):
             "https://square.example/legacy",
             CAM1,
             "PAY_LEGACY.jpg",
-            '{"legacy": true}',
+            '{"device_details":{"device_id":"TERM_LEGACY",'
+            '"device_name":"Legacy Register"}}',
+        ),
+    )
+    db.execute(
+        """
+        INSERT INTO transactions (
+            id, created_at, ts_ms, amount, currency, status, location_id,
+            card_last4, receipt_url, camera_id, thumbnail_path, raw
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "PAY_MALFORMED",
+            "2026-07-16T15:01:00.000Z",
+            1784239260000,
+            600,
+            "USD",
+            "COMPLETED",
+            "LOC1",
+            "1111",
+            "https://square.example/malformed",
+            CAM1,
+            "PAY_MALFORMED.jpg",
+            "not valid json",
         ),
     )
     db.commit()
@@ -77,9 +100,13 @@ def test_legacy_location_mapping_migrates_to_device_aware_schema(tmp_path):
             }
         ]
         legacy_txn = store.get_transaction("PAY_LEGACY")
-        assert legacy_txn["device_id"] == ""
-        assert legacy_txn["device_name"] == ""
+        assert legacy_txn["device_id"] == "TERM_LEGACY"
+        assert legacy_txn["device_name"] == "Legacy Register"
         assert legacy_txn["thumbnail_path"] == "PAY_LEGACY.jpg"
+        malformed_txn = store.get_transaction("PAY_MALFORMED")
+        assert malformed_txn["device_id"] == ""
+        assert malformed_txn["device_name"] == ""
+        assert malformed_txn["thumbnail_path"] == "PAY_MALFORMED.jpg"
 
         store.set_camera_mapping(
             "LOC1",
@@ -92,5 +119,42 @@ def test_legacy_location_mapping_migrates_to_device_aware_schema(tmp_path):
         assert store.camera_for_location("LOC1", "TERM_A")["camera_id"] == CAM2
         assert store.camera_for_location("LOC1", "UNKNOWN")["camera_id"] == CAM1
         assert store.camera_for_location("LOC2", "UNKNOWN")["camera_id"] == CAM_WILDCARD
+    finally:
+        store.close()
+
+
+def test_observed_device_name_uses_newest_nonempty_transaction(tmp_path):
+    store = Store(tmp_path / "data")
+
+    def add_transaction(txn_id: str, ts_ms: int, device_name: str) -> None:
+        store.upsert_transaction(
+            {
+                "id": txn_id,
+                "created_at": "2026-07-16T15:00:00.000Z",
+                "ts_ms": ts_ms,
+                "amount": 500,
+                "currency": "USD",
+                "status": "COMPLETED",
+                "location_id": "LOC1",
+                "device_id": "TERM_A",
+                "device_name": device_name,
+            }
+        )
+
+    try:
+        add_transaction("PAY_OLD", 100, "Zebra Register")
+        add_transaction("PAY_NEW", 200, "Alpha Register")
+        add_transaction("PAY_EMPTY", 300, "")
+        assert store.get_observed_devices() == [
+            {
+                "location_id": "LOC1",
+                "device_id": "TERM_A",
+                "device_name": "Alpha Register",
+            }
+        ]
+
+        add_transaction("PAY_TIE_A", 400, "Register A")
+        add_transaction("PAY_TIE_B", 400, "Register B")
+        assert store.get_observed_devices()[0]["device_name"] == "Register B"
     finally:
         store.close()

@@ -6,6 +6,7 @@ import hmac
 import json
 
 from app.protect_client import ProtectClient
+from app.sync import ingest_payment
 
 from .conftest import (
     ADMIN_PASSWORD,
@@ -111,6 +112,25 @@ def test_camera_mapping_roundtrip(configured):
             "camera_name": "Front Counter",
         }
     ]
+
+def test_camera_mapping_accepts_255_character_device_name(configured):
+    device_name = "R" * 255
+    resp = configured.put(
+        "/api/camera-mapping",
+        json={
+            "mappings": [
+                {
+                    "location_id": "LOC1",
+                    "device_id": "TERM_LONG_NAME",
+                    "device_name": device_name,
+                    "camera_id": CAM1,
+                    "camera_name": "Front Counter",
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert configured.get("/api/camera-mapping").json()[0]["device_name"] == device_name
 
 def test_camera_preview_returns_jpeg(configured):
     resp = configured.get(f"/api/camera-preview/{CAM1}")
@@ -349,6 +369,76 @@ def test_payment_without_device_uses_location_fallback(configured, monkeypatch):
     assert txn["camera_id"] == CAM1
     assert f"/timeline/{CAM1}?" in txn["deep_link"]
     assert snapshot_requests == [CAM1]
+
+def test_sparse_payment_update_preserves_device_camera_evidence(configured, monkeypatch):
+    snapshot_requests = []
+
+    def record_snapshot(_self, camera_id, ts_ms=None, width=640):
+        snapshot_requests.append(camera_id)
+        return b"snapshot:" + camera_id.encode()
+
+    monkeypatch.setattr(ProtectClient, "get_snapshot", record_snapshot)
+    mapping = {
+        "mappings": [
+            {
+                "location_id": "LOC1",
+                "camera_id": CAM2,
+                "camera_name": "Back Door",
+            },
+            {
+                "location_id": "LOC1",
+                "device_id": "TERM_A",
+                "device_name": "Register A",
+                "camera_id": CAM1,
+                "camera_name": "Front Counter",
+            },
+        ]
+    }
+    assert configured.put("/api/camera-mapping", json=mapping).status_code == 200
+
+    initial_body = make_webhook_event("PAY_SPARSE", "TERM_A", "Register A")
+    initial_payment = json.loads(initial_body)["data"]["object"]["payment"]
+    ingest_payment(configured.app.state.store, initial_payment, protect=None)
+
+    sparse_body = make_webhook_event("PAY_SPARSE")
+    resp = configured.post(
+        "/webhooks/square",
+        content=sparse_body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(sparse_body)},
+    )
+    assert resp.status_code == 200
+    txn = next(
+        item
+        for item in configured.get("/api/transactions").json()
+        if item["id"] == "PAY_SPARSE"
+    )
+    original_image = configured.get(txn["thumbnail_url"]).content
+    assert txn["device_id"] == "TERM_A"
+    assert txn["camera_id"] == CAM1
+    assert CAM1.encode() in original_image
+    assert snapshot_requests == [CAM1]
+
+    mapping["mappings"][1]["camera_id"] = CAM2
+    mapping["mappings"][1]["camera_name"] = "Back Door"
+    assert configured.put("/api/camera-mapping", json=mapping).status_code == 200
+    snapshot_requests.clear()
+    resp = configured.post(
+        "/webhooks/square",
+        content=sparse_body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(sparse_body)},
+    )
+    assert resp.status_code == 200
+
+    txn = next(
+        item
+        for item in configured.get("/api/transactions").json()
+        if item["id"] == "PAY_SPARSE"
+    )
+    assert txn["device_id"] == "TERM_A"
+    assert txn["camera_id"] == CAM1
+    assert f"/timeline/{CAM1}?" in txn["deep_link"]
+    assert configured.get(txn["thumbnail_url"]).content == original_image
+    assert snapshot_requests == []
 
 def test_webhook_ignores_non_payment_events(configured):
     body = json.dumps({"type": "inventory.count.updated", "data": {}}).encode()

@@ -115,6 +115,34 @@ class Store:
                 "ALTER TABLE transactions ADD COLUMN device_name "
                 "TEXT NOT NULL DEFAULT ''"
             )
+        self._backfill_transaction_devices()
+
+    def _backfill_transaction_devices(self) -> None:
+        rows = self._db.execute(
+            "SELECT id, device_id, device_name, raw FROM transactions "
+            "WHERE device_id = '' OR device_name = ''"
+        ).fetchall()
+        for row in rows:
+            try:
+                payment = json.loads(row["raw"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payment, dict):
+                continue
+            details = payment.get("device_details")
+            if not isinstance(details, dict):
+                continue
+            parsed_id = details.get("device_id")
+            parsed_name = details.get("device_name")
+            parsed_id = parsed_id if isinstance(parsed_id, str) else ""
+            parsed_name = parsed_name if isinstance(parsed_name, str) else ""
+            device_id = row["device_id"] or parsed_id
+            device_name = row["device_name"] or parsed_name
+            if device_id != row["device_id"] or device_name != row["device_name"]:
+                self._db.execute(
+                    "UPDATE transactions SET device_id = ?, device_name = ? WHERE id = ?",
+                    (device_id, device_name, row["id"]),
+                )
 
     def close(self) -> None:
         self._db.close()
@@ -254,10 +282,14 @@ class Store:
     def get_observed_devices(self) -> list[dict]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT location_id, device_id, MAX(device_name) AS device_name "
-                "FROM transactions WHERE device_id != '' "
-                "GROUP BY location_id, device_id "
-                "ORDER BY location_id, device_name, device_id"
+                "SELECT devices.location_id, devices.device_id, "
+                "COALESCE((SELECT named.device_name FROM transactions AS named "
+                "WHERE named.location_id = devices.location_id "
+                "AND named.device_id = devices.device_id AND named.device_name != '' "
+                "ORDER BY named.ts_ms DESC, named.id DESC LIMIT 1), '') AS device_name "
+                "FROM (SELECT DISTINCT location_id, device_id FROM transactions "
+                "WHERE device_id != '') AS devices "
+                "ORDER BY devices.location_id, device_name, devices.device_id"
             ).fetchall()
         return [dict(r) for r in rows]
 

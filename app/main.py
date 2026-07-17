@@ -62,7 +62,7 @@ class SquareSettingsBody(BaseModel):
 class CameraMappingEntry(BaseModel):
     location_id: str = Field(min_length=1, max_length=64)
     device_id: str = Field(default="", max_length=255)
-    device_name: str = Field(default="", max_length=128)
+    device_name: str = Field(default="", max_length=255)
     camera_id: str = Field(min_length=1, max_length=64)
     camera_name: str = Field(default="", max_length=128)
 

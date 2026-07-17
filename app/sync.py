@@ -38,14 +38,23 @@ def ingest_payment(
         raise ValueError("Payment missing id or created_at")
     txn["ts_ms"] = parse_ts_ms(txn["created_at"])
 
+    existing = store.get_transaction(txn["id"])
+    if existing and not txn["device_id"]:
+        txn["device_id"] = existing.get("device_id", "")
+        if not txn["device_name"]:
+            txn["device_name"] = existing.get("device_name", "")
+
     mapping = store.camera_for_location(txn["location_id"], txn["device_id"])
     txn["camera_id"] = mapping["camera_id"] if mapping else None
     txn["thumbnail_path"] = None
 
-    existing = store.get_transaction(txn["id"])
-    already_has_thumb = bool(existing and existing.get("thumbnail_path"))
+    existing_thumbnail = existing.get("thumbnail_path") if existing else None
+    existing_camera = existing.get("camera_id") if existing else None
 
-    if protect is not None and txn["camera_id"] and not already_has_thumb:
+    if existing_thumbnail and existing_camera:
+        txn["camera_id"] = existing_camera
+        txn["thumbnail_path"] = existing_thumbnail
+    elif protect is not None and txn["camera_id"] and not existing_thumbnail:
         try:
             image = protect.get_snapshot(txn["camera_id"], ts_ms=txn["ts_ms"])
             name = safe_thumbnail_name(txn["id"])

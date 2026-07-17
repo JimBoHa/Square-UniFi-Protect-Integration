@@ -31,6 +31,7 @@ PROTECTED_ENDPOINTS = [
     ("GET", "/api/thumbnails/PAY_001"),
     ("POST", "/api/sync"),
     ("PUT", "/api/settings/protect"),
+    ("POST", "/api/settings/protect/console-switch-token"),
     ("PUT", "/api/settings/square"),
     ("POST", "/api/logout"),
 ]

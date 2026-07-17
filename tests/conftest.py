@@ -83,6 +83,7 @@ def protect_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json={
+                "nvr": {"id": "nvr-console-1"},
                 "cameras": [
                     {"id": "cam1aaaaaaaaaaaaaaaaaaaaa", "name": "Front Counter", "state": "CONNECTED"},
                     {"id": "cam2bbbbbbbbbbbbbbbbbbbbb", "name": "Back Door", "state": "CONNECTED"},
@@ -178,6 +179,10 @@ def configured(authed):
     )
     assert resp.status_code == 200, resp.text
     authed.headers["X-Square-Account-Revision"] = resp.json()["account_revision"]
+    cameras = authed.get("/api/cameras")
+    assert cameras.status_code == 200, cameras.text
+    mapping_generation = cameras.headers["x-protect-console-generation"]
+    authed.headers["X-Protect-Console-Generation"] = mapping_generation
     resp = authed.put(
         "/api/camera-mapping",
         json={

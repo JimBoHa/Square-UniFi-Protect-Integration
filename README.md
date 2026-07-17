@@ -78,8 +78,20 @@ Open `http://<host>:8000`, then:
    Manager → Settings → API Keys and enter it with the ID of a matching Alarm
    Manager webhook trigger. The key is verified against Protect's official local
    integration API before it is saved. Leave alarm fields blank to retain saved
-   values, or use the disable button to remove them locally even when the
-   Protect console is unavailable.
+   values when the same console is verified, or use the disable button to remove
+   them locally even when the Protect console is unavailable.
+   Changing the saved host/IP or port—or changing or losing the NVR identity
+   reported by a previously bound console—requires the **Confirm console switch**
+   checkbox. Each confirmation is short-lived and bound to the verified target.
+   Because aliases cannot reliably prove identity, every host-string change is
+   treated as a different console: camera mappings, camera associations,
+   thumbnails, and thumbnail retries are cleared while Square transaction facts
+   remain unassociated. Re-select the POS cameras afterward; the new mappings
+   apply to new sales, not retained history.
+   Upgraded installations that predate console identities bind the first identity
+   seen on a successful reconnect; every later mismatch requires a confirmed reset.
+   If a Protect version never reports an NVR id or MAC, the saved host string is
+   the only available identity boundary.
 3. **Settings → Square account** — a Square access token
    (Developer Dashboard → your application → Credentials). Optionally add your
    webhook signature key and notification URL for real-time ingestion

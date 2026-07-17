@@ -17,6 +17,7 @@ let lastTransactionPayload = null;
 let settingsLoadGeneration = 0;
 let squareAccountSwitchConfirmationToken = "";
 let squareAccountRevision = "";
+let cameraMappingGeneration = "";
 
 function show(viewId) {
   for (const sec of document.querySelectorAll("main > section")) sec.hidden = true;
@@ -136,24 +137,66 @@ for (const btn of document.querySelectorAll("nav button[data-view]")) {
 
 $("#protect-form").addEventListener("submit", async (e) => {
   e.preventDefault();
+  const confirmationCheckbox = $("#protect-confirm-console-switch");
   try {
+    const settings = {
+      host: $("#protect-host").value.trim(),
+      username: $("#protect-username").value.trim(),
+      password: $("#protect-password").value,
+      verify_ssl: $("#protect-verify-ssl").checked,
+      api_key: $("#protect-api-key").value.trim(),
+      alarm_trigger_id: $("#protect-alarm-trigger-id").value.trim(),
+    };
+    const tokenRequest = protectConsoleSwitchTokenRequest(
+      confirmationCheckbox,
+      settings,
+    );
+    let consoleSwitchToken = "";
+    if (tokenRequest) {
+      const confirmation = await api(
+        "/api/settings/protect/console-switch-token",
+        {
+          method: "POST",
+          body: JSON.stringify(tokenRequest),
+        },
+      );
+      consoleSwitchToken = confirmation.token;
+    }
     const result = await api("/api/settings/protect", {
       method: "PUT",
       body: JSON.stringify({
-        host: $("#protect-host").value.trim(),
-        username: $("#protect-username").value.trim(),
-        password: $("#protect-password").value,
-        verify_ssl: $("#protect-verify-ssl").checked,
-        api_key: $("#protect-api-key").value.trim(),
-        alarm_trigger_id: $("#protect-alarm-trigger-id").value.trim(),
+        ...settings,
+        console_switch_token: consoleSwitchToken,
       }),
     });
     $("#protect-password").value = "";
     $("#protect-api-key").value = "";
-    const alarm = result.alarm_configured ? " Alarm trigger enabled." : "";
-    message(`Connected to UniFi Protect (${result.cameras} cameras found).${alarm}`, "ok");
-    loadSettingsView();
+    confirmationCheckbox.checked = false;
+    let settingsReload = null;
+    if (result.console_switched) {
+      settingsLoadGeneration += 1;
+      squareAccountRevision = "";
+      cameraMappingGeneration = "";
+      clearProtectConsoleView(
+        $("#mapping-rows"),
+        $("#save-mapping"),
+        $("#camera-preview-wrap"),
+        $("#camera-preview"),
+      );
+      lastTransactionPayload = null;
+      renderTransactions([]);
+      settingsReload = loadSettingsView();
+      await Promise.all([
+        loadTransactions({ reset: true }),
+        settingsReload,
+      ]);
+    }
+    message(protectConnectionMessage(result), "ok");
+    if (!settingsReload) loadSettingsView();
   } catch (err) {
+    // Any failed or conflicted save requires a fresh user confirmation and a
+    // newly issued token bound to the then-current console generation.
+    confirmationCheckbox.checked = false;
     message(err.message, "error");
   }
 });
@@ -225,7 +268,13 @@ async function loadSettingsView() {
   rows.textContent = "";
   let cameras = [], locations = [], mappings = [], devices = [];
   let accountRevision = "";
-  try { cameras = await api("/api/cameras"); } catch { /* Protect not configured yet */ }
+  let protectGeneration = "";
+  try {
+    const result = await api("/api/cameras", { includeResponse: true });
+    cameras = result.data;
+    protectGeneration =
+      result.response.headers.get("x-protect-console-generation") || "";
+  } catch { /* Protect not configured yet */ }
   try {
     const result = await api("/api/locations", { includeResponse: true });
     locations = result.data;
@@ -234,7 +283,14 @@ async function loadSettingsView() {
   try { devices = await api("/api/pos-devices"); } catch { /* No observed devices yet */ }
   try { mappings = await api("/api/camera-mapping"); } catch { return; }
   if (generation !== settingsLoadGeneration) return;
-  squareAccountRevision = accountRevision;
+  if (!publishLatestSettingsLoad(
+    generation,
+    settingsLoadGeneration,
+    () => {
+      squareAccountRevision = accountRevision;
+      cameraMappingGeneration = protectGeneration;
+    },
+  )) return;
 
   if (!cameras.length || !locations.length) {
     const p = document.createElement("p");
@@ -323,7 +379,10 @@ $("#save-mapping").addEventListener("click", async () => {
   try {
     await api("/api/camera-mapping", {
       method: "PUT",
-      headers: { "X-Square-Account-Revision": squareAccountRevision },
+      headers: {
+        "X-Square-Account-Revision": squareAccountRevision,
+        "X-Protect-Console-Generation": cameraMappingGeneration,
+      },
       body: JSON.stringify({ mappings }),
     });
     message("Camera selection saved.", "ok");

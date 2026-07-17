@@ -14,6 +14,7 @@ import httpx
 
 HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?(?::\d{1,5})?$")
 CAMERA_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
+_CONSOLE_ID_MAX_LENGTH = 256
 _SNAPSHOT_CONTENT_TYPES = frozenset(
     {
         "image/jpeg",
@@ -218,7 +219,12 @@ class ProtectClient:
 
     # -- API -------------------------------------------------------------------
 
-    def get_cameras(self) -> list[dict]:
+    def get_cameras_with_console_identity(self) -> tuple[list[dict], str | None]:
+        """Return cameras and Protect's optional durable console identity.
+
+        Protect bootstrap payloads do not always include an NVR identity, so
+        malformed or absent identity fields must not prevent camera discovery.
+        """
         resp = self._request("GET", "/proxy/protect/api/bootstrap")
         try:
             data = resp.json()
@@ -231,7 +237,7 @@ class ProtectClient:
             not isinstance(camera, dict) for camera in cameras
         ):
             raise ProtectError("UniFi Protect camera response was invalid")
-        return [
+        normalized_cameras = [
             {
                 "id": cam.get("id", ""),
                 "name": cam.get("name") or cam.get("marketName") or cam.get("id", ""),
@@ -239,6 +245,26 @@ class ProtectClient:
             }
             for cam in cameras
         ]
+        console_identity = None
+        nvr = data.get("nvr")
+        if isinstance(nvr, dict):
+            for field in ("id", "mac"):
+                candidate = nvr.get(field)
+                if not isinstance(candidate, str):
+                    continue
+                candidate = candidate.strip()
+                if (
+                    candidate
+                    and len(candidate) <= _CONSOLE_ID_MAX_LENGTH
+                    and not any(ord(char) < 32 or ord(char) == 127 for char in candidate)
+                ):
+                    console_identity = candidate
+                    break
+        return normalized_cameras, console_identity
+
+    def get_cameras(self) -> list[dict]:
+        cameras, _console_identity = self.get_cameras_with_console_identity()
+        return cameras
 
     def get_snapshot(
         self, camera_id: str, ts_ms: int | None = None, width: int = 640

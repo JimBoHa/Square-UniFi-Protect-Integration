@@ -37,7 +37,11 @@ ALARM_ENABLED_AFTER_SETTING = "protect.alarm_enabled_after_ms"
 SQUARE_POLL_WATERMARK_TABLE = "square_poll_watermarks"
 PROTECT_EVIDENCE_RETIRED_TABLE = "protect_evidence_retired"
 SQUARE_ACCOUNT_REVISION_SETTING = "square.account_revision"
+PROTECT_CONSOLE_GENERATION_SETTING = "protect.console_generation"
+PROTECT_CONSOLE_ID_SETTING = "protect.console_id"
+PROTECT_SWITCH_TOKEN_TTL_SECONDS = 5 * 60
 ORPHAN_THUMBNAIL_CLEANUP_SETTING = "maintenance.orphan_thumbnail_cleanup_pending"
+_NO_EXPECTED_PROTECT_HOST = object()
 
 # Windows' msvcrt backend offers only exclusive byte-range locks. A short-lived
 # gate plus independent reader slots provides shared-reader/exclusive-writer
@@ -72,6 +76,14 @@ class SquareAccountConfiguration:
     switched: bool
     account_revision: str
     evidence_cleanup_pending: bool
+
+
+class ProtectConsoleSwitchConfirmationRequired(RuntimeError):
+    """A host change attempted to discard console-scoped state without consent."""
+
+
+class ProtectSettingsConflict(RuntimeError):
+    """Protect settings changed after a caller took its validation snapshot."""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -120,6 +132,10 @@ CREATE TABLE IF NOT EXISTS thumbnail_retries (
 );
 CREATE INDEX IF NOT EXISTS idx_thumbnail_retries_due
     ON thumbnail_retries (next_attempt_at, lease_expires_at);
+CREATE TABLE IF NOT EXISTS protect_evidence_retired (
+    transaction_id TEXT PRIMARY KEY,
+    FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
     expires_at REAL NOT NULL
@@ -247,6 +263,7 @@ class Store:
                 # the remaining buyer and payment metadata before committing.
                 self._scrub_transaction_raw()
                 self._migrate_alarms()
+                self._ensure_protect_console_generation_locked()
                 self._clear_missing_thumbnail_references_locked()
                 # Upgrade existing databases: any transaction that already
                 # missed its thumbnail must enter the durable retry queue.
@@ -307,7 +324,7 @@ class Store:
                 windows_lock = _acquire_windows_integration_lock(
                     fd, exclusive=exclusive
                 )
-            else:  # Fail closed instead of silently losing account isolation.
+            else:  # Fail closed instead of silently losing provider isolation.
                 raise RuntimeError("No supported cross-process file-lock backend")
             yield
         finally:
@@ -400,6 +417,21 @@ class Store:
                 "alarm_claim_token = NULL, alarm_claimed_at = NULL "
                 "WHERE UPPER(status) = 'COMPLETED' AND alarm_state != ?",
                 (ALARM_SENT, ALARM_SENT),
+            )
+
+    def _ensure_protect_console_generation_locked(self) -> None:
+        """Bind upgraded Protect settings to a stable console generation."""
+        configured = self._db.execute(
+            "SELECT 1 FROM settings WHERE key = ?", ("protect.host",)
+        ).fetchone()
+        generation = self._db.execute(
+            "SELECT 1 FROM settings WHERE key = ?",
+            (PROTECT_CONSOLE_GENERATION_SETTING,),
+        ).fetchone()
+        if configured and not generation:
+            self._db.execute(
+                "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, 0)",
+                (PROTECT_CONSOLE_GENERATION_SETTING, secrets.token_hex(16)),
             )
 
     def _migrate_schema(self) -> None:
@@ -503,6 +535,14 @@ class Store:
 
     # -- settings ----------------------------------------------------------
 
+    def _setting_value_locked(self, key: str) -> str | None:
+        row = self._db.execute(
+            "SELECT value, encrypted FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self.cipher.decrypt(row["value"]) if row["encrypted"] else row["value"]
+
     def set_setting(self, key: str, value: str, secret: bool = False) -> None:
         self.update_settings({key: (value, secret)})
 
@@ -569,6 +609,263 @@ class Store:
                 self._db.rollback()
                 raise
         return alarm_activated
+
+    def update_protect_settings(
+        self,
+        updates: dict[str, tuple[str, bool]],
+        *,
+        expected_host: str | None,
+        expected_generation: str | None,
+        expected_console_id: str | None = None,
+        observed_console_id: str | None = None,
+        console_switch_token: str = "",
+        delete_keys: tuple[str, ...] = (),
+        activate_alarm_at_ms: int | None = None,
+    ) -> bool:
+        """Atomically save Protect settings and isolate a confirmed console switch.
+
+        Returns whether the stored host or durable console identity changed.
+        Database references are cleared in the same transaction as the settings
+        update; files are removed afterward only if no transaction references them.
+        """
+        if "protect.host" not in updates:
+            raise ValueError("Protect settings update requires protect.host")
+        new_host = updates["protect.host"][0]
+        if observed_console_id is not None:
+            updates = {
+                **updates,
+                PROTECT_CONSOLE_ID_SETTING: (observed_console_id, False),
+            }
+        elif PROTECT_CONSOLE_ID_SETTING in updates:
+            raise ValueError("Protect console id must be passed as observed_console_id")
+        stored_updates = [
+            (key, self.cipher.encrypt(value) if secret else value, int(secret))
+            for key, (value, secret) in updates.items()
+        ]
+        console_switched = False
+        alarm_activated = False
+
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                current_host = self._setting_value_locked("protect.host")
+                current_generation = self._setting_value_locked(
+                    PROTECT_CONSOLE_GENERATION_SETTING
+                )
+                current_console_id = self._setting_value_locked(
+                    PROTECT_CONSOLE_ID_SETTING
+                )
+                if (
+                    current_host != expected_host
+                    or current_generation != expected_generation
+                    or current_console_id != expected_console_id
+                ):
+                    raise ProtectSettingsConflict(
+                        "Protect settings changed while credentials were being verified"
+                    )
+                console_switched = bool(
+                    current_host
+                    and (
+                        current_host != new_host
+                        or (
+                            current_console_id is not None
+                            and current_console_id != observed_console_id
+                        )
+                    )
+                )
+                if console_switched and not self._protect_switch_confirmation_matches(
+                    console_switch_token,
+                    current_generation,
+                    new_host,
+                    observed_console_id,
+                ):
+                    raise ProtectConsoleSwitchConfirmationRequired(
+                        "Protect console switch requires explicit confirmation"
+                    )
+
+                if console_switched:
+                    # Retained Square facts must not be silently remapped to
+                    # cameras on the new console when mappings are re-created.
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO protect_evidence_retired "
+                        "(transaction_id) SELECT id FROM transactions"
+                    )
+                    self._db.execute("DELETE FROM camera_map")
+                    self._db.execute("DELETE FROM thumbnail_retries")
+                    self._db.execute(
+                        "UPDATE transactions SET camera_id = NULL, "
+                        "thumbnail_path = NULL "
+                        "WHERE camera_id IS NOT NULL OR thumbnail_path IS NOT NULL"
+                    )
+                    self._db.execute(
+                        "INSERT INTO settings (key, value, encrypted) VALUES (?, '1', 0) "
+                        "ON CONFLICT(key) DO UPDATE SET value='1', encrypted=0",
+                        (ORPHAN_THUMBNAIL_CLEANUP_SETTING,),
+                    )
+
+                for key in delete_keys:
+                    self._db.execute("DELETE FROM settings WHERE key = ?", (key,))
+                if console_switched and observed_console_id is None:
+                    self._db.execute(
+                        "DELETE FROM settings WHERE key = ?",
+                        (PROTECT_CONSOLE_ID_SETTING,),
+                    )
+                self._db.executemany(
+                    "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                    "encrypted=excluded.encrypted",
+                    stored_updates,
+                )
+                if not current_generation or console_switched:
+                    self._db.execute(
+                        "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, 0) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=0",
+                        (
+                            PROTECT_CONSOLE_GENERATION_SETTING,
+                            secrets.token_hex(16),
+                        ),
+                    )
+                if activate_alarm_at_ms is not None:
+                    configured_keys = {
+                        row["key"]
+                        for row in self._db.execute(
+                            "SELECT key FROM settings WHERE key IN (?, ?, ?)",
+                            (
+                                "protect.api_key",
+                                "protect.alarm_trigger_id",
+                                ALARM_ENABLED_AFTER_SETTING,
+                            ),
+                        ).fetchall()
+                    }
+                    if {
+                        "protect.api_key",
+                        "protect.alarm_trigger_id",
+                    }.issubset(configured_keys) and (
+                        ALARM_ENABLED_AFTER_SETTING not in configured_keys
+                    ):
+                        self._db.execute(
+                            "INSERT INTO settings (key, value, encrypted) "
+                            "VALUES (?, ?, 0)",
+                            (
+                                ALARM_ENABLED_AFTER_SETTING,
+                                str(int(activate_alarm_at_ms)),
+                            ),
+                        )
+                        alarm_activated = True
+                if console_switched or alarm_activated:
+                    # Pending alarm claims and deliveries belong to the old
+                    # console too. Never replay completed sales on the new one.
+                    self._db.execute(
+                        "UPDATE transactions SET alarm_state = ?, "
+                        "alarm_claim_token = NULL, alarm_claimed_at = NULL "
+                        "WHERE UPPER(status) = 'COMPLETED' AND alarm_state != ?",
+                        (ALARM_SENT, ALARM_SENT),
+                    )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+
+        if console_switched:
+            try:
+                self.remove_orphan_thumbnails()
+            except Exception as exc:
+                # The durable marker retries the scan at startup. The database
+                # no longer exposes old-console evidence, so this must not make
+                # the committed settings switch look rolled back.
+                logger.warning(
+                    "Could not scan orphan thumbnails after console switch: %s",
+                    exc,
+                )
+        return console_switched
+
+    def protect_console_switch_token(
+        self,
+        target_host: str,
+        target_console_id: str | None,
+        *,
+        expected_host: str | None,
+        expected_generation: str | None,
+        expected_console_id: str | None,
+        now: float | None = None,
+    ) -> str | None:
+        """Issue short-lived consent bound to the current console generation."""
+        with self._lock:
+            current_host = self._setting_value_locked("protect.host")
+            current_generation = self._setting_value_locked(
+                PROTECT_CONSOLE_GENERATION_SETTING
+            )
+            current_console_id = self._setting_value_locked(
+                PROTECT_CONSOLE_ID_SETTING
+            )
+            if (
+                current_host != expected_host
+                or current_generation != expected_generation
+                or current_console_id != expected_console_id
+            ):
+                raise ProtectSettingsConflict(
+                    "Protect settings changed while switch confirmation was being verified"
+                )
+        if not current_host or not current_generation:
+            return None
+        payload = json.dumps(
+            {
+                "generation": current_generation,
+                "target_host": target_host,
+                "target_console_id": target_console_id,
+                "issued_at": int(time.time() if now is None else now),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return self.cipher.encrypt(payload)
+
+    def _protect_switch_confirmation_matches(
+        self,
+        token: str,
+        current_generation: str | None,
+        target_host: str,
+        target_console_id: str | None,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        if not token or not current_generation:
+            return False
+        try:
+            payload = json.loads(self.cipher.decrypt(token))
+            issued_at = payload["issued_at"]
+            generation = payload["generation"]
+            confirmed_target = payload["target_host"]
+            confirmed_console_id = payload["target_console_id"]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        current_time = int(time.time() if now is None else now)
+        return (
+            isinstance(issued_at, int)
+            and current_time - PROTECT_SWITCH_TOKEN_TTL_SECONDS <= issued_at
+            <= current_time + 30
+            and generation == current_generation
+            and confirmed_target == target_host
+            and confirmed_console_id == target_console_id
+        )
+
+    def protect_console_switch_token_valid(
+        self,
+        token: str,
+        target_host: str,
+        target_console_id: str | None,
+    ) -> bool:
+        """Validate a switch token against the latest stored generation."""
+        with self._lock:
+            current_generation = self._setting_value_locked(
+                PROTECT_CONSOLE_GENERATION_SETTING
+            )
+        return self._protect_switch_confirmation_matches(
+            token,
+            current_generation,
+            target_host,
+            target_console_id,
+        )
 
     def set_setting_if_absent(self, key: str, value: str, secret: bool = False) -> bool:
         """Store a setting only if no caller has created the key."""
@@ -1006,6 +1303,24 @@ class Store:
             row = self._camera_for_location_locked(location_id, device_id)
         return dict(row) if row else None
 
+    def camera_context_for_location(
+        self, location_id: str, device_id: str = ""
+    ) -> tuple[dict | None, str | None, str | None]:
+        """Read a camera mapping and console identity from one DB snapshot."""
+        with self._lock:
+            try:
+                self._db.execute("BEGIN")
+                host = self._setting_value_locked("protect.host")
+                generation = self._setting_value_locked(
+                    PROTECT_CONSOLE_GENERATION_SETTING
+                )
+                mapping_row = self._camera_for_location_locked(location_id, device_id)
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return (dict(mapping_row) if mapping_row else None, host, generation)
+
     def clear_camera_mappings(self) -> None:
         with self._lock:
             self._db.execute("DELETE FROM camera_map")
@@ -1016,11 +1331,13 @@ class Store:
         mappings: list[tuple[str, str, str, str, str]],
         *,
         expected_account_revision: str | None = None,
+        expected_protect_generation: str | object = _NO_EXPECTED_PROTECT_HOST,
     ) -> None:
         with self.integration_guard():
             self._replace_camera_mappings(
                 mappings,
                 expected_account_revision=expected_account_revision,
+                expected_protect_generation=expected_protect_generation,
             )
 
     def _replace_camera_mappings(
@@ -1028,6 +1345,7 @@ class Store:
         mappings: list[tuple[str, str, str, str, str]],
         *,
         expected_account_revision: str | None = None,
+        expected_protect_generation: str | object = _NO_EXPECTED_PROTECT_HOST,
     ) -> None:
         """Replace mappings and retarget pending evidence in one transaction.
 
@@ -1042,6 +1360,14 @@ class Store:
                 self._assert_square_account_revision_locked(
                     expected_account_revision
                 )
+                if expected_protect_generation is not _NO_EXPECTED_PROTECT_HOST:
+                    current_generation = self._setting_value_locked(
+                        PROTECT_CONSOLE_GENERATION_SETTING
+                    )
+                    if current_generation != expected_protect_generation:
+                        raise ProtectSettingsConflict(
+                            "Protect console changed while cameras were being selected"
+                        )
                 self._db.execute("DELETE FROM camera_map")
                 self._db.executemany(
                     "INSERT INTO camera_map (location_id, device_id, device_name, "
@@ -1057,7 +1383,9 @@ class Store:
                 }
                 pending = self._db.execute(
                     "SELECT id, location_id, device_id, camera_id FROM transactions "
-                    "WHERE thumbnail_path IS NULL"
+                    "WHERE thumbnail_path IS NULL AND NOT EXISTS ("
+                    "SELECT 1 FROM protect_evidence_retired r "
+                    "WHERE r.transaction_id = transactions.id)"
                 ).fetchall()
                 for txn in pending:
                     exact_key = (txn["location_id"], txn["device_id"])
@@ -1104,6 +1432,8 @@ class Store:
         expected_merchant_id: str | None = None,
         expected_environment: str | None = None,
         expected_account_revision: str | None = None,
+        expected_protect_host: str | None | object = _NO_EXPECTED_PROTECT_HOST,
+        expected_protect_generation: str | None | object = _NO_EXPECTED_PROTECT_HOST,
     ) -> bool:
         """Insert or update a transaction. Returns True if it was new.
 
@@ -1128,6 +1458,7 @@ class Store:
         values["updated_ts_ms"] = txn.get("updated_ts_ms", txn["ts_ms"])
         values["replace_evidence"] = int(bool(replace_evidence))
         superseded_thumbnail: str | None = None
+        protect_identity_mismatch = False
 
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
@@ -1137,6 +1468,30 @@ class Store:
                 self._assert_square_account_revision_locked(
                     expected_account_revision
                 )
+                if expected_protect_host is not _NO_EXPECTED_PROTECT_HOST:
+                    current_host = self._setting_value_locked("protect.host")
+                    current_generation = self._setting_value_locked(
+                        PROTECT_CONSOLE_GENERATION_SETTING
+                    )
+                    if (
+                        current_host != expected_protect_host
+                        or current_generation != expected_protect_generation
+                    ):
+                        protect_identity_mismatch = True
+                        # Square facts remain valid, but camera IDs and bytes
+                        # selected under another console must not reattach.
+                        values["camera_id"] = None
+                        values["thumbnail_path"] = None
+                        values["replace_evidence"] = 0
+                retired = self._db.execute(
+                    "SELECT 1 FROM protect_evidence_retired "
+                    "WHERE transaction_id = ?",
+                    (txn["id"],),
+                ).fetchone()
+                if retired:
+                    values["camera_id"] = None
+                    values["thumbnail_path"] = None
+                    values["replace_evidence"] = 0
                 existing = self._db.execute(
                     "SELECT id, camera_id, ts_ms, thumbnail_path, status "
                     "FROM transactions WHERE id = ?",
@@ -1172,6 +1527,15 @@ class Store:
                     "WHERE excluded.updated_ts_ms >= transactions.updated_ts_ms",
                     values,
                 )
+                if protect_identity_mismatch and existing is None:
+                    # A transaction first persisted by work from a superseded
+                    # console was not present when the switch took its reset
+                    # snapshot. Retire it now so later remapping stays isolated.
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO protect_evidence_retired "
+                        "(transaction_id) VALUES (?)",
+                        (txn["id"],),
+                    )
                 current = self._db.execute(
                     "SELECT camera_id, ts_ms, thumbnail_path FROM transactions WHERE id = ?",
                     (txn["id"],),

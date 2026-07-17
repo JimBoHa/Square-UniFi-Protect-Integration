@@ -1,0 +1,11 @@
+services:
+  square-protect:
+    build: .
+    # For a published image instead of building locally:
+    # image: ghcr.io/jimboha/square-unifi-protect:latest
+    container_name: square-protect
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data

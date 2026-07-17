@@ -1,0 +1,21 @@
+name: docker
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t square-unifi-protect:ci .
+      - name: Smoke test
+        run: |
+          docker run -d --name spi -p 8000:8000 square-unifi-protect:ci
+          for i in $(seq 1 20); do
+            curl -fs http://127.0.0.1:8000/api/status && exit 0
+            sleep 1
+          done
+          docker logs spi
+          exit 1

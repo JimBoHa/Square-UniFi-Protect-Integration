@@ -85,6 +85,18 @@ def test_square_settings_success(authed):
         {"id": "LOC1", "name": "Main Store", "status": "ACTIVE"}
     ]
 
+def test_square_settings_require_complete_webhook_pair(authed):
+    resp = authed.put(
+        "/api/settings/square",
+        json={
+            "access_token": SQUARE_TOKEN,
+            "environment": "production",
+            "webhook_signature_key": WEBHOOK_KEY,
+        },
+    )
+    assert resp.status_code == 422
+    assert authed.get("/api/status").json()["square_configured"] is False
+
 
 # -- cameras, locations, POS camera selection ------------------------------------------
 
@@ -205,6 +217,27 @@ def test_webhook_ingests_payment_with_thumbnail(configured):
     assert txns[0]["id"] == "PAY_HOOK"
     assert txns[0]["thumbnail_url"] is not None
     assert txns[0]["deep_link"] is not None
+
+def test_square_settings_can_disable_existing_webhook(configured):
+    store = configured.app.state.store
+    assert store.get_setting("square.webhook_signature_key") == WEBHOOK_KEY
+    assert store.get_setting("square.webhook_url") == WEBHOOK_URL
+
+    resp = configured.put(
+        "/api/settings/square",
+        json={"access_token": SQUARE_TOKEN, "environment": "production"},
+    )
+    assert resp.status_code == 200
+    assert store.get_setting("square.webhook_signature_key") is None
+    assert store.get_setting("square.webhook_url") is None
+
+    body = make_webhook_event("PAY_DISABLED_HOOK")
+    webhook_resp = configured.post(
+        "/webhooks/square",
+        content=body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+    )
+    assert webhook_resp.status_code == 403
 
 def test_webhook_ignores_non_payment_events(configured):
     body = json.dumps({"type": "inventory.count.updated", "data": {}}).encode()

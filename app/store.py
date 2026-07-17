@@ -88,6 +88,16 @@ class Store:
             self._db.execute("DELETE FROM settings WHERE key = ?", (key,))
             self._db.commit()
 
+    def delete_settings(self, *keys: str) -> None:
+        if not keys:
+            return
+        placeholders = ", ".join("?" for _ in keys)
+        with self._lock:
+            self._db.execute(
+                f"DELETE FROM settings WHERE key IN ({placeholders})", keys
+            )
+            self._db.commit()
+
     # -- camera mapping ----------------------------------------------------
 
     def set_camera_mapping(self, location_id: str, camera_id: str, camera_name: str = "") -> None:

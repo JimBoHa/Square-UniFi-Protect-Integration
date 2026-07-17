@@ -10,7 +10,7 @@ import pytest
 from app.deeplink import build_deep_link
 from app.protect_client import ProtectAuthError, ProtectClient, validate_camera_id, validate_host
 from app.security import CredentialCipher, hash_password, verify_password
-from app.square_client import SquareClient, verify_webhook_signature
+from app.square_client import SquareClient, SquarePermissionError, verify_webhook_signature
 from app.sync import parse_ts_ms, safe_thumbnail_name
 
 from .conftest import PROTECT_PASS, PROTECT_USER, protect_handler
@@ -205,3 +205,12 @@ def test_square_pagination_follows_cursor():
 def test_square_rejects_bad_environment():
     with pytest.raises(ValueError):
         SquareClient("tok", environment="staging")
+
+def test_square_permission_error_is_distinct():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"errors": [{"code": "FORBIDDEN"}]})
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    with pytest.raises(SquarePermissionError):
+        client.list_payments(limit=1)
+    client.close()

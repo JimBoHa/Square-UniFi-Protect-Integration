@@ -294,6 +294,93 @@ def test_square_settings_transport_error_returns_502(tmp_path):
         app.state.store.close()
 
 
+@pytest.mark.parametrize("malformed", ["html", "shape"])
+def test_protect_settings_malformed_camera_response_returns_502(tmp_path, malformed):
+    def malformed_protect(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        if malformed == "html":
+            return httpx.Response(200, content=b"<html>private console body</html>")
+        return httpx.Response(200, json={"cameras": ["private camera item"]})
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(malformed_protect),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            response = isolated.put(
+                "/api/settings/protect",
+                json={
+                    "host": "192.168.1.1",
+                    "username": PROTECT_USER,
+                    "password": PROTECT_PASS,
+                },
+            )
+
+        assert response.status_code == 502
+        assert response.json()["detail"].startswith(
+            "Could not reach UniFi Protect: UniFi Protect camera response"
+        )
+        assert "private console body" not in response.text
+        assert "private camera item" not in response.text
+        assert app.state.store.get_setting("protect.host") is None
+    finally:
+        app.state.store.close()
+
+
+@pytest.mark.parametrize("malformed", ["html", "location-shape", "payment-shape"])
+def test_square_settings_malformed_response_returns_502(tmp_path, malformed):
+    def malformed_square(request: httpx.Request) -> httpx.Response:
+        if malformed == "html":
+            return httpx.Response(200, content=b"<html>private Square body</html>")
+        if malformed == "location-shape":
+            return httpx.Response(
+                200, json={"locations": ["private location item"]}
+            )
+        if request.url.path == "/v2/locations":
+            return httpx.Response(200, json={"locations": [{"id": "LOC1"}]})
+        return httpx.Response(200, json={"payments": ["private payment item"]})
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(protect_handler),
+        square_transport=httpx.MockTransport(malformed_square),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            response = isolated.put(
+                "/api/settings/square",
+                json={"access_token": SQUARE_TOKEN, "environment": "production"},
+            )
+
+        assert response.status_code == 502
+        assert response.json()["detail"].startswith(
+            "Could not reach Square: Square returned"
+        )
+        assert "private Square body" not in response.text
+        assert "private location item" not in response.text
+        assert "private payment item" not in response.text
+        assert app.state.store.get_setting("square.access_token") is None
+    finally:
+        app.state.store.close()
+
+
 # -- cameras, locations, POS camera selection ------------------------------------------
 
 def test_cameras_requires_protect_config(authed):

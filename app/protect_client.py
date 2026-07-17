@@ -219,14 +219,25 @@ class ProtectClient:
     # -- API -------------------------------------------------------------------
 
     def get_cameras(self) -> list[dict]:
-        data = self._request("GET", "/proxy/protect/api/bootstrap").json()
+        resp = self._request("GET", "/proxy/protect/api/bootstrap")
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise ProtectError("UniFi Protect camera response was not JSON") from exc
+        if not isinstance(data, dict):
+            raise ProtectError("UniFi Protect camera response was invalid")
+        cameras = data.get("cameras", [])
+        if not isinstance(cameras, list) or any(
+            not isinstance(camera, dict) for camera in cameras
+        ):
+            raise ProtectError("UniFi Protect camera response was invalid")
         return [
             {
                 "id": cam.get("id", ""),
                 "name": cam.get("name") or cam.get("marketName") or cam.get("id", ""),
                 "state": cam.get("state", ""),
             }
-            for cam in data.get("cameras", [])
+            for cam in cameras
         ]
 
     def get_snapshot(

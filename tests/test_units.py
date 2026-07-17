@@ -340,6 +340,42 @@ def test_protect_request_transport_error_is_normalized():
     client.close()
 
 
+def test_protect_camera_html_response_is_normalized():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        return httpx.Response(200, content=b"<html>private console body</html>")
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    with pytest.raises(ProtectError) as exc_info:
+        client.get_cameras()
+    assert str(exc_info.value) == "UniFi Protect camera response was not JSON"
+    assert "private console body" not in str(exc_info.value)
+    client.close()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"cameras": {}},
+        {"cameras": ["private camera item"]},
+    ],
+)
+def test_protect_camera_response_shapes_are_normalized(payload):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        return httpx.Response(200, json=payload)
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    with pytest.raises(ProtectError) as exc_info:
+        client.get_cameras()
+    assert str(exc_info.value) == "UniFi Protect camera response was invalid"
+    assert "private camera item" not in str(exc_info.value)
+    client.close()
+
+
 def test_protect_snapshot_passes_timestamp():
     client = ProtectClient(
         "unifi.local", PROTECT_USER, PROTECT_PASS,
@@ -917,6 +953,46 @@ def test_square_transport_error_is_normalized():
     assert "sensitive Square connection details" not in str(exc_info.value)
     assert isinstance(exc_info.value.__cause__, httpx.RequestError)
     client.close()
+
+
+def test_square_html_response_is_normalized():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"<html>private Square body</html>")
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    with pytest.raises(SquareError) as exc_info:
+        client.list_locations()
+    assert str(exc_info.value) == "Square returned a non-JSON response"
+    assert "private Square body" not in str(exc_info.value)
+    client.close()
+
+
+@pytest.mark.parametrize(
+    ("operation", "payload"),
+    [
+        ("locations", []),
+        ("locations", {"locations": {}}),
+        ("locations", {"locations": ["private location item"]}),
+        ("payments", {"payments": {}}),
+        ("payments", {"payments": ["private payment item"]}),
+        ("payments", {"payments": [], "cursor": []}),
+    ],
+)
+def test_square_response_shapes_are_normalized(operation, payload):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    with pytest.raises(SquareError) as exc_info:
+        if operation == "locations":
+            client.list_locations()
+        else:
+            client.list_payments(limit=1)
+    assert str(exc_info.value) == "Square returned an invalid response"
+    assert "private location item" not in str(exc_info.value)
+    assert "private payment item" not in str(exc_info.value)
+    client.close()
+
 
 def test_square_permission_error_is_distinct():
     def handler(_request: httpx.Request) -> httpx.Response:

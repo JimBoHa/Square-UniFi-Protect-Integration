@@ -64,17 +64,33 @@ class SquareClient:
             raise SquarePermissionError("Square rejected the token's permissions")
         if resp.status_code >= 400:
             raise SquareError(f"Square request {path} failed (HTTP {resp.status_code})")
-        return resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise SquareError("Square returned a non-JSON response") from exc
+        if not isinstance(data, dict):
+            raise SquareError("Square returned an invalid response")
+        return data
+
+    @staticmethod
+    def _object_list(data: dict, key: str) -> list[dict]:
+        items = data.get(key, [])
+        if not isinstance(items, list) or any(
+            not isinstance(item, dict) for item in items
+        ):
+            raise SquareError("Square returned an invalid response")
+        return items
 
     def list_locations(self) -> list[dict]:
         data = self._get("/v2/locations")
+        locations = self._object_list(data, "locations")
         return [
             {
                 "id": loc.get("id", ""),
                 "name": loc.get("name", ""),
                 "status": loc.get("status", ""),
             }
-            for loc in data.get("locations", [])
+            for loc in locations
         ]
 
     def merchant_id(self) -> str:
@@ -122,8 +138,10 @@ class SquareClient:
             if cursor:
                 params["cursor"] = cursor
             data = self._get("/v2/payments", params=params)
-            payments.extend(data.get("payments", []))
+            payments.extend(self._object_list(data, "payments"))
             next_cursor = data.get("cursor")
+            if next_cursor is not None and not isinstance(next_cursor, str):
+                raise SquareError("Square returned an invalid response")
             if not next_cursor or (limit is not None and len(payments) >= limit):
                 break
             if next_cursor in seen_cursors:

@@ -372,7 +372,7 @@ def test_camera_mapping_rejects_more_than_500_entries_without_mutation(configure
     )
 
     assert resp.status_code == 422
-    assert resp.json()["detail"][0]["type"] == "too_long"
+    assert resp.json()["detail"] == "Camera mappings cannot exceed 500 entries"
     assert configured.get("/api/camera-mapping").json() == existing
 
 def test_camera_preview_returns_jpeg(configured):

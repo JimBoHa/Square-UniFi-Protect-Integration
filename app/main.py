@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 from . import deeplink, sync
 from .protect_client import (
@@ -84,22 +84,7 @@ class CameraMappingEntry(BaseModel):
     camera_name: str = Field(default="", max_length=128)
 
 class CameraMappingBody(BaseModel):
-    mappings: list[CameraMappingEntry] = Field(max_length=MAX_CAMERA_MAPPINGS)
-
-    @field_validator("mappings")
-    @classmethod
-    def unique_targets(
-        cls, mappings: list[CameraMappingEntry]
-    ) -> list[CameraMappingEntry]:
-        targets: set[tuple[str, str]] = set()
-        for mapping in mappings:
-            target = (mapping.location_id, mapping.device_id)
-            if target in targets:
-                raise ValueError(
-                    "Duplicate camera mapping for the same location_id and device_id"
-                )
-            targets.add(target)
-        return mappings
+    mappings: list[CameraMappingEntry]
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +471,23 @@ def create_app(
 
     @app.put("/api/camera-mapping")
     def set_mapping(body: CameraMappingBody, _=authed) -> dict:
+        if len(body.mappings) > MAX_CAMERA_MAPPINGS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Camera mappings cannot exceed {MAX_CAMERA_MAPPINGS} entries",
+            )
+        targets: set[tuple[str, str]] = set()
         for entry in body.mappings:
+            target = (entry.location_id, entry.device_id)
+            if target in targets:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Duplicate camera mapping for the same location_id and "
+                        "device_id"
+                    ),
+                )
+            targets.add(target)
             try:
                 validate_camera_id(entry.camera_id)
             except ValueError as exc:

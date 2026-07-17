@@ -123,6 +123,56 @@ def test_old_failure_retries_after_square_window_advances(tmp_path):
         store.close()
 
 
+def test_missing_thumbnail_file_is_requeued_on_reingest(tmp_path):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC1", CAM_A, "Register")
+    payment = _payment("LOST", "2026-07-16T15:30:00.000Z")
+
+    class Protect:
+        calls = 0
+
+        def get_snapshot(self, camera_id, ts_ms=None):
+            self.calls += 1
+            return f"jpeg-{self.calls}".encode()
+
+    protect = Protect()
+    try:
+        ingest_payment(store, payment, protect)
+        original = store.get_transaction("LOST")
+        (store.thumbnail_dir / original["thumbnail_path"]).unlink()
+
+        ingest_payment(store, payment, protect)
+        missing = store.get_transaction("LOST")
+        assert missing["thumbnail_path"] is None
+        assert protect.calls == 1
+
+        assert retry_missing_thumbnails(store, protect) == 1
+        repaired = store.get_transaction("LOST")
+        assert repaired["thumbnail_path"] is not None
+        assert (store.thumbnail_dir / repaired["thumbnail_path"]).read_bytes() == (
+            b"jpeg-2"
+        )
+    finally:
+        store.close()
+
+
+def test_store_startup_requeues_missing_thumbnail_file(tmp_path):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    store.upsert_transaction(
+        _stored_txn("LOST", 1000, thumbnail_path="vanished.jpg")
+    )
+    store.close()
+
+    reopened = Store(data_dir)
+    try:
+        assert reopened.get_transaction("LOST")["thumbnail_path"] is None
+        jobs = reopened.claim_thumbnail_retries(1, 10, now=0)
+        assert [job["transaction_id"] for job in jobs] == ["LOST"]
+    finally:
+        reopened.close()
+
+
 def test_square_failure_still_processes_retry_queue(tmp_path):
     store = Store(tmp_path / "data")
     store.upsert_transaction(_stored_txn("OLD", 1000))

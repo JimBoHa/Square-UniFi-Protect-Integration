@@ -90,6 +90,7 @@ class Store:
                 self._migrate_transactions()
                 self._migrate_schema()
                 self._migrate_alarms()
+                self._clear_missing_thumbnail_references_locked()
                 # Upgrade existing databases: any transaction that already
                 # missed its thumbnail must enter the durable retry queue.
                 self._db.execute(
@@ -109,6 +110,25 @@ class Store:
                 raise
             else:
                 self._db.commit()
+
+    def _thumbnail_file_exists(self, name: str) -> bool:
+        path = (self.thumbnail_dir / name).resolve()
+        return self.thumbnail_dir.resolve() in path.parents and path.is_file()
+
+    def _clear_missing_thumbnail_references_locked(self) -> None:
+        rows = self._db.execute(
+            "SELECT id, thumbnail_path FROM transactions "
+            "WHERE thumbnail_path IS NOT NULL"
+        ).fetchall()
+        missing_ids = [
+            row["id"]
+            for row in rows
+            if not self._thumbnail_file_exists(row["thumbnail_path"])
+        ]
+        self._db.executemany(
+            "UPDATE transactions SET thumbnail_path = NULL WHERE id = ?",
+            ((txn_id,) for txn_id in missing_ids),
+        )
 
     def _migrate_alarms(self) -> None:
         """Add alarm delivery columns; never replay pre-existing completed sales."""
@@ -563,6 +583,31 @@ class Store:
                 self._db.rollback()
                 raise
         return existing is None
+
+    def requeue_missing_thumbnail(self, txn_id: str, expected_path: str) -> bool:
+        """Clear a vanished file reference and schedule immediate recapture."""
+        with self._lock, self._db:
+            if self._thumbnail_file_exists(expected_path):
+                return False
+            cursor = self._db.execute(
+                "UPDATE transactions SET thumbnail_path = NULL "
+                "WHERE id = ? AND thumbnail_path = ?",
+                (txn_id, expected_path),
+            )
+            if cursor.rowcount != 1:
+                return False
+            txn = self._db.execute(
+                "SELECT camera_id FROM transactions WHERE id = ?", (txn_id,)
+            ).fetchone()
+            if txn and txn["camera_id"]:
+                self._db.execute(
+                    "INSERT INTO thumbnail_retries (transaction_id) VALUES (?) "
+                    "ON CONFLICT(transaction_id) DO UPDATE SET attempts = 0, "
+                    "next_attempt_at = 0, lease_token = NULL, "
+                    "lease_expires_at = NULL, last_error = ''",
+                    (txn_id,),
+                )
+            return True
 
     def claim_thumbnail_retries(
         self,

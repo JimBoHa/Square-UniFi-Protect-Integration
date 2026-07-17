@@ -65,6 +65,15 @@ def _ingest_payment_with_status(
     txn["updated_ts_ms"] = parse_ts_ms(txn["updated_at"])
 
     existing = store.get_transaction(txn["id"])
+    if existing and existing.get("thumbnail_path"):
+        path = (store.thumbnail_dir / existing["thumbnail_path"]).resolve()
+        if (
+            store.thumbnail_dir.resolve() not in path.parents
+            or not path.is_file()
+        ) and store.requeue_missing_thumbnail(
+            txn["id"], existing["thumbnail_path"]
+        ):
+            existing["thumbnail_path"] = None
     if existing and not txn["device_id"]:
         txn["device_id"] = existing.get("device_id", "")
         if not txn["device_name"]:

@@ -534,6 +534,8 @@ def create_app(
             raise HTTPException(status_code=404, detail="No thumbnail for this transaction")
         path = (store.thumbnail_dir / txn["thumbnail_path"]).resolve()
         if store.thumbnail_dir.resolve() not in path.parents or not path.is_file():
+            if store.requeue_missing_thumbnail(txn_id, txn["thumbnail_path"]):
+                nudge_protect_work_queue()
             raise HTTPException(status_code=404, detail="Thumbnail not found")
         return FileResponse(path, media_type="image/jpeg")
 

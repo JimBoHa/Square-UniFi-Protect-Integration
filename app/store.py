@@ -469,10 +469,11 @@ class Store:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 existing = self._db.execute(
-                    "SELECT id, camera_id, ts_ms FROM transactions WHERE id = ?",
+                    "SELECT id, camera_id, ts_ms, status "
+                    "FROM transactions WHERE id = ?",
                     (txn["id"],),
                 ).fetchone()
-                self._db.execute(
+                applied = self._db.execute(
                     "INSERT INTO transactions (id, created_at, ts_ms, updated_at, updated_ts_ms, "
                     "amount, currency, status, location_id, device_id, device_name, card_last4, "
                     "receipt_url, camera_id, thumbnail_path, raw) "
@@ -547,10 +548,24 @@ class Store:
                     )
                 except (TypeError, ValueError):
                     enabled_after_ms = None
+
+                # A first-seen completed payment is historical according to
+                # its sale time. Once a pending payment is already known, its
+                # accepted Square update version is the completion boundary.
+                # Rejected stale versions never get a suppression boundary.
+                completion_reference_ms = None
+                if (
+                    applied.rowcount == 1
+                    and str(txn.get("status", "")).upper() == "COMPLETED"
+                ):
+                    if existing is None:
+                        completion_reference_ms = int(txn["ts_ms"])
+                    elif str(existing["status"]).upper() != "COMPLETED":
+                        completion_reference_ms = int(values["updated_ts_ms"])
                 if (
                     enabled_after_ms is not None
-                    and str(txn.get("status", "")).upper() == "COMPLETED"
-                    and int(txn["ts_ms"]) < enabled_after_ms
+                    and completion_reference_ms is not None
+                    and completion_reference_ms < enabled_after_ms
                 ):
                     self._db.execute(
                         "UPDATE transactions SET alarm_state = ?, "

@@ -9,6 +9,8 @@ const {
   protectConnectionMessage,
   protectConsoleSwitchTokenRequest,
   publishLatestSettingsLoad,
+  publishCoherentSettingsLoad,
+  settingsSnapshotMismatchAction,
   clearProtectConsoleView,
 } = require("../app/static/protect-console-switch.js");
 
@@ -104,6 +106,79 @@ test("console switch invalidation suppresses a pending old settings load", async
   assert.equal(published, null);
 });
 
+test("old camera response reloads instead of rendering after console switch", () => {
+  let published = false;
+  const decision = publishCoherentSettingsLoad(
+    1,
+    1,
+    {
+      cameraGeneration: "protect-generation-1",
+      locationRevision: "square-revision-2",
+      mappingGeneration: "protect-generation-2",
+      mappingRevision: "square-revision-2",
+    },
+    () => { published = true; },
+  );
+
+  assert.equal(decision, "reload");
+  assert.equal(published, false);
+});
+
+test("old location response reloads instead of rendering after account switch", () => {
+  let published = false;
+  const decision = publishCoherentSettingsLoad(
+    1,
+    1,
+    {
+      cameraGeneration: "protect-generation-2",
+      locationRevision: "square-revision-1",
+      mappingGeneration: "protect-generation-2",
+      mappingRevision: "square-revision-2",
+    },
+    () => { published = true; },
+  );
+
+  assert.equal(decision, "reload");
+  assert.equal(published, false);
+});
+
+test("coherent provider snapshots publish mapping save generations", () => {
+  let published = false;
+  const decision = publishCoherentSettingsLoad(
+    4,
+    4,
+    {
+      cameraGeneration: "protect-generation-2",
+      locationRevision: "square-revision-2",
+      mappingGeneration: "protect-generation-2",
+      mappingRevision: "square-revision-2",
+    },
+    () => { published = true; },
+  );
+
+  assert.equal(decision, "published");
+  assert.equal(published, true);
+});
+
+test("snapshot mismatch retries once then requires a page reload", () => {
+  assert.equal(settingsSnapshotMismatchAction(1), "retry");
+  assert.equal(settingsSnapshotMismatchAction(0), "show-reload");
+});
+
+test("every settings load clears an old preview before provider reads", () => {
+  const app = fs.readFileSync(
+    path.join(__dirname, "../app/static/app.js"),
+    "utf8",
+  );
+  const loadStart = app.indexOf("async function loadSettingsView");
+  const clearView = app.indexOf("clearProtectConsoleView(", loadStart);
+  const cameraRead = app.indexOf('api("/api/cameras"', loadStart);
+
+  assert.ok(loadStart >= 0);
+  assert.ok(clearView > loadStart);
+  assert.ok(cameraRead > clearView);
+});
+
 test("successful switch immediately clears old console camera UI", () => {
   const mappingRows = { textContent: "Old register → Old camera" };
   const saveButton = { hidden: false };
@@ -155,4 +230,13 @@ test("console-switch helper loads before the app entry point", () => {
   );
   assert.match(app, /loadTransactions\(\{ reset: true \}\)/);
   assert.match(app, /includeResponse: true/);
+  assert.match(
+    app,
+    /api\("\/api\/camera-mapping", \{ includeResponse: true \}\)/,
+  );
+  assert.match(
+    app,
+    /if \(loadDecision === "reload"\)[\s\S]*return loadSettingsView\(snapshotRetriesRemaining - 1\)/,
+  );
+  assert.match(app, /Provider settings kept changing[\s\S]*Reload the page/);
 });

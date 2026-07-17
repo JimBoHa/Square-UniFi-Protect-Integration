@@ -262,45 +262,81 @@ $("#square-form").addEventListener("submit", async (e) => {
   }
 });
 
-async function loadSettingsView() {
+async function loadSettingsView(snapshotRetriesRemaining = 1) {
   const generation = ++settingsLoadGeneration;
   const rows = $("#mapping-rows");
-  rows.textContent = "";
+  const saveButton = $("#save-mapping");
+  clearProtectConsoleView(
+    rows,
+    saveButton,
+    $("#camera-preview-wrap"),
+    $("#camera-preview"),
+  );
   let cameras = [], locations = [], mappings = [], devices = [];
-  let accountRevision = "";
-  let protectGeneration = "";
+  let locationRevision = null;
+  let cameraGeneration = null;
+  let mappingRevision = "";
+  let mappingGeneration = "";
   try {
     const result = await api("/api/cameras", { includeResponse: true });
     cameras = result.data;
-    protectGeneration =
+    cameraGeneration =
       result.response.headers.get("x-protect-console-generation") || "";
   } catch { /* Protect not configured yet */ }
   try {
     const result = await api("/api/locations", { includeResponse: true });
     locations = result.data;
-    accountRevision = result.response.headers.get("x-square-account-revision") || "";
+    locationRevision =
+      result.response.headers.get("x-square-account-revision") || "";
   } catch { /* Square not configured yet */ }
   try { devices = await api("/api/pos-devices"); } catch { /* No observed devices yet */ }
-  try { mappings = await api("/api/camera-mapping"); } catch { return; }
+  try {
+    const result = await api("/api/camera-mapping", { includeResponse: true });
+    mappings = result.data;
+    mappingGeneration =
+      result.response.headers.get("x-protect-console-generation") || "";
+    mappingRevision =
+      result.response.headers.get("x-square-account-revision") || "";
+  } catch { return; }
   if (generation !== settingsLoadGeneration) return;
-  if (!publishLatestSettingsLoad(
+  const loadDecision = publishCoherentSettingsLoad(
     generation,
     settingsLoadGeneration,
-    () => {
-      squareAccountRevision = accountRevision;
-      cameraMappingGeneration = protectGeneration;
+    {
+      cameraGeneration,
+      locationRevision,
+      mappingGeneration,
+      mappingRevision,
     },
-  )) return;
+    () => {
+      squareAccountRevision = mappingRevision;
+      cameraMappingGeneration = mappingGeneration;
+    },
+  );
+  if (loadDecision === "reload") {
+    const mismatchAction = settingsSnapshotMismatchAction(
+      snapshotRetriesRemaining,
+    );
+    if (mismatchAction === "retry") {
+      return loadSettingsView(snapshotRetriesRemaining - 1);
+    }
+    const hint = document.createElement("p");
+    hint.className = "hint";
+    hint.textContent =
+      "Provider settings kept changing while this page loaded. Reload the page to try again.";
+    rows.appendChild(hint);
+    return;
+  }
+  if (loadDecision !== "published") return;
 
   if (!cameras.length || !locations.length) {
     const p = document.createElement("p");
     p.className = "hint";
     p.textContent = "Connect both UniFi Protect and Square above to choose the POS camera.";
     rows.appendChild(p);
-    $("#save-mapping").hidden = true;
     return;
   }
-  $("#save-mapping").hidden = false;
+  saveButton.hidden = false;
   const mappingKey = (locationId, deviceId = "") =>
     JSON.stringify([locationId, deviceId || ""]);
   const current = new Map(mappings.map((m) => [

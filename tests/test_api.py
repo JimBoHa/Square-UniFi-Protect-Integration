@@ -979,6 +979,22 @@ def test_camera_mapping_roundtrip(configured):
         }
     ]
 
+
+def test_camera_mapping_headers_identify_both_provider_snapshots(configured):
+    cameras = configured.get("/api/cameras")
+    locations = configured.get("/api/locations")
+    mapping = configured.get("/api/camera-mapping")
+
+    assert mapping.status_code == 200
+    assert mapping.headers["cache-control"] == "private, no-store"
+    assert mapping.headers["x-protect-console-generation"] == (
+        cameras.headers["x-protect-console-generation"]
+    )
+    assert mapping.headers["x-square-account-revision"] == (
+        locations.headers["x-square-account-revision"]
+    )
+
+
 def test_camera_mapping_accepts_255_character_device_name(configured):
     device_name = "R" * 255
     resp = configured.put(

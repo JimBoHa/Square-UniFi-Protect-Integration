@@ -674,12 +674,16 @@ def create_app(
             event = _json.loads(body)
         except ValueError:
             raise HTTPException(status_code=422, detail="Invalid JSON payload")
+        event_data = event.get("data") if isinstance(event, dict) else None
+        event_object = (
+            event_data.get("object") if isinstance(event_data, dict) else None
+        )
         payment = (
-            event.get("data", {}).get("object", {}).get("payment")
-            if isinstance(event, dict)
+            event_object.get("payment")
+            if isinstance(event_object, dict)
             else None
         )
-        if not payment:
+        if not isinstance(payment, dict) or not payment:
             return JSONResponse({"ok": True, "ignored": True})
         try:
             txn = await run_in_threadpool(sync.ingest_payment, store, payment, None)

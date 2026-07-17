@@ -953,3 +953,38 @@ def test_snapshot_falls_back_to_legacy_ts_on_old_firmware():
     assert image == b"\xff\xd8legacy"
     assert legacy_params == [{"w": "640", "ts": "1609459200000"}]
     client.close()
+
+
+def test_integration_api_never_sends_legacy_session_cookie():
+    """Verified on Protect 7.1.87: the console accepts the legacy session
+    cookie on integration endpoints even when X-API-Key is wrong, so a shared
+    cookie jar would make API-key verification silently pass."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(
+                200,
+                headers={"x-csrf-token": "c", "set-cookie": "TOKEN=session1; Path=/"},
+                json={},
+            )
+        if "/integration/v1/" in request.url.path:
+            assert "cookie" not in {k.lower() for k in request.headers}, (
+                "integration request must not carry the legacy session cookie"
+            )
+            if request.headers.get("x-api-key") != "good-key":
+                return httpx.Response(401, json={"error": "Unauthorized"})
+            return httpx.Response(200, json={"applicationVersion": "7.1.87"})
+        return httpx.Response(200, json={"cameras": []})
+
+    good = ProtectClient("u.local", "u", "p", api_key="good-key",
+                         transport=httpx.MockTransport(handler))
+    good.login()
+    assert good.get_integration_info() == {"applicationVersion": "7.1.87"}
+    good.close()
+
+    bad = ProtectClient("u.local", "u", "p", api_key="wrong-key",
+                        transport=httpx.MockTransport(handler))
+    bad.login()  # session cookie now present in the legacy client
+    with pytest.raises(ProtectAuthError):
+        bad.get_integration_info()
+    bad.close()

@@ -79,9 +79,21 @@ class ProtectClient:
             transport=transport,
             timeout=timeout,
         )
+        # The integration API must authenticate with the API key alone. A
+        # shared client would send the legacy login's session cookie, which
+        # the console accepts even when the API key is wrong — verified on
+        # Protect 7.1.87 — so key verification would silently pass and alarm
+        # delivery would break only once the session expired.
+        self._integration_client = httpx.Client(
+            base_url=f"https://{self.host}",
+            verify=verify_ssl,
+            transport=transport,
+            timeout=timeout,
+        )
 
     def close(self) -> None:
         self._client.close()
+        self._integration_client.close()
 
     # -- auth ----------------------------------------------------------------
 
@@ -141,7 +153,7 @@ class ProtectClient:
         headers.setdefault("Accept", "application/json")
         headers["X-API-Key"] = self._api_key
         try:
-            resp = self._client.request(method, path, headers=headers, **kwargs)
+            resp = self._integration_client.request(method, path, headers=headers, **kwargs)
         except httpx.RequestError as exc:
             raise ProtectError("Network error while contacting UniFi Protect") from exc
         if resp.status_code in (401, 403):

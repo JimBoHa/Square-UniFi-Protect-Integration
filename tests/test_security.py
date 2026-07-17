@@ -167,6 +167,29 @@ def test_webhook_rejects_tampered_body(configured):
     assert resp.status_code == 401
 
 
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "payment.updated", "data": []},
+        {"type": "payment.updated", "data": {"object": []}},
+        {"type": "payment.updated", "data": {"object": {"payment": []}}},
+        {"type": "payment.updated", "data": {"object": {"payment": "bad"}}},
+    ],
+)
+def test_webhook_ignores_non_object_payment_envelopes(configured, event):
+    from .test_api import _webhook_signature
+
+    body = json.dumps(event).encode()
+    resp = configured.post(
+        "/webhooks/square",
+        content=body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "ignored": True}
+
+
 # -- stored XSS surface -----------------------------------------------------------------
 
 def test_malicious_payment_fields_returned_as_json_not_html(configured):

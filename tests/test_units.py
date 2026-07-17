@@ -31,7 +31,7 @@ from app.square_client import (
 from app.store import ALARM_ENABLED_AFTER_SETTING, Store
 from app.sync import ingest_payment, parse_ts_ms, safe_thumbnail_name, sync_payments
 
-from .conftest import PROTECT_PASS, PROTECT_USER, protect_handler
+from .conftest import FAKE_JPEG, PROTECT_PASS, PROTECT_USER, protect_handler
 
 
 # -- passwords & encryption --------------------------------------------------
@@ -905,15 +905,18 @@ def test_snapshot_with_ts_uses_recording_endpoint():
             return httpx.Response(
                 200,
                 content=(
-                    b"\xff\xd8rec:" + request.url.params["ts"].encode() + b"\xff\xd9"
+                    FAKE_JPEG[:-2]
+                    + b"rec:"
+                    + request.url.params["ts"].encode()
+                    + b"\xff\xd9"
                 ),
                 headers={"content-type": "image/jpeg"},
             )
-        return httpx.Response(200, content=b"\xff\xd8live\xff\xd9")
+        return httpx.Response(200, content=FAKE_JPEG)
 
     client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
     image = client.get_snapshot("cam1", ts_ms=1609459200000)
-    assert image == b"\xff\xd8rec:1609459200000\xff\xd9"
+    assert image == FAKE_JPEG[:-2] + b"rec:1609459200000\xff\xd9"
     assert len(paths) == 1 and "recording-snapshot" in paths[0]
     client.close()
 
@@ -948,11 +951,11 @@ def test_snapshot_falls_back_to_legacy_ts_on_old_firmware():
                 404, content=b"<!DOCTYPE html>", headers={"content-type": "text/html"}
             )
         legacy_params.append(dict(request.url.params))
-        return httpx.Response(200, content=b"\xff\xd8legacy\xff\xd9")
+        return httpx.Response(200, content=FAKE_JPEG[:-2] + b"legacy\xff\xd9")
 
     client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
     image = client.get_snapshot("cam1", ts_ms=1609459200000)
-    assert image == b"\xff\xd8legacy\xff\xd9"
+    assert image == FAKE_JPEG[:-2] + b"legacy\xff\xd9"
     assert legacy_params == [{"w": "640", "ts": "1609459200000"}]
     client.close()
 
@@ -964,6 +967,7 @@ def test_snapshot_falls_back_to_legacy_ts_on_old_firmware():
         ("text/html; charset=utf-8", b"<!DOCTYPE html><title>Error</title>"),
         ("image/jpeg", b"not actually a jpeg"),
         ("image/jpeg", b"\xff\xd8truncated"),
+        ("image/jpeg", b"\xff\xd8\xff\xd9"),
     ],
 )
 def test_snapshot_rejects_successful_non_jpeg_response(content_type, content):
@@ -991,10 +995,10 @@ def test_snapshot_accepts_valid_jpeg_content_type_variants(content_type):
         if request.url.path == "/api/auth/login":
             return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
         headers = {"content-type": content_type} if content_type else {}
-        return httpx.Response(200, content=b"\xff\xd8jpeg\xff\xd9", headers=headers)
+        return httpx.Response(200, content=FAKE_JPEG, headers=headers)
 
     client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
-    assert client.get_snapshot("cam1", ts_ms=1609459200000) == b"\xff\xd8jpeg\xff\xd9"
+    assert client.get_snapshot("cam1", ts_ms=1609459200000) == FAKE_JPEG
     client.close()
 
 

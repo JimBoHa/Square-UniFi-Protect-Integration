@@ -20,7 +20,11 @@ ADMIN_PASSWORD = "hunter2-hunter2"
 WEBHOOK_KEY = "whsec_test_key_456"
 WEBHOOK_URL = "https://shop.example.com/webhooks/square"
 
-FAKE_JPEG = b"\xff\xd8\xff\xe0" + b"JFIF-fake-image-data" * 4 + b"\xff\xd9"
+FAKE_JPEG = (
+    b"\xff\xd8\xff\xe0JFIF-fake-image-data"
+    b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00"
+    b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00fake-scan-data\xff\xd9"
+)
 
 PROTECT_META_KEYS: list[str | None] = []
 PROTECT_ALARM_CALLS: list[str] = []

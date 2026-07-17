@@ -23,6 +23,24 @@ _SNAPSHOT_CONTENT_TYPES = frozenset(
         "binary/octet-stream",
     }
 )
+_JPEG_START_OF_FRAME_MARKERS = tuple(
+    bytes((0xFF, marker))
+    for marker in (
+        0xC0,
+        0xC1,
+        0xC2,
+        0xC3,
+        0xC5,
+        0xC6,
+        0xC7,
+        0xC9,
+        0xCA,
+        0xCB,
+        0xCD,
+        0xCE,
+        0xCF,
+    )
+)
 
 
 class ProtectError(Exception):
@@ -42,14 +60,17 @@ def _validated_snapshot_bytes(resp: httpx.Response) -> bytes:
         raise ProtectError("UniFi Protect snapshot response was not a JPEG")
 
     content = resp.content
-    # Protect may omit Content-Type or use application/octet-stream, so the
-    # JPEG start/end markers are the authoritative payload check. Trailing
-    # bytes are allowed because JPEG decoders permit data after the EOI marker.
-    if (
-        len(content) < 4
-        or not content.startswith(b"\xff\xd8")
-        or content.find(b"\xff\xd9", 2) == -1
-    ):
+    # Protect may omit Content-Type or use application/octet-stream. Require a
+    # frame header and scan in addition to SOI/EOI so marker-only or wrapped
+    # error payloads are not persisted as camera evidence. Trailing bytes are
+    # allowed because JPEG decoders permit data after the EOI marker.
+    eoi_position = content.find(b"\xff\xd9", 2)
+    scan_position = content.find(b"\xff\xda", 2, eoi_position)
+    has_frame = scan_position != -1 and any(
+        content.find(marker, 2, scan_position) != -1
+        for marker in _JPEG_START_OF_FRAME_MARKERS
+    )
+    if not content.startswith(b"\xff\xd8") or eoi_position == -1 or not has_frame:
         raise ProtectError("UniFi Protect snapshot response contained invalid JPEG data")
     return content
 

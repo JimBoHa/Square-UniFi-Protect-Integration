@@ -524,8 +524,18 @@ def create_app(
         }
 
     @app.get("/api/transactions")
-    def transactions(limit: int = 50, offset: int = 0, _=authed) -> list[dict]:
-        return [txn_response(t) for t in store.list_transactions(limit, offset)]
+    def transactions(
+        response: Response,
+        limit: int = 50,
+        offset: int = 0,
+        snapshot: int | None = None,
+        _=authed,
+    ) -> list[dict]:
+        rows, snapshot_rowid = store.list_transactions_page(limit, offset, snapshot)
+        # Preserve the existing list response while issuing an optional
+        # snapshot boundary for clients that paginate across live inserts.
+        response.headers["X-Transaction-Snapshot"] = str(snapshot_rowid)
+        return [txn_response(t) for t in rows]
 
     @app.get("/api/thumbnails/{txn_id}")
     def thumbnail(txn_id: str, _=authed) -> FileResponse:

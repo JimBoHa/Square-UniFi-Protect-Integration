@@ -12,6 +12,7 @@ let transactionPendingOffset = null;
 let transactionOffset = 0;
 let transactionHasNext = false;
 let transactionPageCount = 0;
+let transactionSnapshot = null;
 let lastTransactionPayload = null;
 
 function show(viewId) {
@@ -26,10 +27,11 @@ function message(text, kind) {
 }
 
 async function api(path, options = {}) {
+  const { includeResponse = false, ...requestOptions } = options;
   const resp = await fetch(path, {
     headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
-    ...options,
+    ...requestOptions,
   });
   if (resp.status === 401 && path !== "/api/login") {
     show("#view-login");
@@ -38,7 +40,7 @@ async function api(path, options = {}) {
   }
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(data.detail || `Request failed (${resp.status})`);
-  return data;
+  return includeResponse ? { data, response: resp } : data;
 }
 
 // ---------------------------------------------------------------- boot
@@ -396,10 +398,18 @@ async function loadTransactions({ reset = false, offset = transactionOffset } = 
   transactionLoadInFlight = true;
   updateTransactionPagination(true);
   let page = null;
+  let pageSnapshot = null;
   try {
-    page = await api(
-      `/api/transactions?limit=${TRANSACTION_PAGE_SIZE + 1}&offset=${requestedOffset}`,
+    const snapshotParam = requestedOffset > 0 && transactionSnapshot !== null
+      ? `&snapshot=${encodeURIComponent(transactionSnapshot)}`
+      : "";
+    const result = await api(
+      `/api/transactions?limit=${TRANSACTION_PAGE_SIZE + 1}` +
+        `&offset=${requestedOffset}${snapshotParam}`,
+      { includeResponse: true },
     );
+    page = result.data;
+    pageSnapshot = result.response.headers.get("x-transaction-snapshot");
   } catch (err) {
     message(err.message, "error");
   } finally {
@@ -414,12 +424,14 @@ async function loadTransactions({ reset = false, offset = transactionOffset } = 
       transactionPendingOffset = Math.max(0, requestedOffset - TRANSACTION_PAGE_SIZE);
     } else {
       transactionOffset = requestedOffset;
+      transactionSnapshot = pageSnapshot;
       transactionHasNext = page.length > TRANSACTION_PAGE_SIZE;
       transactionPageCount = txns.length;
       $("#txn-last-updated").textContent =
         `Last updated ${new Date().toLocaleTimeString()}`;
       const payload = JSON.stringify({
         offset: transactionOffset,
+        snapshot: transactionSnapshot,
         hasNext: transactionHasNext,
         transactions: txns,
       });

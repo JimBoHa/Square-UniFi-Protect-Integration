@@ -764,16 +764,36 @@ class Store:
             ).fetchone()
         return dict(row) if row else None
 
-    def list_transactions(self, limit: int = 50, offset: int = 0) -> list[dict]:
+    def list_transactions_page(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        snapshot_rowid: int | None = None,
+    ) -> tuple[list[dict], int]:
+        """List a stable page and the maximum rowid visible to that snapshot."""
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
         with self._lock:
+            if snapshot_rowid is None:
+                boundary = self._db.execute(
+                    "SELECT COALESCE(MAX(rowid), 0) AS rowid FROM transactions"
+                ).fetchone()
+                snapshot_rowid = int(boundary["rowid"])
+            else:
+                snapshot_rowid = max(
+                    0,
+                    min(int(snapshot_rowid), (1 << 63) - 1),
+                )
             rows = self._db.execute(
-                "SELECT * FROM transactions "
+                "SELECT * FROM transactions WHERE rowid <= ? "
                 "ORDER BY ts_ms DESC, id DESC LIMIT ? OFFSET ?",
-                (limit, offset),
+                (snapshot_rowid, limit, offset),
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in rows], snapshot_rowid
+
+    def list_transactions(self, limit: int = 50, offset: int = 0) -> list[dict]:
+        rows, _snapshot_rowid = self.list_transactions_page(limit, offset)
+        return rows
 
     def get_observed_devices(self) -> list[dict]:
         with self._lock:

@@ -228,15 +228,20 @@ def test_transaction_feed_pagination_wiring():
     static_dir = Path(__file__).parent.parent / "app" / "static"
     js = (static_dir / "app.js").read_text()
     html = (static_dir / "index.html").read_text()
+    css = (static_dir / "style.css").read_text()
     assert "TRANSACTION_PAGE_SIZE + 1" in js
     assert "&offset=${requestedOffset}" in js
     assert "page.slice(0, TRANSACTION_PAGE_SIZE)" in js
     assert "transactionPendingOffset" in js
+    assert "transactionSnapshot" in js
+    assert 'headers.get("x-transaction-snapshot")' in js
     assert "transactionOffset === 0" in js
     assert 'id="txn-prev"' in html
     assert 'id="txn-next"' in html
     assert 'id="txn-page-status"' in html
     assert 'aria-live="polite"' in html
+    assert "min-width: 0" in css
+    assert "@media (max-width: 520px)" in css
 
 def test_pos_device_mapping_ui_wiring():
     from pathlib import Path

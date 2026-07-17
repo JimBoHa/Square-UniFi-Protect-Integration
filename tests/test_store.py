@@ -92,6 +92,22 @@ def test_newer_payment_refreshes_all_mutable_fields(tmp_path):
         card_last4="2222",
         receipt_url="https://square.example/completed",
     )
+    completed.update(
+        {
+            "buyer_email_address": "buyer@example.com",
+            "billing_address": {"address_line_1": "123 Private Street"},
+            "card_details": {
+                "card": {
+                    "last_4": "2222",
+                    "fingerprint": "CARD_FINGERPRINT_PRIVATE",
+                },
+                "wallet_details": {"brand": "WALLET_PRIVATE"},
+            },
+            "customer_id": "CUSTOMER_PRIVATE",
+            "note": "private order note",
+            "risk_evaluation": {"risk_level": "RISK_LEVEL_PRIVATE"},
+        }
+    )
 
     try:
         ingest_payment(store, pending, protect=_ProtectStub())
@@ -112,7 +128,15 @@ def test_newer_payment_refreshes_all_mutable_fields(tmp_path):
     # location must no longer be presented as belonging to this payment.
     assert stored["camera_id"] is None
     assert stored["thumbnail_path"] is None
-    assert json.loads(stored["raw"]) == completed
+    assert stored["raw"] == "{}"
+    database_bytes = (tmp_path / "data" / "spi.db").read_bytes()
+    assert b"buyer@example.com" not in database_bytes
+    assert b"123 Private Street" not in database_bytes
+    assert b"CARD_FINGERPRINT_PRIVATE" not in database_bytes
+    assert b"WALLET_PRIVATE" not in database_bytes
+    assert b"CUSTOMER_PRIVATE" not in database_bytes
+    assert b"private order note" not in database_bytes
+    assert b"RISK_LEVEL_PRIVATE" not in database_bytes
 
 
 def test_newer_device_correction_requeues_camera_evidence(tmp_path):
@@ -703,7 +727,7 @@ def test_superseded_thumbnail_delete_failure_does_not_rollback_update(
         store.close()
 
 
-def test_store_migrates_legacy_transaction_schema_without_data_loss(tmp_path):
+def test_store_migrates_legacy_fields_and_scrubs_raw_payment(tmp_path):
     data_dir = tmp_path / "legacy"
     data_dir.mkdir()
     db = sqlite3.connect(data_dir / "spi.db")
@@ -746,7 +770,7 @@ def test_store_migrates_legacy_transaction_schema_without_data_loss(tmp_path):
             "https://square.example/legacy",
             "cam1aaaaaaaaaaaaaaaaaaaaa",
             "PAY_LEGACY.jpg",
-            '{"legacy": true}',
+            '{"legacy":true,"buyer_email_address":"buyer@example.com"}',
         ),
     )
     db.commit()
@@ -773,7 +797,7 @@ def test_store_migrates_legacy_transaction_schema_without_data_loss(tmp_path):
         "receipt_url": "https://square.example/legacy",
         "camera_id": "cam1aaaaaaaaaaaaaaaaaaaaa",
         "thumbnail_path": "PAY_LEGACY.jpg",
-        "raw": '{"legacy": true}',
+        "raw": "{}",
         "updated_at": created_at,
         "updated_ts_ms": ts_ms,
         "device_id": "",

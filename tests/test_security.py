@@ -361,7 +361,7 @@ def test_malicious_payment_fields_returned_as_json_not_html(configured):
     listing = configured.get("/api/transactions")
     assert listing.headers["content-type"].startswith("application/json")
     txn = next(t for t in listing.json() if t["id"] == "XSS1")
-    assert txn["status"] == "<script>alert(1)</script>"  # stored raw, escaped by JSON
+    assert txn["status"] == "<script>alert(1)</script>"  # normalized, escaped by JSON
 
 def test_frontend_never_uses_innerhtml():
     from pathlib import Path

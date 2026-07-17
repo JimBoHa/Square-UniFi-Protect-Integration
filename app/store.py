@@ -96,6 +96,9 @@ class Store:
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         os.chmod(db_path, 0o600)
         self._db.row_factory = sqlite3.Row
+        # Ensure migration updates overwrite discarded Payment JSON in SQLite
+        # pages instead of leaving recoverable buyer metadata in free space.
+        self._db.execute("PRAGMA secure_delete = ON")
         with self._lock:
             self._db.executescript(_SCHEMA)
             # Serialize schema inspection and ALTER statements across workers.
@@ -103,6 +106,11 @@ class Store:
             try:
                 self._migrate_transactions()
                 self._migrate_schema()
+                # Legacy releases kept the complete Square Payment JSON so
+                # device metadata could be backfilled later. The schema
+                # migration above has consumed that one needed field; discard
+                # the remaining buyer and payment metadata before committing.
+                self._scrub_transaction_raw()
                 self._migrate_alarms()
                 self._clear_missing_thumbnail_references_locked()
                 # Upgrade existing databases: any transaction that already
@@ -272,6 +280,10 @@ class Store:
                     "UPDATE transactions SET device_id = ?, device_name = ? WHERE id = ?",
                     (device_id, device_name, row["id"]),
                 )
+
+    def _scrub_transaction_raw(self) -> None:
+        """Remove legacy Square Payment payloads after device backfill."""
+        self._db.execute("UPDATE transactions SET raw = '{}' WHERE raw != '{}'")
 
     def _migrate_transactions(self) -> None:
         """Add transaction version columns without replacing existing tables."""
@@ -554,7 +566,10 @@ class Store:
             "device_name": "",
             "card_last4": "",
             "receipt_url": "",
-            "raw": json.dumps(txn.get("raw", {})),
+            # Normalized columns contain everything used at runtime. Never
+            # persist the original Square Payment, which can include buyer
+            # contact, address, note, wallet, and risk metadata.
+            "raw": "{}",
             **{k: v for k, v in txn.items() if k != "raw"},
         }
         values["updated_at"] = txn.get("updated_at") or txn["created_at"]

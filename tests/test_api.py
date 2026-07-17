@@ -5,6 +5,8 @@ import hashlib
 import hmac
 import json
 
+from app.protect_client import ProtectClient
+
 from .conftest import (
     ADMIN_PASSWORD,
     PROTECT_PASS,
@@ -15,6 +17,7 @@ from .conftest import (
 )
 
 CAM1 = "cam1aaaaaaaaaaaaaaaaaaaaa"
+CAM2 = "cam2bbbbbbbbbbbbbbbbbbbbb"
 
 
 # -- setup / login flow ------------------------------------------------------------
@@ -152,6 +155,66 @@ def test_sync_is_idempotent(configured):
     configured.post("/api/sync")
     configured.post("/api/sync")
     assert len(configured.get("/api/transactions").json()) == 2
+
+def test_camera_remap_preserves_thumbnail_and_deep_link(configured, monkeypatch):
+    snapshot_requests = []
+
+    def record_snapshot(_self, camera_id, ts_ms=None, width=640):
+        snapshot_requests.append((camera_id, ts_ms))
+        return f"snapshot:{camera_id}:{ts_ms}".encode()
+
+    monkeypatch.setattr(ProtectClient, "get_snapshot", record_snapshot)
+
+    assert configured.post("/api/sync").status_code == 200
+    original = configured.app.state.store.get_transaction("PAY_001")
+    original_thumbnail = original["thumbnail_path"]
+    original_image = configured.get("/api/thumbnails/PAY_001").content
+    assert original["camera_id"] == CAM1
+    assert original_thumbnail
+    assert CAM1.encode() in original_image
+
+    resp = configured.put(
+        "/api/camera-mapping",
+        json={
+            "mappings": [
+                {
+                    "location_id": "LOC1",
+                    "camera_id": CAM2,
+                    "camera_name": "Back Door",
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+
+    snapshot_requests.clear()
+    assert configured.post("/api/sync").status_code == 200
+    assert snapshot_requests == []
+
+    stored = configured.app.state.store.get_transaction("PAY_001")
+    txn = next(
+        item
+        for item in configured.get("/api/transactions").json()
+        if item["id"] == "PAY_001"
+    )
+    assert stored["camera_id"] == CAM1
+    assert stored["thumbnail_path"] == original_thumbnail
+    assert configured.get(txn["thumbnail_url"]).content == original_image
+    assert txn["camera_id"] == CAM1
+    assert txn["deep_link"] == (
+        f"https://192.168.1.1/protect/timeline/{CAM1}?ts={txn['ts_ms']}"
+    )
+
+    body = make_webhook_event("PAY_AFTER_REMAP")
+    resp = configured.post(
+        "/webhooks/square",
+        content=body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+    )
+    assert resp.status_code == 200
+    new_txn = configured.app.state.store.get_transaction("PAY_AFTER_REMAP")
+    assert snapshot_requests == [(CAM2, new_txn["ts_ms"])]
+    assert new_txn["camera_id"] == CAM2
 
 def test_transactions_without_camera_mapping_still_listed(authed):
     authed.put(

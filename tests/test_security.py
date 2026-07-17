@@ -98,6 +98,13 @@ def test_camera_mapping_rejects_malformed_camera_id(configured):
     )
     assert resp.status_code == 422
 
+def test_wildcard_camera_mapping_rejects_malformed_camera_id(configured):
+    resp = configured.put(
+        "/api/camera-mapping",
+        json={"mappings": [{"location_id": "*", "camera_id": "../etc"}]},
+    )
+    assert resp.status_code == 422
+
 
 # -- thumbnail path traversal ----------------------------------------------------------
 

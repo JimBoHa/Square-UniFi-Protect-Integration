@@ -88,7 +88,16 @@ def test_credential_cipher_rejects_tampered(tmp_path):
 
 # -- host / camera id validation ---------------------------------------------
 
-@pytest.mark.parametrize("host", ["192.168.1.1", "unifi.local", "console.example.com:8443"])
+@pytest.mark.parametrize(
+    "host",
+    [
+        "192.168.1.1",
+        "unifi.local",
+        "console.example.com:8443",
+        "console.example.com:1",
+        "console.example.com:65535",
+    ],
+)
 def test_validate_host_accepts(host):
     assert validate_host(host) == host
 
@@ -103,6 +112,9 @@ def test_validate_host_accepts(host):
         "",
         "host name",
         "evil.com:443/../..",
+        "unifi.local:0",
+        "unifi.local:65536",
+        "unifi.local:99999",
     ],
 )
 def test_validate_host_rejects(host):

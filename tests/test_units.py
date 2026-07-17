@@ -1067,6 +1067,9 @@ def test_square_html_response_is_normalized():
         ("locations", []),
         ("locations", {"locations": {}}),
         ("locations", {"locations": ["private location item"]}),
+        ("locations", {"locations": [{"id": ["private location id"]}]}),
+        ("locations", {"locations": [{"id": "LOC1", "name": {}}]}),
+        ("locations", {"locations": [{"id": "LOC1", "status": []}]}),
         ("payments", {"payments": {}}),
         ("payments", {"payments": ["private payment item"]}),
         ("payments", {"payments": [], "cursor": []}),
@@ -1086,6 +1089,22 @@ def test_square_response_shapes_are_normalized(operation, payload):
     assert "private location item" not in str(exc_info.value)
     assert "private payment item" not in str(exc_info.value)
     client.close()
+
+
+@pytest.mark.parametrize("merchant_id", [{"private": "id"}, ["id"], 123, None])
+def test_square_rejects_malformed_merchant_id(merchant_id):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"merchant": {"id": merchant_id}})
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(
+            SquareError,
+            match="Square did not return the access token's merchant id",
+        ):
+            client.merchant_id()
+    finally:
+        client.close()
 
 
 def test_square_permission_error_is_distinct():

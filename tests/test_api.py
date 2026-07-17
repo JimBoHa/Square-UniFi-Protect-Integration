@@ -383,6 +383,50 @@ def test_square_settings_malformed_response_returns_502(tmp_path, malformed):
         app.state.store.close()
 
 
+def test_square_settings_malformed_nested_payment_returns_502(tmp_path):
+    def malformed_payment(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/payments":
+            return httpx.Response(
+                200,
+                json={
+                    "payments": [
+                        {
+                            "id": "PAY_BAD_NESTED",
+                            "created_at": "2026-07-16T16:30:00Z",
+                            "amount_money": [],
+                        }
+                    ]
+                },
+            )
+        return square_handler(request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(protect_handler),
+        square_transport=httpx.MockTransport(malformed_payment),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            resp = isolated.put(
+                "/api/settings/square",
+                json={"access_token": SQUARE_TOKEN, "environment": "production"},
+            )
+
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == (
+            "Could not reach Square: Square returned invalid payment data"
+        )
+    finally:
+        app.state.store.close()
+
+
 # -- cameras, locations, POS camera selection ------------------------------------------
 
 def test_cameras_requires_protect_config(authed):

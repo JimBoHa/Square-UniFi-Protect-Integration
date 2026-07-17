@@ -316,6 +316,7 @@ def test_webhook_rejects_oversized_streamed_or_underdeclared_body(
 def test_webhook_ignores_non_object_payment_envelopes(configured, event):
     from .test_api import _webhook_signature
 
+    event = {"merchant_id": SQUARE_MERCHANT_ID, **event}
     body = json.dumps(event).encode()
     resp = configured.post(
         "/webhooks/square",
@@ -325,6 +326,22 @@ def test_webhook_ignores_non_object_payment_envelopes(configured, event):
 
     assert resp.status_code == 200
     assert resp.json() == {"ok": True, "ignored": True}
+
+
+def test_webhook_rejects_malformed_nested_payment(configured):
+    from .test_api import _webhook_signature
+
+    event = json.loads(make_webhook_event())
+    event["data"]["object"]["payment"]["device_details"] = []
+    body = json.dumps(event).encode()
+    resp = configured.post(
+        "/webhooks/square",
+        content=body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "Payment device_details must be an object"
 
 
 # -- stored XSS surface -----------------------------------------------------------------

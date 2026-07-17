@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from app.main import SQUARE_WEBHOOK_MAX_BODY_BYTES
+
 from .conftest import ADMIN_PASSWORD, PROTECT_PASS, SQUARE_TOKEN, WEBHOOK_KEY
 from .test_api import make_webhook_event
 
@@ -165,6 +167,33 @@ def test_webhook_rejects_tampered_body(configured):
         headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
     )
     assert resp.status_code == 401
+
+
+def test_webhook_rejects_oversized_content_length(configured):
+    resp = configured.post(
+        "/webhooks/square",
+        content=b"{}",
+        headers={"content-length": str(SQUARE_WEBHOOK_MAX_BODY_BYTES + 1)},
+    )
+
+    assert resp.status_code == 413
+    assert resp.json()["detail"] == "Webhook payload too large"
+
+
+@pytest.mark.parametrize("headers", [{}, {"content-length": "1"}])
+def test_webhook_rejects_oversized_streamed_or_underdeclared_body(
+    configured, headers
+):
+    chunks = iter(
+        [
+            b"x" * (SQUARE_WEBHOOK_MAX_BODY_BYTES // 2),
+            b"y" * (SQUARE_WEBHOOK_MAX_BODY_BYTES // 2 + 1),
+        ]
+    )
+    resp = configured.post("/webhooks/square", content=chunks, headers=headers)
+
+    assert resp.status_code == 413
+    assert resp.json()["detail"] == "Webhook payload too large"
 
 
 # -- stored XSS surface -----------------------------------------------------------------

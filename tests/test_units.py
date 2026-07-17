@@ -564,6 +564,75 @@ def test_alarm_activation_suppresses_later_historical_imports(tmp_path):
         store.close()
 
 
+def test_pending_sale_completed_after_activation_remains_alarm_eligible(tmp_path):
+    store = Store(tmp_path / "data")
+    try:
+        pending = _transaction("PAY_TRANSITION", "PENDING") | {
+            "ts_ms": 1000,
+            "updated_ts_ms": 1000,
+        }
+        store.upsert_transaction(pending)
+        store.update_settings({ALARM_ENABLED_AFTER_SETTING: ("1500", False)})
+
+        completed = _transaction("PAY_TRANSITION") | {
+            "ts_ms": 1000,
+            "updated_ts_ms": 2000,
+        }
+        store.upsert_transaction(completed)
+        saved = store.get_transaction("PAY_TRANSITION")
+
+        assert saved["status"] == "COMPLETED"
+        assert saved["updated_ts_ms"] == 2000
+        assert saved["alarm_state"] == "idle"
+        assert store.claim_alarm_trigger("PAY_TRANSITION") is not None
+    finally:
+        store.close()
+
+
+def test_first_seen_historical_completion_uses_sale_time_for_suppression(tmp_path):
+    store = Store(tmp_path / "data")
+    try:
+        store.update_settings({ALARM_ENABLED_AFTER_SETTING: ("1500", False)})
+        historical = _transaction("PAY_HISTORICAL") | {
+            "ts_ms": 1000,
+            # A recent Square version does not prove that an unseen sale
+            # completed after alarms were enabled.
+            "updated_ts_ms": 2000,
+        }
+        store.upsert_transaction(historical)
+
+        saved = store.get_transaction("PAY_HISTORICAL")
+        assert saved["alarm_state"] == "sent"
+        assert store.claim_alarm_trigger("PAY_HISTORICAL") is None
+    finally:
+        store.close()
+
+
+def test_stale_completion_version_cannot_suppress_live_alarm(tmp_path):
+    store = Store(tmp_path / "data")
+    try:
+        store.update_settings({ALARM_ENABLED_AFTER_SETTING: ("1500", False)})
+        live = _transaction("PAY_LIVE") | {
+            "ts_ms": 2000,
+            "updated_ts_ms": 2000,
+        }
+        stale = _transaction("PAY_LIVE") | {
+            "ts_ms": 1000,
+            "updated_ts_ms": 1000,
+        }
+
+        store.upsert_transaction(live)
+        assert store.get_transaction("PAY_LIVE")["alarm_state"] == "idle"
+
+        store.upsert_transaction(stale)
+        saved = store.get_transaction("PAY_LIVE")
+        assert saved["ts_ms"] == 2000
+        assert saved["updated_ts_ms"] == 2000
+        assert saved["alarm_state"] == "idle"
+    finally:
+        store.close()
+
+
 def test_alarm_activation_watermark_is_set_once_across_settings_saves(tmp_path):
     data_dir = tmp_path / "data"
     first = Store(data_dir)

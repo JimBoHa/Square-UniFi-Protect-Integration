@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import deeplink, sync
+from . import deeplink, discovery, sync
 from .protect_client import (
     ProtectAuthError,
     ProtectClient,
@@ -361,6 +361,22 @@ def create_app(
     def delete_protect_alarm(_=authed) -> dict:
         """Disable alarms locally even when the Protect console is offline."""
         return clear_protect_alarm_settings()
+
+    @app.get("/api/discover/protect")
+    def discover_protect(host: str = "", _=authed) -> list[dict]:
+        """Scan the LAN for UniFi consoles; optionally probe one address.
+
+        Broadcast/subnet discovery finds consoles on this network; consoles
+        on routed VLANs only answer a direct probe, so the UI passes the
+        typed host here to identify it before connecting.
+        """
+        extra: tuple[str, ...] = ()
+        if host:
+            try:
+                extra = (validate_host(host).partition(":")[0],)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+        return discovery.discover_consoles(extra_hosts=extra)
 
     @app.put("/api/settings/protect")
     def set_protect(body: ProtectSettingsBody, _=authed) -> dict:

@@ -400,7 +400,7 @@ def test_transaction_feed_refresh_is_visibility_aware_and_non_overlapping():
     assert "TRANSACTION_REFRESH_MS" in js
     assert 'document.visibilityState === "visible"' in js
     assert "transactionLoadInFlight" in js
-    assert "payload === lastTransactionPayload" in js
+    assert "payload !== lastTransactionPayload" in js
     assert 'id="txn-last-updated"' in html
 
 
@@ -413,6 +413,28 @@ def test_transaction_amount_formatter_uses_currency_minor_units():
     assert "resolvedOptions().maximumFractionDigits" in formatter
     assert "10 ** fractionDigits" in formatter
     assert html.index('/format.js') < html.index('/app.js')
+
+
+def test_transaction_feed_pagination_wiring():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js = (static_dir / "app.js").read_text()
+    html = (static_dir / "index.html").read_text()
+    css = (static_dir / "style.css").read_text()
+    assert "TRANSACTION_PAGE_SIZE + 1" in js
+    assert "&offset=${requestedOffset}" in js
+    assert "page.slice(0, TRANSACTION_PAGE_SIZE)" in js
+    assert "transactionPendingOffset" in js
+    assert "transactionSnapshot" in js
+    assert 'headers.get("x-transaction-snapshot")' in js
+    assert "transactionOffset === 0" in js
+    assert 'id="txn-prev"' in html
+    assert 'id="txn-next"' in html
+    assert 'id="txn-page-status"' in html
+    assert 'aria-live="polite"' in html
+    assert "min-width: 0" in css
+    assert "@media (max-width: 520px)" in css
 
 def test_pos_device_mapping_ui_wiring():
     from pathlib import Path

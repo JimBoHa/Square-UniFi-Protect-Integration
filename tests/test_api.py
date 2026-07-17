@@ -598,6 +598,98 @@ def test_sync_is_idempotent(configured):
     assert second.json()["ingested"] == 0
     assert len(configured.get("/api/transactions").json()) == 2
 
+
+def test_transactions_api_supports_page_lookahead_and_offset(authed):
+    store = authed.app.state.store
+    for index in range(102):
+        store.upsert_transaction(
+            {
+                "id": f"PAY_PAGE_{index:03d}",
+                "created_at": "2026-07-16T15:30:00.000Z",
+                # Equal timestamps verify the secondary id ordering keeps
+                # offset pages deterministic and non-overlapping.
+                "ts_ms": 1784215800000,
+                "amount": index,
+                "currency": "USD",
+                "status": "COMPLETED",
+                "location_id": "LOC1",
+            }
+        )
+
+    first_response = authed.get("/api/transactions?limit=101&offset=0")
+    snapshot = first_response.headers["x-transaction-snapshot"]
+    second_response = authed.get(
+        f"/api/transactions?limit=101&offset=100&snapshot={snapshot}"
+    )
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert second_response.headers["x-transaction-snapshot"] == snapshot
+    first_with_lookahead = first_response.json()
+    second_page = second_response.json()
+
+    assert len(first_with_lookahead) == 101
+    assert len(second_page) == 2
+    first_page = first_with_lookahead[:100]
+    assert first_with_lookahead[100]["id"] == second_page[0]["id"]
+    assert {txn["id"] for txn in first_page}.isdisjoint(
+        txn["id"] for txn in second_page
+    )
+    assert second_page[-1]["id"] == "PAY_PAGE_000"
+
+
+def test_transaction_snapshot_keeps_offset_pages_stable_during_inserts(authed):
+    store = authed.app.state.store
+    created_at = "2026-07-16T15:30:00.000Z"
+    for index in range(300):
+        store.upsert_transaction(
+            {
+                "id": f"PAY_STABLE_{index:03d}",
+                "created_at": created_at,
+                "ts_ms": 1784215800000 - index,
+                "amount": index,
+                "currency": "USD",
+                "status": "COMPLETED",
+                "location_id": "LOC1",
+            }
+        )
+
+    first_response = authed.get("/api/transactions?limit=101&offset=0")
+    snapshot = first_response.headers["x-transaction-snapshot"]
+    middle_page = authed.get(
+        f"/api/transactions?limit=101&offset=100&snapshot={snapshot}"
+    ).json()[:100]
+
+    # These rows sort ahead of every row in the snapshot. Without the rowid
+    # boundary they shift offset 200 and repeat five rows from the middle page.
+    for index in range(5):
+        store.upsert_transaction(
+            {
+                "id": f"PAY_NEW_{index}",
+                "created_at": created_at,
+                "ts_ms": 1784216800000 + index,
+                "amount": index,
+                "currency": "USD",
+                "status": "COMPLETED",
+                "location_id": "LOC1",
+            }
+        )
+
+    refreshed = authed.get("/api/transactions?limit=101&offset=0")
+    assert int(refreshed.headers["x-transaction-snapshot"]) > int(snapshot)
+    assert {txn["id"] for txn in refreshed.json()[:5]} == {
+        f"PAY_NEW_{index}" for index in range(5)
+    }
+
+    next_response = authed.get(
+        f"/api/transactions?limit=101&offset=200&snapshot={snapshot}"
+    )
+    next_page = next_response.json()[:100]
+    assert next_response.headers["x-transaction-snapshot"] == snapshot
+    assert {txn["id"] for txn in middle_page}.isdisjoint(
+        txn["id"] for txn in next_page
+    )
+    assert all(not txn["id"].startswith("PAY_NEW_") for txn in next_page)
+
 def test_transactions_without_camera_mapping_still_listed(authed):
     authed.put(
         "/api/settings/square",

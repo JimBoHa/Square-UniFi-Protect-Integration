@@ -8,6 +8,8 @@ import re
 import threading
 from datetime import datetime, timedelta, timezone
 
+import httpx
+
 from .protect_client import ProtectClient, ProtectError
 from .square_client import SquareClient, payment_from_api
 from .store import Store
@@ -20,6 +22,7 @@ THUMBNAIL_RETRY_BATCH_SIZE = 10
 THUMBNAIL_RETRY_LEASE_SECONDS = 5 * 60
 THUMBNAIL_RETRY_BASE_DELAY_SECONDS = 30
 THUMBNAIL_RETRY_MAX_DELAY_SECONDS = 60 * 60
+_THUMBNAIL_ERRORS = (ProtectError, httpx.RequestError, ValueError, OSError)
 
 
 def parse_ts_ms(created_at: str) -> int:
@@ -63,15 +66,15 @@ def ingest_payment(
     txn["thumbnail_path"] = None
 
     existing = store.get_transaction(txn["id"])
-    already_has_thumb = bool(existing and existing.get("thumbnail_path"))
-
-    if protect is not None and txn["camera_id"] and not already_has_thumb:
+    # Existing misses belong to the durable queue. Directly fetching them here
+    # would bypass its next_attempt_at backoff on every Square overlap page.
+    if protect is not None and txn["camera_id"] and existing is None:
         try:
             image = protect.get_snapshot(txn["camera_id"], ts_ms=txn["ts_ms"])
             name = safe_thumbnail_name(txn["id"])
             (store.thumbnail_dir / name).write_bytes(image)
             txn["thumbnail_path"] = name
-        except (ProtectError, ValueError, OSError) as exc:
+        except _THUMBNAIL_ERRORS as exc:
             logger.warning("Thumbnail capture failed for %s: %s", txn["id"], exc)
 
     store.upsert_transaction(txn)
@@ -86,13 +89,17 @@ def retry_missing_thumbnails(
     now: float | None = None,
 ) -> int:
     """Retry a bounded batch independently of Square's current payment window."""
-    jobs = store.claim_thumbnail_retries(
-        batch_size,
-        THUMBNAIL_RETRY_LEASE_SECONDS,
-        now=now,
-    )
+    batch_size = max(0, min(int(batch_size), 100))
     completed = 0
-    for job in jobs:
+    for _ in range(batch_size):
+        jobs = store.claim_thumbnail_retries(
+            1,
+            THUMBNAIL_RETRY_LEASE_SECONDS,
+            now=now,
+        )
+        if not jobs:
+            break
+        job = jobs[0]
         path = None
         try:
             image = protect.get_snapshot(job["camera_id"], ts_ms=job["ts_ms"])
@@ -115,7 +122,7 @@ def retry_missing_thumbnails(
                 completed += 1
             else:
                 path.unlink(missing_ok=True)
-        except (ProtectError, ValueError, OSError) as exc:
+        except _THUMBNAIL_ERRORS as exc:
             if path is not None:
                 try:
                     path.unlink(missing_ok=True)
@@ -141,23 +148,29 @@ def sync_payments(
     store: Store, square: SquareClient, protect: ProtectClient | None
 ) -> int:
     """Pull recent Square payments and ingest them. Returns count ingested."""
-    if protect is not None:
-        retry_missing_thumbnails(store, protect)
-    latest = store.latest_transaction_ts()
-    if latest:
-        begin = datetime.fromtimestamp(latest / 1000, tz=timezone.utc) - timedelta(minutes=5)
-    else:
-        begin = datetime.now(tz=timezone.utc) - timedelta(hours=BACKFILL_HOURS)
-    payments = square.list_payments(
-        begin_time=begin.isoformat(timespec="seconds").replace("+00:00", "Z")
-    )
     count = 0
-    for payment in payments:
-        try:
-            ingest_payment(store, payment, protect)
-            count += 1
-        except ValueError as exc:
-            logger.warning("Skipping malformed payment: %s", exc)
+    try:
+        latest = store.latest_transaction_ts()
+        if latest:
+            begin = datetime.fromtimestamp(latest / 1000, tz=timezone.utc) - timedelta(
+                minutes=5
+            )
+        else:
+            begin = datetime.now(tz=timezone.utc) - timedelta(hours=BACKFILL_HOURS)
+        payments = square.list_payments(
+            begin_time=begin.isoformat(timespec="seconds").replace("+00:00", "Z")
+        )
+        for payment in payments:
+            try:
+                ingest_payment(store, payment, protect)
+                count += 1
+            except ValueError as exc:
+                logger.warning("Skipping malformed payment: %s", exc)
+    finally:
+        # Retry persisted misses after fresh payments. This still runs when
+        # Square listing fails, and never contributes to the ingested count.
+        if protect is not None:
+            retry_missing_thumbnails(store, protect)
     return count
 
 

@@ -151,42 +151,71 @@ class Store:
     def upsert_transaction(self, txn: dict) -> bool:
         """Insert or update a transaction. Returns True if it was new."""
         with self._lock:
-            existing = self._db.execute(
-                "SELECT id FROM transactions WHERE id = ?", (txn["id"],)
-            ).fetchone()
-            self._db.execute(
-                "INSERT INTO transactions (id, created_at, ts_ms, amount, currency, status, "
-                "location_id, card_last4, receipt_url, camera_id, thumbnail_path, raw) "
-                "VALUES (:id, :created_at, :ts_ms, :amount, :currency, :status, :location_id, "
-                ":card_last4, :receipt_url, :camera_id, :thumbnail_path, :raw) "
-                "ON CONFLICT(id) DO UPDATE SET status=excluded.status, "
-                "camera_id=COALESCE(excluded.camera_id, camera_id), "
-                "thumbnail_path=COALESCE(excluded.thumbnail_path, thumbnail_path)",
-                {
-                    "camera_id": None,
-                    "thumbnail_path": None,
-                    "location_id": "",
-                    "card_last4": "",
-                    "receipt_url": "",
-                    "raw": json.dumps(txn.get("raw", {})),
-                    **{k: v for k, v in txn.items() if k != "raw"},
-                },
-            )
-            current = self._db.execute(
-                "SELECT camera_id, thumbnail_path FROM transactions WHERE id = ?",
-                (txn["id"],),
-            ).fetchone()
-            if current and current["camera_id"] and not current["thumbnail_path"]:
-                self._db.execute(
-                    "INSERT OR IGNORE INTO thumbnail_retries (transaction_id) VALUES (?)",
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._db.execute(
+                    "SELECT id, camera_id, ts_ms FROM transactions WHERE id = ?",
                     (txn["id"],),
-                )
-            else:
+                ).fetchone()
                 self._db.execute(
-                    "DELETE FROM thumbnail_retries WHERE transaction_id = ?",
-                    (txn["id"],),
+                    "INSERT INTO transactions (id, created_at, ts_ms, amount, currency, status, "
+                    "location_id, card_last4, receipt_url, camera_id, thumbnail_path, raw) "
+                    "VALUES (:id, :created_at, :ts_ms, :amount, :currency, :status, "
+                    ":location_id, :card_last4, :receipt_url, :camera_id, :thumbnail_path, "
+                    ":raw) ON CONFLICT(id) DO UPDATE SET status=excluded.status, "
+                    "created_at=excluded.created_at, ts_ms=excluded.ts_ms, "
+                    "thumbnail_path=CASE WHEN "
+                    "transactions.camera_id IS NOT COALESCE(excluded.camera_id, "
+                    "transactions.camera_id) OR transactions.ts_ms != excluded.ts_ms "
+                    "THEN excluded.thumbnail_path ELSE COALESCE(excluded.thumbnail_path, "
+                    "transactions.thumbnail_path) END, "
+                    "camera_id=COALESCE(excluded.camera_id, transactions.camera_id)",
+                    {
+                        "camera_id": None,
+                        "thumbnail_path": None,
+                        "location_id": "",
+                        "card_last4": "",
+                        "receipt_url": "",
+                        "raw": json.dumps(txn.get("raw", {})),
+                        **{k: v for k, v in txn.items() if k != "raw"},
+                    },
                 )
-            self._db.commit()
+                current = self._db.execute(
+                    "SELECT camera_id, ts_ms, thumbnail_path FROM transactions WHERE id = ?",
+                    (txn["id"],),
+                ).fetchone()
+                evidence_changed = bool(
+                    existing
+                    and current
+                    and (
+                        existing["camera_id"] != current["camera_id"]
+                        or existing["ts_ms"] != current["ts_ms"]
+                    )
+                )
+                if current and current["camera_id"] and not current["thumbnail_path"]:
+                    if evidence_changed:
+                        self._db.execute(
+                            "INSERT INTO thumbnail_retries (transaction_id) VALUES (?) "
+                            "ON CONFLICT(transaction_id) DO UPDATE SET attempts = 0, "
+                            "next_attempt_at = 0, lease_token = NULL, "
+                            "lease_expires_at = NULL, last_error = ''",
+                            (txn["id"],),
+                        )
+                    else:
+                        self._db.execute(
+                            "INSERT OR IGNORE INTO thumbnail_retries (transaction_id) "
+                            "VALUES (?)",
+                            (txn["id"],),
+                        )
+                else:
+                    self._db.execute(
+                        "DELETE FROM thumbnail_retries WHERE transaction_id = ?",
+                        (txn["id"],),
+                    )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
         return existing is None
 
     def claim_thumbnail_retries(

@@ -5,11 +5,18 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import httpx
 import pytest
 
 from app.protect_client import ProtectError
+from app.square_client import SquareError
 from app.store import Store
-from app.sync import retry_missing_thumbnails, retry_thumbnail_name, sync_payments
+from app.sync import (
+    ingest_payment,
+    retry_missing_thumbnails,
+    retry_thumbnail_name,
+    sync_payments,
+)
 
 
 CAM_A = "cameraA"
@@ -68,44 +75,66 @@ def test_old_failure_retries_after_square_window_advances(tmp_path):
     old = _payment("OLD", "2026-07-16T15:30:00.000Z")
     new = _payment("NEW", "2026-07-16T15:45:00.000Z")
 
+    class UnavailableProtect:
+        def get_snapshot(self, camera_id, ts_ms=None):
+            raise ProtectError("recording temporarily unavailable")
+
     class Square:
-        calls = 0
         returned: list[list[str]] = []
 
         def list_payments(self, begin_time=None):
-            self.calls += 1
-            result = [old, new] if self.calls == 1 else [new]
-            self.returned.append([payment["id"] for payment in result])
-            return result
+            self.returned.append([new["id"]])
+            return [new]
 
     class Protect:
-        failed_old = False
         calls: list[int] = []
 
         def get_snapshot(self, camera_id, ts_ms=None):
             self.calls.append(ts_ms)
-            if ts_ms == 1784215800000 and not self.failed_old:
-                self.failed_old = True
-                raise ProtectError("recording temporarily unavailable")
             return b"jpeg-" + str(ts_ms).encode()
 
     square = Square()
     protect = Protect()
     try:
-        assert sync_payments(store, square, protect) == 2
+        # OLD persists after both its initial capture and first queue attempt fail.
+        ingest_payment(store, old, UnavailableProtect())
+        assert retry_missing_thumbnails(
+            store, UnavailableProtect(), batch_size=1, now=0
+        ) == 0
         assert store.get_transaction("OLD")["thumbnail_path"] is None
+
+        # Square returns only newer NEW. Fresh ingestion runs before OLD's queue.
+        assert sync_payments(store, square, protect) == 1
+        assert square.returned == [["NEW"]]
+        assert protect.calls == [1784216700000, 1784215800000]
         assert store.get_transaction("NEW")["thumbnail_path"] is not None
         assert store.latest_transaction_ts() == 1784216700000
-
-        # Square no longer returns OLD, but the independent durable queue does.
-        assert sync_payments(store, square, protect) == 1
-        assert square.returned[1] == ["NEW"]
         old_row = store.get_transaction("OLD")
         assert old_row["thumbnail_path"] is not None
         assert old_row["thumbnail_path"] != "OLD.jpg"
         assert (store.thumbnail_dir / old_row["thumbnail_path"]).read_bytes().endswith(
             b"1784215800000"
         )
+    finally:
+        store.close()
+
+
+def test_square_failure_still_processes_retry_queue(tmp_path):
+    store = Store(tmp_path / "data")
+    store.upsert_transaction(_stored_txn("OLD", 1000))
+
+    class Square:
+        def list_payments(self, begin_time=None):
+            raise SquareError("Square unavailable")
+
+    class Protect:
+        def get_snapshot(self, camera_id, ts_ms=None):
+            return b"jpeg"
+
+    try:
+        with pytest.raises(SquareError, match="Square unavailable"):
+            sync_payments(store, Square(), Protect())
+        assert store.get_transaction("OLD")["thumbnail_path"] is not None
     finally:
         store.close()
 
@@ -130,6 +159,53 @@ def test_retry_backoff_is_exponential_and_capped(tmp_path):
         # Third delay is capped at 25 seconds instead of growing to 40.
         fourth = store.claim_thumbnail_retries(1, 5, now=155)[0]
         assert fourth["attempts"] == 3
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("camera_id", "ts_ms"),
+    [(CAM_B, 1000), (CAM_A, 2000)],
+)
+def test_evidence_change_resets_retry_backoff(tmp_path, camera_id, ts_ms):
+    store = Store(tmp_path / "data")
+    try:
+        store.upsert_transaction(_stored_txn("P", 1000, camera_id=CAM_A))
+        failed = store.claim_thumbnail_retries(1, 10, now=100)[0]
+        assert _fail(store, failed, 100)
+        assert store.claim_thumbnail_retries(1, 10, now=109) == []
+
+        store.upsert_transaction(_stored_txn("P", ts_ms, camera_id=camera_id))
+        replacement = store.claim_thumbnail_retries(1, 10, now=100)[0]
+        assert replacement["camera_id"] == camera_id
+        assert replacement["ts_ms"] == ts_ms
+        assert replacement["attempts"] == 0
+    finally:
+        store.close()
+
+
+def test_reingest_does_not_bypass_retry_backoff(tmp_path):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC1", CAM_A, "Register")
+    payment = _payment("P", "2026-07-16T15:30:00.000Z")
+    ingest_payment(store, payment, None)
+    failed = store.claim_thumbnail_retries(1, 10, now=100)[0]
+    assert _fail(store, failed, 100)
+
+    class Protect:
+        calls = 0
+
+        def get_snapshot(self, camera_id, ts_ms=None):
+            self.calls += 1
+            return b"jpeg"
+
+    protect = Protect()
+    try:
+        ingest_payment(store, payment, protect)
+        assert protect.calls == 0
+        assert store.get_transaction("P")["thumbnail_path"] is None
+        assert store.claim_thumbnail_retries(1, 10, now=109) == []
+        assert store.claim_thumbnail_retries(1, 10, now=110)[0]["attempts"] == 1
     finally:
         store.close()
 
@@ -217,6 +293,33 @@ def test_retry_batch_bounds_protect_calls(tmp_path):
         store.close()
 
 
+def test_request_error_releases_job_and_continues_batch(tmp_path):
+    store = Store(tmp_path / "data")
+    store.upsert_transaction(_stored_txn("P1", 1000))
+    store.upsert_transaction(_stored_txn("P2", 1001))
+
+    class Protect:
+        calls = 0
+
+        def get_snapshot(self, camera_id, ts_ms=None):
+            self.calls += 1
+            if ts_ms == 1000:
+                request = httpx.Request("GET", "https://protect.local/snapshot")
+                raise httpx.ConnectError("Protect offline", request=request)
+            return b"jpeg"
+
+    protect = Protect()
+    try:
+        assert retry_missing_thumbnails(store, protect, batch_size=2, now=100) == 1
+        assert protect.calls == 2
+        assert store.get_transaction("P1")["thumbnail_path"] is None
+        assert store.get_transaction("P2")["thumbnail_path"] is not None
+        assert store.claim_thumbnail_retries(1, 10, now=129) == []
+        assert store.claim_thumbnail_retries(1, 10, now=130)[0]["attempts"] == 1
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize(
     "error",
     [ProtectError("protect down"), ValueError("bad evidence"), OSError("disk down")],
@@ -262,7 +365,8 @@ def test_retry_file_write_failure_is_caught(tmp_path, monkeypatch):
 def test_retry_io_does_not_hold_database_claim_lock(tmp_path):
     data_dir = tmp_path / "data"
     worker_store = Store(data_dir)
-    worker_store.upsert_transaction(_stored_txn("P", 1000))
+    worker_store.upsert_transaction(_stored_txn("P1", 1000))
+    worker_store.upsert_transaction(_stored_txn("P2", 1001))
     other_store = Store(data_dir)
     entered = threading.Event()
     release = threading.Event()
@@ -281,6 +385,9 @@ def test_retry_io_does_not_hold_database_claim_lock(tmp_path):
     try:
         thread.start()
         assert entered.wait(1)
+        # Only P1 is leased while its I/O runs; P2 remains claimable.
+        other_job = other_store.claim_thumbnail_retries(1, 10, now=100)[0]
+        assert other_job["transaction_id"] == "P2"
         # This write needs BEGIN/COMMIT access while snapshot I/O is blocked.
         other_store.set_setting("concurrent", "ok")
         assert other_store.get_setting("concurrent") == "ok"

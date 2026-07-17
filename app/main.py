@@ -39,6 +39,7 @@ logger = logging.getLogger("spi")
 SESSION_COOKIE = "spi_session"
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
+LOGIN_FAILURE_KEY_LIMIT = 10_000
 PROTECT_SETTING_KEYS = (
     "protect.host",
     "protect.username",
@@ -207,24 +208,57 @@ def create_app(
     def client_key(request: Request) -> str:
         return request.client.host if request.client else "unknown"
 
+    def prune_login_failures_locked(now: float) -> None:
+        """Discard expired attempts and empty client keys while holding the lock."""
+        for key, attempts in list(app.state.login_failures.items()):
+            active = [
+                attempted_at
+                for attempted_at in attempts
+                if now - attempted_at < LOGIN_LOCKOUT_SECONDS
+            ]
+            if active:
+                app.state.login_failures[key] = active
+            else:
+                app.state.login_failures.pop(key, None)
+
     def check_login_throttle(request: Request) -> None:
         key = client_key(request)
         now = time.time()
         with app.state.login_lock:
-            attempts = [
-                t for t in app.state.login_failures.get(key, [])
-                if now - t < LOGIN_LOCKOUT_SECONDS
-            ]
-            app.state.login_failures[key] = attempts
-            if len(attempts) >= LOGIN_MAX_FAILURES:
+            prune_login_failures_locked(now)
+            if len(app.state.login_failures.get(key, ())) >= LOGIN_MAX_FAILURES:
                 raise HTTPException(
                     status_code=429,
                     detail="Too many failed login attempts; try again shortly",
                 )
 
     def record_login_failure(request: Request) -> None:
+        key = client_key(request)
+        now = time.time()
         with app.state.login_lock:
-            app.state.login_failures.setdefault(client_key(request), []).append(time.time())
+            prune_login_failures_locked(now)
+            attempts = app.state.login_failures.get(key)
+            if attempts is None:
+                # Never evict an active source: doing so would let a distributed
+                # attacker reset another source's brute-force counter. When the
+                # bounded map is full, throttle new failing sources instead.
+                if len(app.state.login_failures) >= LOGIN_FAILURE_KEY_LIMIT:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Too many failed login attempts; try again shortly",
+                    )
+                attempts = []
+                app.state.login_failures[key] = attempts
+            if len(attempts) >= LOGIN_MAX_FAILURES:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many failed login attempts; try again shortly",
+                )
+            attempts.append(now)
+
+    def clear_login_failures(request: Request) -> None:
+        with app.state.login_lock:
+            app.state.login_failures.pop(client_key(request), None)
 
     # -- setup & login -------------------------------------------------------
 
@@ -257,6 +291,7 @@ def create_app(
             raise HTTPException(status_code=401, detail="Invalid password")
         token = new_session_token()
         store.create_session(token)
+        clear_login_failures(request)
         response.set_cookie(
             SESSION_COOKIE,
             token,

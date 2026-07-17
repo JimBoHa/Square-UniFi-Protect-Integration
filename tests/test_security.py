@@ -1,6 +1,7 @@
 """Security tests: authentication, secrets at rest, webhook forgery, traversal."""
 
 import json
+import time
 
 import pytest
 
@@ -54,6 +55,42 @@ def test_login_throttled_after_repeated_failures(client):
     assert resp.status_code == 429
     # Even the correct password is throttled while locked out
     assert client.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 429
+
+
+def test_successful_login_resets_prior_failures(client):
+    client.post("/api/setup", json={"password": ADMIN_PASSWORD})
+    for _ in range(4):
+        assert client.post("/api/login", json={"password": "wrong"}).status_code == 401
+
+    assert client.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
+    assert client.app.state.login_failures == {}
+    assert client.post("/api/login", json={"password": "one-more-typo"}).status_code == 401
+    assert client.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
+
+
+def test_login_failure_map_prunes_expired_keys_and_throttles_at_capacity(
+    client, monkeypatch
+):
+    client.post("/api/setup", json={"password": ADMIN_PASSWORD})
+    now = time.time()
+    client.app.state.login_failures.update(
+        {
+            "active-a": [now],
+            "active-b": [now],
+            "expired": [now - 61],
+        }
+    )
+    monkeypatch.setattr("app.main.LOGIN_FAILURE_KEY_LIMIT", 2)
+
+    # Full capacity does not block a valid password and the normal throttle
+    # check removes expired client keys.
+    assert client.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
+    assert set(client.app.state.login_failures) == {"active-a", "active-b"}
+
+    # A failing new source is throttled rather than left untracked or allowed
+    # to evict an active brute-force counter.
+    assert client.post("/api/login", json={"password": "wrong"}).status_code == 429
+    assert set(client.app.state.login_failures) == {"active-a", "active-b"}
 
 
 # -- secrets at rest ---------------------------------------------------------------

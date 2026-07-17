@@ -296,14 +296,6 @@ function stopTransactionRefresh() {
 
 document.addEventListener("visibilitychange", refreshTransactionsIfVisible);
 
-function formatAmount(cents, currency) {
-  try {
-    return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(cents / 100);
-  } catch {
-    return `${(cents / 100).toFixed(2)} ${currency}`;
-  }
-}
-
 async function loadTransactions() {
   if (transactionLoadInFlight) return;
   transactionLoadInFlight = true;

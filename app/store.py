@@ -19,9 +19,12 @@ CREATE TABLE IF NOT EXISTS settings (
     encrypted INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS camera_map (
-    location_id TEXT PRIMARY KEY,
+    location_id TEXT NOT NULL,
+    device_id TEXT NOT NULL DEFAULT '',
+    device_name TEXT NOT NULL DEFAULT '',
     camera_id TEXT NOT NULL,
-    camera_name TEXT NOT NULL DEFAULT ''
+    camera_name TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (location_id, device_id)
 );
 CREATE TABLE IF NOT EXISTS transactions (
     id TEXT PRIMARY KEY,
@@ -31,6 +34,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     currency TEXT NOT NULL,
     status TEXT NOT NULL,
     location_id TEXT NOT NULL DEFAULT '',
+    device_id TEXT NOT NULL DEFAULT '',
+    device_name TEXT NOT NULL DEFAULT '',
     card_last4 TEXT NOT NULL DEFAULT '',
     receipt_url TEXT NOT NULL DEFAULT '',
     camera_id TEXT,
@@ -57,7 +62,59 @@ class Store:
         self._db.row_factory = sqlite3.Row
         with self._lock:
             self._db.executescript(_SCHEMA)
-            self._db.commit()
+            self._db.execute("BEGIN")
+            try:
+                self._migrate_schema()
+            except Exception:
+                self._db.rollback()
+                raise
+            else:
+                self._db.commit()
+
+    def _migrate_schema(self) -> None:
+        mapping_columns = {
+            row["name"]
+            for row in self._db.execute("PRAGMA table_info(camera_map)").fetchall()
+        }
+        if "device_id" not in mapping_columns:
+            self._db.execute("ALTER TABLE camera_map RENAME TO camera_map_legacy")
+            self._db.execute(
+                """
+                CREATE TABLE camera_map (
+                    location_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL DEFAULT '',
+                    device_name TEXT NOT NULL DEFAULT '',
+                    camera_id TEXT NOT NULL,
+                    camera_name TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (location_id, device_id)
+                )
+                """
+            )
+            self._db.execute(
+                """
+                INSERT INTO camera_map (
+                    location_id, device_id, device_name, camera_id, camera_name
+                )
+                SELECT location_id, '', '', camera_id, camera_name
+                FROM camera_map_legacy
+                """
+            )
+            self._db.execute("DROP TABLE camera_map_legacy")
+
+        transaction_columns = {
+            row["name"]
+            for row in self._db.execute("PRAGMA table_info(transactions)").fetchall()
+        }
+        if "device_id" not in transaction_columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN device_id "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if "device_name" not in transaction_columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN device_name "
+                "TEXT NOT NULL DEFAULT ''"
+            )
 
     def close(self) -> None:
         self._db.close()
@@ -90,29 +147,48 @@ class Store:
 
     # -- camera mapping ----------------------------------------------------
 
-    def set_camera_mapping(self, location_id: str, camera_id: str, camera_name: str = "") -> None:
+    def set_camera_mapping(
+        self,
+        location_id: str,
+        camera_id: str,
+        camera_name: str = "",
+        device_id: str = "",
+        device_name: str = "",
+    ) -> None:
         with self._lock:
             self._db.execute(
-                "INSERT INTO camera_map (location_id, camera_id, camera_name) VALUES (?, ?, ?) "
-                "ON CONFLICT(location_id) DO UPDATE SET camera_id=excluded.camera_id, "
+                "INSERT INTO camera_map (location_id, device_id, device_name, camera_id, "
+                "camera_name) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(location_id, device_id) DO UPDATE SET "
+                "device_name=excluded.device_name, camera_id=excluded.camera_id, "
                 "camera_name=excluded.camera_name",
-                (location_id, camera_id, camera_name),
+                (location_id, device_id, device_name, camera_id, camera_name),
             )
             self._db.commit()
 
     def get_camera_mappings(self) -> list[dict]:
         with self._lock:
-            rows = self._db.execute("SELECT * FROM camera_map ORDER BY location_id").fetchall()
+            rows = self._db.execute(
+                "SELECT * FROM camera_map ORDER BY location_id, device_id"
+            ).fetchall()
         return [dict(r) for r in rows]
 
-    def camera_for_location(self, location_id: str) -> dict | None:
+    def camera_for_location(self, location_id: str, device_id: str = "") -> dict | None:
         with self._lock:
-            row = self._db.execute(
-                "SELECT * FROM camera_map WHERE location_id = ?", (location_id,)
-            ).fetchone()
+            row = None
+            if device_id:
+                row = self._db.execute(
+                    "SELECT * FROM camera_map WHERE location_id = ? AND device_id = ?",
+                    (location_id, device_id),
+                ).fetchone()
             if row is None:
                 row = self._db.execute(
-                    "SELECT * FROM camera_map WHERE location_id = '*'"
+                    "SELECT * FROM camera_map WHERE location_id = ? AND device_id = ''",
+                    (location_id,),
+                ).fetchone()
+            if row is None:
+                row = self._db.execute(
+                    "SELECT * FROM camera_map WHERE location_id = '*' AND device_id = ''"
                 ).fetchone()
         return dict(row) if row else None
 
@@ -131,16 +207,24 @@ class Store:
             ).fetchone()
             self._db.execute(
                 "INSERT INTO transactions (id, created_at, ts_ms, amount, currency, status, "
-                "location_id, card_last4, receipt_url, camera_id, thumbnail_path, raw) "
+                "location_id, device_id, device_name, card_last4, receipt_url, camera_id, "
+                "thumbnail_path, raw) "
                 "VALUES (:id, :created_at, :ts_ms, :amount, :currency, :status, :location_id, "
-                ":card_last4, :receipt_url, :camera_id, :thumbnail_path, :raw) "
+                ":device_id, :device_name, :card_last4, :receipt_url, :camera_id, "
+                ":thumbnail_path, :raw) "
                 "ON CONFLICT(id) DO UPDATE SET status=excluded.status, "
-                "camera_id=COALESCE(excluded.camera_id, camera_id), "
-                "thumbnail_path=COALESCE(excluded.thumbnail_path, thumbnail_path)",
+                "device_id=COALESCE(NULLIF(excluded.device_id, ''), transactions.device_id), "
+                "device_name=COALESCE(NULLIF(excluded.device_name, ''), "
+                "transactions.device_name), "
+                "camera_id=COALESCE(excluded.camera_id, transactions.camera_id), "
+                "thumbnail_path=COALESCE(excluded.thumbnail_path, "
+                "transactions.thumbnail_path)",
                 {
                     "camera_id": None,
                     "thumbnail_path": None,
                     "location_id": "",
+                    "device_id": "",
+                    "device_name": "",
                     "card_last4": "",
                     "receipt_url": "",
                     "raw": json.dumps(txn.get("raw", {})),
@@ -164,6 +248,16 @@ class Store:
             rows = self._db.execute(
                 "SELECT * FROM transactions ORDER BY ts_ms DESC LIMIT ? OFFSET ?",
                 (limit, offset),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_observed_devices(self) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT location_id, device_id, MAX(device_name) AS device_name "
+                "FROM transactions WHERE device_id != '' "
+                "GROUP BY location_id, device_id "
+                "ORDER BY location_id, device_name, device_id"
             ).fetchall()
         return [dict(r) for r in rows]
 

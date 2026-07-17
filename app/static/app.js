@@ -148,9 +148,10 @@ $("#square-form").addEventListener("submit", async (e) => {
 async function loadSettingsView() {
   const rows = $("#mapping-rows");
   rows.textContent = "";
-  let cameras = [], locations = [], mappings = [];
+  let cameras = [], locations = [], mappings = [], devices = [];
   try { cameras = await api("/api/cameras"); } catch { /* Protect not configured yet */ }
   try { locations = await api("/api/locations"); } catch { /* Square not configured yet */ }
+  try { devices = await api("/api/pos-devices"); } catch { /* No observed devices yet */ }
   try { mappings = await api("/api/camera-mapping"); } catch { return; }
 
   if (!cameras.length || !locations.length) {
@@ -162,31 +163,59 @@ async function loadSettingsView() {
     return;
   }
   $("#save-mapping").hidden = false;
-  const current = Object.fromEntries(mappings.map((m) => [m.location_id, m.camera_id]));
+  const mappingKey = (locationId, deviceId = "") =>
+    JSON.stringify([locationId, deviceId || ""]);
+  const current = new Map(mappings.map((m) => [
+    mappingKey(m.location_id, m.device_id),
+    m.camera_id,
+  ]));
+  const devicesByLocation = new Map();
+  for (const device of devices) {
+    if (!devicesByLocation.has(device.location_id))
+      devicesByLocation.set(device.location_id, []);
+    devicesByLocation.get(device.location_id).push(device);
+  }
 
   for (const loc of locations) {
-    const row = document.createElement("div");
-    row.className = "mapping-row";
-    const label = document.createElement("span");
-    label.className = "loc";
-    label.textContent = loc.name || loc.id;
-    const select = document.createElement("select");
-    select.dataset.locationId = loc.id;
-    const none = document.createElement("option");
-    none.value = "";
-    none.textContent = "— no camera —";
-    select.appendChild(none);
-    for (const cam of cameras) {
-      const opt = document.createElement("option");
-      opt.value = cam.id;
-      opt.textContent = cam.name;
-      if (current[loc.id] === cam.id) opt.selected = true;
-      select.appendChild(opt);
+    const observed = devicesByLocation.get(loc.id) || [];
+    const targets = [
+      { device_id: "", device_name: "" },
+      ...observed,
+    ];
+    for (const target of targets) {
+      const row = document.createElement("div");
+      row.className = "mapping-row";
+      const label = document.createElement("span");
+      label.className = "loc";
+      const locationName = loc.name || loc.id;
+      if (target.device_id) {
+        label.textContent = `${locationName} — ${target.device_name || target.device_id}`;
+      } else if (observed.length) {
+        label.textContent = `${locationName} — Other devices (fallback)`;
+      } else {
+        label.textContent = locationName;
+      }
+      const select = document.createElement("select");
+      select.dataset.locationId = loc.id;
+      select.dataset.deviceId = target.device_id || "";
+      select.dataset.deviceName = target.device_name || "";
+      const none = document.createElement("option");
+      none.value = "";
+      none.textContent = "— no camera —";
+      select.appendChild(none);
+      for (const cam of cameras) {
+        const opt = document.createElement("option");
+        opt.value = cam.id;
+        opt.textContent = cam.name;
+        if (current.get(mappingKey(loc.id, target.device_id)) === cam.id)
+          opt.selected = true;
+        select.appendChild(opt);
+      }
+      select.addEventListener("change", () => previewCamera(select.value));
+      row.appendChild(label);
+      row.appendChild(select);
+      rows.appendChild(row);
     }
-    select.addEventListener("change", () => previewCamera(select.value));
-    row.appendChild(label);
-    row.appendChild(select);
-    rows.appendChild(row);
   }
 }
 
@@ -203,6 +232,8 @@ $("#save-mapping").addEventListener("click", async () => {
     if (!select.value) continue;
     mappings.push({
       location_id: select.dataset.locationId,
+      device_id: select.dataset.deviceId || "",
+      device_name: select.dataset.deviceName || "",
       camera_id: select.value,
       camera_name: select.options[select.selectedIndex].textContent,
     });

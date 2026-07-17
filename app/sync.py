@@ -38,7 +38,7 @@ def ingest_payment(
         raise ValueError("Payment missing id or created_at")
     txn["ts_ms"] = parse_ts_ms(txn["created_at"])
 
-    mapping = store.camera_for_location(txn["location_id"])
+    mapping = store.camera_for_location(txn["location_id"], txn["device_id"])
     txn["camera_id"] = mapping["camera_id"] if mapping else None
     txn["thumbnail_path"] = None
 

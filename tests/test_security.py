@@ -10,6 +10,7 @@ from .test_api import make_webhook_event
 PROTECTED_ENDPOINTS = [
     ("GET", "/api/cameras"),
     ("GET", "/api/locations"),
+    ("GET", "/api/pos-devices"),
     ("GET", "/api/camera-mapping"),
     ("PUT", "/api/camera-mapping"),
     ("GET", "/api/camera-preview/cam1aaaaaaaaaaaaaaaaaaaaa"),
@@ -192,3 +193,15 @@ def test_frontend_never_uses_innerhtml():
     js = (Path(__file__).parent.parent / "app" / "static" / "app.js").read_text()
     assert "innerHTML" not in js
     assert "document.write" not in js
+
+def test_pos_device_mapping_ui_wiring():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js = (static_dir / "app.js").read_text()
+    html = (static_dir / "index.html").read_text()
+    assert 'api("/api/pos-devices")' in js
+    assert "select.dataset.deviceId" in js
+    assert "select.dataset.deviceName" in js
+    assert "Other devices (fallback)" in js
+    assert "observed Square POS device" in html

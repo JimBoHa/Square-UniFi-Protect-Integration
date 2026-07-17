@@ -447,3 +447,19 @@ def test_pos_device_mapping_ui_wiring():
     assert "select.dataset.deviceName" in js
     assert "Other devices (fallback)" in js
     assert "observed Square POS device" in html
+
+
+def test_setup_wizard_ui_wiring():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js = (static_dir / "app.js").read_text()
+    html = (static_dir / "index.html").read_text()
+    assert 'id="view-wizard"' in html
+    for step in ("1", "2", "3", "4"):
+        assert f'data-step="{step}"' in html
+    assert "maybeStartWizard" in js
+    assert "enterAppOrWizard" in js
+    assert "buildMappingRows" in js  # shared with Settings, not duplicated
+    assert js.count("function buildMappingRows") == 1
+    assert 'id="wiz-skip"' in html

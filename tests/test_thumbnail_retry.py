@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from app.protect_client import ProtectError
+from app.protect_client import ProtectClient, ProtectError
 from app.square_client import SquareError
 from app.store import Store
 from app.sync import (
@@ -447,6 +447,33 @@ def test_retry_failures_are_caught_and_requeued(tmp_path, error):
         assert store.claim_thumbnail_retries(1, 5, now=129) == []
         assert store.claim_thumbnail_retries(1, 5, now=130)[0]["attempts"] == 1
     finally:
+        store.close()
+
+
+def test_successful_json_snapshot_response_keeps_durable_retry(tmp_path):
+    store = Store(tmp_path / "data")
+    store.upsert_transaction(_stored_txn("P", 1000))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        return httpx.Response(200, json={"error": "Recording not found"})
+
+    protect = ProtectClient(
+        "protect.local",
+        "user",
+        "password",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert retry_missing_thumbnails(store, protect, batch_size=1, now=100) == 0
+        assert store.get_transaction("P")["thumbnail_path"] is None
+        assert store.claim_thumbnail_retries(1, 5, now=129) == []
+        retry = store.claim_thumbnail_retries(1, 5, now=130)[0]
+        assert retry["transaction_id"] == "P"
+        assert retry["attempts"] == 1
+    finally:
+        protect.close()
         store.close()
 
 

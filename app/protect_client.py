@@ -14,6 +14,33 @@ import httpx
 
 HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?(?::\d{1,5})?$")
 CAMERA_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
+_SNAPSHOT_CONTENT_TYPES = frozenset(
+    {
+        "image/jpeg",
+        "image/jpg",
+        "image/pjpeg",
+        "application/octet-stream",
+        "binary/octet-stream",
+    }
+)
+_JPEG_START_OF_FRAME_MARKERS = tuple(
+    bytes((0xFF, marker))
+    for marker in (
+        0xC0,
+        0xC1,
+        0xC2,
+        0xC3,
+        0xC5,
+        0xC6,
+        0xC7,
+        0xC9,
+        0xCA,
+        0xCB,
+        0xCD,
+        0xCE,
+        0xCF,
+    )
+)
 
 
 class ProtectError(Exception):
@@ -22,6 +49,30 @@ class ProtectError(Exception):
 
 class ProtectAuthError(ProtectError):
     pass
+
+
+def _validated_snapshot_bytes(resp: httpx.Response) -> bytes:
+    """Return a complete JPEG response or reject an upstream error document."""
+    content_type = (
+        resp.headers.get("content-type", "").partition(";")[0].strip().lower()
+    )
+    if content_type and content_type not in _SNAPSHOT_CONTENT_TYPES:
+        raise ProtectError("UniFi Protect snapshot response was not a JPEG")
+
+    content = resp.content
+    # Protect may omit Content-Type or use application/octet-stream. Require a
+    # frame header and scan in addition to SOI/EOI so marker-only or wrapped
+    # error payloads are not persisted as camera evidence. Trailing bytes are
+    # allowed because JPEG decoders permit data after the EOI marker.
+    eoi_position = content.find(b"\xff\xd9", 2)
+    scan_position = content.find(b"\xff\xda", 2, eoi_position)
+    has_frame = scan_position != -1 and any(
+        content.find(marker, 2, scan_position) != -1
+        for marker in _JPEG_START_OF_FRAME_MARKERS
+    )
+    if not content.startswith(b"\xff\xd8") or eoi_position == -1 or not has_frame:
+        raise ProtectError("UniFi Protect snapshot response contained invalid JPEG data")
+    return content
 
 
 def validate_host(host: str) -> str:
@@ -200,7 +251,7 @@ class ProtectClient:
                 raise_for_status=False,
             )
             if 200 <= resp.status_code < 300:
-                return resp.content
+                return _validated_snapshot_bytes(resp)
             content_type = resp.headers.get("content-type", "")
             if resp.status_code == 404 and "json" in content_type:
                 # Firmware supports the endpoint but has no recorded frame at
@@ -222,7 +273,7 @@ class ProtectClient:
         resp = self._request(
             "GET", f"/proxy/protect/api/cameras/{camera_id}/snapshot", params=params
         )
-        return resp.content
+        return _validated_snapshot_bytes(resp)
 
     def get_integration_info(self) -> dict:
         """Verify API-key access and return official Protect application metadata."""

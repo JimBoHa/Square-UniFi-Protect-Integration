@@ -436,6 +436,22 @@ def test_transaction_feed_pagination_wiring():
     assert "min-width: 0" in css
     assert "@media (max-width: 520px)" in css
 
+
+def test_transaction_thumbnails_use_accessible_timeline_links():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js = (static_dir / "app.js").read_text()
+    css = (static_dir / "style.css").read_text()
+    assert 'const link = document.createElement("a")' in js
+    assert "link.href = txn.deep_link" in js
+    assert 'link.target = "_blank"' in js
+    assert 'link.rel = "noopener noreferrer"' in js
+    assert '"aria-label"' in js
+    assert "window.open(txn.deep_link" not in js
+    assert ".txn .thumbnail-link:focus-visible" in css
+
+
 def test_pos_device_mapping_ui_wiring():
     from pathlib import Path
 

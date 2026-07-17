@@ -153,6 +153,29 @@ $("#protect-disable-alarm").addEventListener("click", async () => {
   }
 });
 
+$("#square-register-webhook").addEventListener("click", async () => {
+  const url = $("#square-webhook-url").value.trim();
+  if (!url) {
+    message("Enter the public webhook notification URL first.", "error");
+    return;
+  }
+  try {
+    const result = await api("/api/settings/square/webhook/register", {
+      method: "POST",
+      body: JSON.stringify({ notification_url: url }),
+    });
+    $("#square-webhook-key").value = "";
+    message(
+      result.updated
+        ? "Webhook subscription updated and signature key stored."
+        : "Webhook registered with Square and signature key stored.",
+      "ok",
+    );
+  } catch (err) {
+    message(err.message, "error");
+  }
+});
+
 $("#square-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {

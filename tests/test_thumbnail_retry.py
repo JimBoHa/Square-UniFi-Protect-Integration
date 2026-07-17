@@ -506,6 +506,99 @@ def test_reingest_missing_evidence_adopts_remapped_camera(tmp_path):
         store.close()
 
 
+def test_mapping_save_wins_over_blocked_initial_snapshot(tmp_path):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC1", CAM_A, "Original camera")
+    payment = _payment("P", "2026-07-16T15:30:00.000Z")
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+    errors: list[Exception] = []
+
+    class BlockingProtect:
+        def get_snapshot(self, camera_id, ts_ms=None):
+            assert camera_id == CAM_A
+            snapshot_started.set()
+            assert release_snapshot.wait(timeout=5)
+            return b"old-camera-frame"
+
+    def ingest() -> None:
+        try:
+            ingest_payment(store, payment, BlockingProtect())
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=ingest)
+    worker.start()
+    try:
+        assert snapshot_started.wait(timeout=5)
+        store.replace_camera_mappings(
+            [("LOC1", "", "", CAM_B, "New camera")]
+        )
+        release_snapshot.set()
+        worker.join(timeout=5)
+
+        saved = store.get_transaction("P")
+        jobs = store.claim_thumbnail_retries(1, 10, now=0)
+        assert not worker.is_alive()
+        assert errors == []
+        assert saved["camera_id"] == CAM_B
+        assert saved["thumbnail_path"] is None
+        assert [job["camera_id"] for job in jobs] == [CAM_B]
+        assert list(store.thumbnail_dir.iterdir()) == []
+    finally:
+        release_snapshot.set()
+        worker.join(timeout=5)
+        store.close()
+
+
+def test_late_duplicate_webhook_ingest_cannot_undo_pending_evidence_remap(
+    tmp_path, monkeypatch
+):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC1", CAM_A, "Original camera")
+    payment = _payment("P", "2026-07-16T15:30:00.000Z")
+    ingest_payment(store, payment, None)
+    upsert_started = threading.Event()
+    release_upsert = threading.Event()
+    errors: list[Exception] = []
+    original_upsert = store.upsert_transaction
+
+    def blocked_upsert(txn, **kwargs):
+        upsert_started.set()
+        assert release_upsert.wait(timeout=5)
+        return original_upsert(txn, **kwargs)
+
+    def ingest_duplicate() -> None:
+        try:
+            ingest_payment(store, payment, None)
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(store, "upsert_transaction", blocked_upsert)
+    worker = threading.Thread(target=ingest_duplicate)
+    worker.start()
+    try:
+        assert upsert_started.wait(timeout=5)
+        store.replace_camera_mappings(
+            [("LOC1", "", "", CAM_B, "New camera")]
+        )
+        assert store.get_transaction("P")["camera_id"] == CAM_B
+        release_upsert.set()
+        worker.join(timeout=5)
+
+        saved = store.get_transaction("P")
+        jobs = store.claim_thumbnail_retries(1, 10, now=0)
+        assert not worker.is_alive()
+        assert errors == []
+        assert saved["camera_id"] == CAM_B
+        assert saved["thumbnail_path"] is None
+        assert [job["camera_id"] for job in jobs] == [CAM_B]
+    finally:
+        release_upsert.set()
+        worker.join(timeout=5)
+        store.close()
+
+
 def test_reingest_does_not_bypass_retry_backoff(tmp_path):
     store = Store(tmp_path / "data")
     store.set_camera_mapping("LOC1", CAM_A, "Register")

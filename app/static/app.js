@@ -278,15 +278,19 @@ $("#save-mapping").addEventListener("click", async () => {
 
 // ---------------------------------------------------------------- transactions
 
-function transactionViewIsVisible() {
+function transactionRefreshAllowed() {
+  // Refresh whenever the operator is logged in and the browser tab is
+  // visible — including while the Settings section is open — so the feed is
+  // always current the moment they switch back. Paging into history
+  // (offset > 0) still pauses refresh so rows cannot shift underfoot.
   return document.visibilityState === "visible" &&
-    !$("#nav").hidden && !$("#view-transactions").hidden;
+    !$("#nav").hidden && transactionOffset === 0;
 }
 
 function refreshTransactionsIfVisible() {
   // Offset pages would shift when new sales arrive. Keep older pages stable;
   // returning to the newest page resumes the normal live refresh.
-  if (transactionViewIsVisible() && transactionOffset === 0) loadTransactions();
+  if (transactionRefreshAllowed()) void loadTransactions({ reset: true });
 }
 
 function startTransactionRefresh() {

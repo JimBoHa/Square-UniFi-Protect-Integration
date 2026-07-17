@@ -399,6 +399,11 @@ def test_transaction_feed_refresh_is_visibility_aware_and_non_overlapping():
     html = (static_dir / "index.html").read_text()
     assert "TRANSACTION_REFRESH_MS" in js
     assert 'document.visibilityState === "visible"' in js
+    # The 15-second refresh must keep running while the Settings section is
+    # open; only browser-tab visibility, login state, and history paging gate
+    # it — never the active app section.
+    assert "transactionRefreshAllowed" in js
+    assert '!$("#view-transactions").hidden' not in js
     assert "transactionLoadInFlight" in js
     assert "payload !== lastTransactionPayload" in js
     assert 'id="txn-last-updated"' in html

@@ -4,9 +4,15 @@ import json
 import sqlite3
 
 from app.store import Store
-from app.sync import ingest_payment, parse_ts_ms, sync_payments
+from app.sync import (
+    ingest_payment,
+    parse_ts_ms,
+    retry_missing_thumbnails,
+    sync_payments,
+)
 
 CAMERA_ID = "cam1aaaaaaaaaaaaaaaaaaaaa"
+CAMERA_B = "cam2bbbbbbbbbbbbbbbbbbbbb"
 
 
 class _ProtectStub:
@@ -37,8 +43,10 @@ def _payment(
     location_id: str,
     card_last4: str,
     receipt_url: str,
+    device_id: str = "",
+    device_name: str = "",
 ) -> dict:
-    return {
+    payment = {
         "id": "PAY_VERSIONED",
         "created_at": "2026-07-16T15:00:00.000Z",
         "updated_at": updated_at,
@@ -49,6 +57,12 @@ def _payment(
         "receipt_url": receipt_url,
         "version_marker": status.lower(),
     }
+    if device_id or device_name:
+        payment["device_details"] = {
+            "device_id": device_id,
+            "device_name": device_name,
+        }
+    return payment
 
 
 def test_newer_payment_refreshes_all_mutable_fields(tmp_path):
@@ -88,9 +102,151 @@ def test_newer_payment_refreshes_all_mutable_fields(tmp_path):
     assert stored["location_id"] == "LOC_NEW"
     assert stored["card_last4"] == "2222"
     assert stored["receipt_url"] == "https://square.example/completed"
-    assert stored["camera_id"] == CAMERA_ID
-    assert stored["thumbnail_path"] == "PAY_VERSIONED.jpg"
+    # The corrected location has no camera mapping, so evidence from the old
+    # location must no longer be presented as belonging to this payment.
+    assert stored["camera_id"] is None
+    assert stored["thumbnail_path"] is None
     assert json.loads(stored["raw"]) == completed
+
+
+def test_newer_device_correction_requeues_camera_evidence(tmp_path):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC_OLD", CAMERA_ID, "Location fallback")
+    store.set_camera_mapping(
+        "LOC_OLD",
+        CAMERA_B,
+        "Register B camera",
+        device_id="TERM_B",
+        device_name="Register B",
+    )
+    fallback_payment = _payment(
+        "2026-07-16T15:01:00.000Z",
+        amount=500,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/original",
+    )
+    corrected_device = _payment(
+        "2026-07-16T15:02:00.000Z",
+        amount=500,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/corrected",
+        device_id="TERM_B",
+        device_name="Register B",
+    )
+
+    try:
+        ingest_payment(store, fallback_payment, protect=_ProtectStub())
+        original = store.get_transaction("PAY_VERSIONED")
+        assert original["camera_id"] == CAMERA_ID
+        assert original["thumbnail_path"] == "PAY_VERSIONED.jpg"
+
+        # Webhooks persist without a Protect client; the durable queue must
+        # replace the fallback evidence on its background pass.
+        ingest_payment(store, corrected_device, protect=None)
+        queued = store.get_transaction("PAY_VERSIONED")
+        assert queued["device_id"] == "TERM_B"
+        assert queued["camera_id"] == CAMERA_B
+        assert queued["thumbnail_path"] is None
+
+        assert retry_missing_thumbnails(store, _ProtectStub(), now=0) == 1
+        corrected = store.get_transaction("PAY_VERSIONED")
+        image = (store.thumbnail_dir / corrected["thumbnail_path"]).read_bytes()
+    finally:
+        store.close()
+
+    assert corrected["camera_id"] == CAMERA_B
+    assert image == f"snapshot:{CAMERA_B}:{corrected['ts_ms']}".encode()
+
+
+def test_newer_location_correction_recaptures_camera_evidence(tmp_path):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC_OLD", CAMERA_ID, "Old location")
+    store.set_camera_mapping("LOC_NEW", CAMERA_B, "Corrected location")
+    original = _payment(
+        "2026-07-16T15:01:00.000Z",
+        amount=500,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/original",
+    )
+    corrected = _payment(
+        "2026-07-16T15:02:00.000Z",
+        amount=500,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_NEW",
+        card_last4="1111",
+        receipt_url="https://square.example/corrected",
+    )
+
+    try:
+        ingest_payment(store, original, protect=_ProtectStub())
+        ingest_payment(store, corrected, protect=_ProtectStub())
+        stored = store.get_transaction("PAY_VERSIONED")
+        image = (store.thumbnail_dir / stored["thumbnail_path"]).read_bytes()
+    finally:
+        store.close()
+
+    assert stored["location_id"] == "LOC_NEW"
+    assert stored["camera_id"] == CAMERA_B
+    assert image == f"snapshot:{CAMERA_B}:{stored['ts_ms']}".encode()
+
+
+def test_stale_device_correction_cannot_replace_camera_evidence(tmp_path):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC_OLD", CAMERA_ID, "Location fallback")
+    store.set_camera_mapping(
+        "LOC_OLD",
+        CAMERA_B,
+        "Register B camera",
+        device_id="TERM_B",
+        device_name="Register B",
+    )
+    accepted = _payment(
+        "2026-07-16T15:02:00.000Z",
+        amount=500,
+        currency="USD",
+        status="COMPLETED",
+        location_id="LOC_OLD",
+        card_last4="1111",
+        receipt_url="https://square.example/accepted",
+    )
+    stale = _payment(
+        "2026-07-16T15:01:00.000Z",
+        amount=400,
+        currency="USD",
+        status="PENDING",
+        location_id="LOC_OLD",
+        card_last4="2222",
+        receipt_url="https://square.example/stale",
+        device_id="TERM_B",
+        device_name="Register B",
+    )
+
+    class UnexpectedProtectCall:
+        def get_snapshot(self, camera_id, ts_ms=None):
+            raise AssertionError("stale versions must not request new evidence")
+
+    try:
+        ingest_payment(store, accepted, protect=_ProtectStub())
+        before = store.get_transaction("PAY_VERSIONED")
+        before_image = (store.thumbnail_dir / before["thumbnail_path"]).read_bytes()
+        ingest_payment(store, stale, protect=UnexpectedProtectCall())
+        after = store.get_transaction("PAY_VERSIONED")
+        after_image = (store.thumbnail_dir / after["thumbnail_path"]).read_bytes()
+    finally:
+        store.close()
+
+    assert after == before
+    assert after_image == before_image
 
 
 def test_older_payment_update_cannot_regress_state(tmp_path):

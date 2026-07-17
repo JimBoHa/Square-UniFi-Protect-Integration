@@ -65,10 +65,39 @@ def _ingest_payment_with_status(
     txn["updated_ts_ms"] = parse_ts_ms(txn["updated_at"])
 
     existing = store.get_transaction(txn["id"])
-    if existing and not txn["device_id"]:
+    stale_event = bool(
+        existing and txn["updated_ts_ms"] < existing["updated_ts_ms"]
+    )
+    incoming_location_id = txn["location_id"]
+    incoming_device_id = txn["device_id"]
+    source_changed = bool(
+        existing
+        and not stale_event
+        and (
+            (
+                incoming_location_id
+                and incoming_location_id != existing.get("location_id", "")
+            )
+            or (
+                incoming_device_id
+                and incoming_device_id != existing.get("device_id", "")
+            )
+        )
+    )
+
+    if existing and stale_event:
+        # Keep even the in-memory mapping decision on the accepted version.
+        # The database version gate also rejects every stale mutable field.
+        txn["location_id"] = existing.get("location_id", "")
         txn["device_id"] = existing.get("device_id", "")
-        if not txn["device_name"]:
-            txn["device_name"] = existing.get("device_name", "")
+        txn["device_name"] = existing.get("device_name", "")
+    elif existing:
+        if not txn["location_id"]:
+            txn["location_id"] = existing.get("location_id", "")
+        if not txn["device_id"]:
+            txn["device_id"] = existing.get("device_id", "")
+            if not txn["device_name"]:
+                txn["device_name"] = existing.get("device_name", "")
 
     mapping = store.camera_for_location(txn["location_id"], txn["device_id"])
     txn["camera_id"] = mapping["camera_id"] if mapping else None
@@ -76,29 +105,28 @@ def _ingest_payment_with_status(
 
     # A stale out-of-order event is ignored by the versioned upsert, so it must
     # not overwrite the on-disk thumbnail with a wrong-time frame either.
-    stale_event = bool(existing and txn["updated_ts_ms"] < existing["updated_ts_ms"])
     ts_unchanged = bool(existing and existing["ts_ms"] == txn["ts_ms"])
 
     if (
         existing
         and existing.get("camera_id")
         and existing.get("thumbnail_path")
-        and (ts_unchanged or stale_event)
+        and (stale_event or (ts_unchanged and not source_changed))
     ):
-        # Camera and thumbnail form one historical evidence record. A later
-        # location remap applies to new/missing evidence, never to this pair.
+        # Sparse updates and later mapping edits cannot silently move accepted
+        # historical evidence. Missing evidence can still adopt a remap.
         txn["camera_id"] = existing["camera_id"]
         txn["thumbnail_path"] = existing["thumbnail_path"]
     elif (
         protect is not None
         and txn["camera_id"]
         and not stale_event
-        and (existing is None or not ts_unchanged)
+        and (existing is None or not ts_unchanged or source_changed)
     ):
-        # Capture inline only for brand-new transactions or corrected sale
-        # times. Existing misses belong to the durable retry queue; fetching
-        # them here would bypass its next_attempt_at backoff on every Square
-        # overlap page.
+        # Capture inline only for brand-new transactions or authoritative
+        # evidence corrections. Existing misses belong to the durable retry
+        # queue; fetching them here would bypass its next_attempt_at backoff
+        # on every Square overlap page.
         try:
             image = protect.get_snapshot(txn["camera_id"], ts_ms=txn["ts_ms"])
             name = safe_thumbnail_name(txn["id"])
@@ -107,7 +135,7 @@ def _ingest_payment_with_status(
         except _THUMBNAIL_ERRORS as exc:
             logger.warning("Thumbnail capture failed for %s: %s", txn["id"], exc)
 
-    return txn, store.upsert_transaction(txn)
+    return txn, store.upsert_transaction(txn, replace_evidence=source_changed)
 
 
 def ingest_payment(

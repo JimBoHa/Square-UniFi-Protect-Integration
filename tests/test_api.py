@@ -529,10 +529,17 @@ def _wait_for_alarm_state(
 
 
 def _wait_for_protect_jobs(client, timeout: float = 3.0) -> None:
+    """Wait until every scheduled Protect work drain has finished."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not client.app.state.thumbnail_jobs:
-            return
+        if not client.app.state.thumbnail_drain_queued:
+            # The single-worker executor serializes drains; once this no-op
+            # barrier runs, all previously scheduled drains have completed.
+            client.app.state.thumbnail_executor.submit(lambda: None).result(
+                timeout=timeout
+            )
+            if not client.app.state.thumbnail_drain_queued:
+                return
         time.sleep(0.01)
     raise AssertionError("webhook Protect work did not finish")
 

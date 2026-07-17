@@ -604,6 +604,9 @@ def test_store_upgrades_configured_alarm_without_watermark(tmp_path):
 
 def test_alarm_retry_runs_when_square_listing_fails(tmp_path):
     class UnavailableSquare:
+        def list_locations(self):
+            raise RuntimeError("Square unavailable")
+
         def list_payments(self, **_kwargs):
             raise RuntimeError("Square unavailable")
 
@@ -630,9 +633,10 @@ def test_alarm_retry_runs_when_square_listing_fails(tmp_path):
                 protect,
                 alarm_trigger_id="square.completed",
             )
+        # The alarm batch drains oldest-first even though Square failed.
         assert store.get_transaction("PAY_RETRY_DURING_OUTAGE_1")["alarm_state"] == "sent"
-        assert store.get_transaction("PAY_RETRY_DURING_OUTAGE_2")["alarm_state"] == "idle"
-        assert len(protect.timeouts) == 1
+        assert store.get_transaction("PAY_RETRY_DURING_OUTAGE_2")["alarm_state"] == "sent"
+        assert len(protect.timeouts) == 2
         assert 0 < protect.timeouts[0] <= 5
     finally:
         store.close()

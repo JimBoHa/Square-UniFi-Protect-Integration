@@ -290,6 +290,9 @@ def test_store_migrates_legacy_transaction_schema_without_data_loss(tmp_path):
         "updated_ts_ms": ts_ms,
         "device_id": "",
         "device_name": "",
+        "alarm_state": "sent",
+        "alarm_claim_token": None,
+        "alarm_claimed_at": None,
     }
 
 

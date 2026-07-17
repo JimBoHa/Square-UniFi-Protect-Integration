@@ -8,9 +8,16 @@ cd "$(dirname "$0")"
 if [ ! -x .venv/bin/python ]; then
   echo "First run: setting up the Python environment (about a minute)..."
   python3 -m venv .venv
-  .venv/bin/pip install --quiet --upgrade pip
-  .venv/bin/pip install --quiet -e .
 fi
+
+if ! .venv/bin/python -c 'import cryptography, fastapi, httpx, uvicorn' >/dev/null 2>&1; then
+  echo "Installing or repairing Python dependencies (about a minute)..."
+  .venv/bin/python -m pip install --quiet --upgrade pip
+  .venv/bin/python -m pip install --quiet -e .
+fi
+
+# Lets automated checks verify setup without starting a browser or server.
+[ "${SPI_LAUNCHER_SETUP_ONLY:-0}" = "1" ] && exit 0
 
 PORT="${SPI_PORT:-8000}"
 export SPI_DATA_DIR="${SPI_DATA_DIR:-$PWD/data}"

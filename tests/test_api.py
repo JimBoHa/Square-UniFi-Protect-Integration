@@ -17,6 +17,11 @@ from app.sync import enrich_transaction_thumbnail, ingest_payment
 
 from .conftest import (
     ADMIN_PASSWORD,
+    PROTECT_ALARM_CALLS,
+    PROTECT_ALARM_RESPONSES,
+    PROTECT_ALARM_TRIGGER_ID,
+    PROTECT_API_KEY,
+    PROTECT_META_KEYS,
     PROTECT_PASS,
     PROTECT_USER,
     SQUARE_TOKEN,
@@ -79,6 +84,84 @@ def test_protect_settings_success(authed):
     assert resp.status_code == 200
     assert resp.json()["cameras"] == 2
     assert authed.get("/api/status").json()["protect_configured"] is True
+
+def test_protect_alarm_settings_verify_and_encrypt_api_key(authed, tmp_path):
+    bad = authed.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.1",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+            "api_key": "wrong-api-key",
+            "alarm_trigger_id": PROTECT_ALARM_TRIGGER_ID,
+        },
+    )
+    assert bad.status_code == 401
+    assert authed.app.state.store.get_setting("protect.api_key") is None
+
+    good = authed.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.1",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+            "api_key": PROTECT_API_KEY,
+            "alarm_trigger_id": PROTECT_ALARM_TRIGGER_ID,
+        },
+    )
+    assert good.status_code == 200
+    assert good.json()["alarm_configured"] is True
+    assert PROTECT_META_KEYS == ["wrong-api-key", PROTECT_API_KEY]
+    assert authed.app.state.store.get_setting("protect.api_key") == PROTECT_API_KEY
+    assert (
+        authed.app.state.store.get_setting("protect.alarm_trigger_id")
+        == PROTECT_ALARM_TRIGGER_ID
+    )
+    assert PROTECT_API_KEY.encode() not in (tmp_path / "data" / "spi.db").read_bytes()
+
+    PROTECT_META_KEYS.clear()
+    preserved = authed.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.1",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+        },
+    )
+    assert preserved.status_code == 200
+    assert preserved.json()["alarm_configured"] is True
+    assert PROTECT_META_KEYS == [PROTECT_API_KEY]
+
+def test_protect_alarm_settings_can_be_disabled(authed):
+    _enable_alarm(authed)
+
+    resp = authed.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.1",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+            "disable_alarm": True,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["alarm_configured"] is False
+    assert authed.app.state.store.get_setting("protect.api_key") is None
+    assert authed.app.state.store.get_setting("protect.alarm_trigger_id") is None
+
+def test_protect_settings_reject_malformed_alarm_trigger(authed):
+    resp = authed.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.1",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+            "api_key": PROTECT_API_KEY,
+            "alarm_trigger_id": "../trigger?all=true",
+        },
+    )
+    assert resp.status_code == 422
+    assert PROTECT_META_KEYS == []
 
 def test_square_settings_validates_token(authed):
     resp = authed.put(
@@ -187,7 +270,9 @@ def _webhook_signature(body: bytes) -> str:
         hmac.new(WEBHOOK_KEY.encode(), WEBHOOK_URL.encode() + body, hashlib.sha256).digest()
     ).decode()
 
-def make_webhook_event(payment_id: str = "PAY_HOOK") -> bytes:
+def make_webhook_event(
+    payment_id: str = "PAY_HOOK", status: str = "COMPLETED"
+) -> bytes:
     return json.dumps(
         {
             "type": "payment.updated",
@@ -197,7 +282,7 @@ def make_webhook_event(payment_id: str = "PAY_HOOK") -> bytes:
                         "id": payment_id,
                         "created_at": "2026-07-16T16:00:00.000Z",
                         "amount_money": {"amount": 500, "currency": "USD"},
-                        "status": "COMPLETED",
+                        "status": status,
                         "location_id": "LOC1",
                         "card_details": {"card": {"last_4": "9999"}},
                     }
@@ -440,6 +525,85 @@ def test_webhook_thumbnail_queue_is_bounded(tmp_path, monkeypatch):
     finally:
         release_snapshots.set()
         app.state.store.close()
+
+def _enable_alarm(client):
+    resp = client.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.1",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+            "api_key": PROTECT_API_KEY,
+            "alarm_trigger_id": PROTECT_ALARM_TRIGGER_ID,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+def test_completed_payments_trigger_once_across_sync_and_webhook(configured):
+    _enable_alarm(configured)
+
+    assert configured.post("/api/sync").status_code == 200
+    assert PROTECT_ALARM_CALLS == [
+        PROTECT_ALARM_TRIGGER_ID,
+        PROTECT_ALARM_TRIGGER_ID,
+    ]
+    assert configured.post("/api/sync").status_code == 200
+
+    body = make_webhook_event("PAY_001")
+    resp = configured.post(
+        "/webhooks/square",
+        content=body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+    )
+    assert resp.status_code == 200
+    assert PROTECT_ALARM_CALLS == [
+        PROTECT_ALARM_TRIGGER_ID,
+        PROTECT_ALARM_TRIGGER_ID,
+    ]
+
+def test_enabling_alarm_does_not_replay_existing_completed_sales(configured):
+    assert configured.post("/api/sync").status_code == 200
+    _enable_alarm(configured)
+
+    assert configured.post("/api/sync").status_code == 200
+    assert PROTECT_ALARM_CALLS == []
+
+def test_pending_payment_triggers_when_it_becomes_completed(configured):
+    _enable_alarm(configured)
+
+    pending = make_webhook_event("PAY_TRANSITION", status="PENDING")
+    assert configured.post(
+        "/webhooks/square",
+        content=pending,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(pending)},
+    ).status_code == 200
+    assert PROTECT_ALARM_CALLS == []
+
+    completed = make_webhook_event("PAY_TRANSITION", status="COMPLETED")
+    assert configured.post(
+        "/webhooks/square",
+        content=completed,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(completed)},
+    ).status_code == 200
+    assert PROTECT_ALARM_CALLS == [PROTECT_ALARM_TRIGGER_ID]
+
+def test_alarm_failure_persists_transaction_and_retries(configured):
+    _enable_alarm(configured)
+    PROTECT_ALARM_RESPONSES.extend([500, 204])
+    body = make_webhook_event("PAY_RETRY")
+    headers = {"x-square-hmacsha256-signature": _webhook_signature(body)}
+
+    assert configured.post("/webhooks/square", content=body, headers=headers).status_code == 200
+    transaction = configured.app.state.store.get_transaction("PAY_RETRY")
+    assert transaction is not None
+    assert transaction["alarm_state"] == "idle"
+
+    assert configured.post("/api/sync").status_code == 200
+    assert configured.app.state.store.get_transaction("PAY_RETRY")["alarm_state"] == "sent"
+    assert len(PROTECT_ALARM_CALLS) == 4
+
+    assert configured.post("/webhooks/square", content=body, headers=headers).status_code == 200
+    assert len(PROTECT_ALARM_CALLS) == 4
 
 def test_webhook_ignores_non_payment_events(configured):
     body = json.dumps({"type": "inventory.count.updated", "data": {}}).encode()

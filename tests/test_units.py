@@ -3,14 +3,24 @@
 import base64
 import hashlib
 import hmac
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
 
 from app.deeplink import build_deep_link
-from app.protect_client import ProtectAuthError, ProtectClient, validate_camera_id, validate_host
+from app.protect_client import (
+    ProtectAuthError,
+    ProtectClient,
+    ProtectError,
+    validate_alarm_trigger_id,
+    validate_camera_id,
+    validate_host,
+)
 from app.security import CredentialCipher, hash_password, verify_password
 from app.square_client import SquareClient, verify_webhook_signature
+from app.store import Store
 from app.sync import parse_ts_ms, safe_thumbnail_name
 
 from .conftest import PROTECT_PASS, PROTECT_USER, protect_handler
@@ -79,6 +89,17 @@ def test_validate_camera_id_accepts(cam):
 def test_validate_camera_id_rejects(cam):
     with pytest.raises(ValueError):
         validate_camera_id(cam)
+
+@pytest.mark.parametrize("trigger_id", ["sale", "Square_Sale-01", "A" * 64])
+def test_validate_alarm_trigger_id_accepts_safe_path_segment(trigger_id):
+    assert validate_alarm_trigger_id(trigger_id) == trigger_id
+
+@pytest.mark.parametrize(
+    "trigger_id", ["", "../sale", "sale/other", "sale?all=1", "sale space", "A" * 65]
+)
+def test_validate_alarm_trigger_id_rejects_unsafe_path_segment(trigger_id):
+    with pytest.raises(ValueError):
+        validate_alarm_trigger_id(trigger_id)
 
 
 # -- deep links -----------------------------------------------------------------
@@ -183,6 +204,146 @@ def test_protect_relogin_on_expired_session():
     cameras = client.get_cameras()
     assert cameras[0]["id"] == "cam9"
     client.close()
+
+def test_protect_official_api_uses_key_without_legacy_login():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, request.headers.get("x-api-key")))
+        if request.url.path.endswith("/meta/info"):
+            return httpx.Response(200, json={"applicationVersion": "7.1.87"})
+        return httpx.Response(204)
+
+    client = ProtectClient(
+        "u.local",
+        "legacy-user",
+        "legacy-pass",
+        api_key="api-key",
+        transport=httpx.MockTransport(handler),
+    )
+    assert client.get_integration_info() == {"applicationVersion": "7.1.87"}
+    client.trigger_alarm("square-sale")
+    client.close()
+
+    assert requests == [
+        (
+            "GET",
+            "/proxy/protect/integration/v1/meta/info",
+            "api-key",
+        ),
+        (
+            "POST",
+            "/proxy/protect/integration/v1/alarm-manager/webhook/square-sale",
+            "api-key",
+        ),
+    ]
+
+def test_protect_official_api_does_not_accept_redirect_as_success():
+    client = ProtectClient(
+        "u.local",
+        "legacy-user",
+        "legacy-pass",
+        api_key="api-key",
+        transport=httpx.MockTransport(lambda request: httpx.Response(302)),
+    )
+    with pytest.raises(ProtectError):
+        client.trigger_alarm("square-sale")
+    client.close()
+
+
+# -- Store alarm state -------------------------------------------------------------
+
+def _transaction(txn_id: str, status: str = "COMPLETED") -> dict:
+    return {
+        "id": txn_id,
+        "created_at": "2026-07-16T15:30:00Z",
+        "ts_ms": 1784215800000,
+        "amount": 100,
+        "currency": "USD",
+        "status": status,
+    }
+
+def test_alarm_claim_is_atomic_and_terminal_after_success(tmp_path):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    second_store = Store(data_dir)
+    try:
+        store.upsert_transaction(_transaction("PAY1"))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            claims = list(
+                executor.map(
+                    lambda candidate: candidate.claim_alarm_trigger("PAY1"),
+                    (store, second_store),
+                )
+            )
+        assert sum(bool(claim) for claim in claims) == 1
+        claim_token = next(claim for claim in claims if claim)
+        assert store.mark_alarm_sent("PAY1", claim_token) is True
+        assert store.claim_alarm_trigger("PAY1") is None
+        assert second_store.claim_alarm_trigger("PAY1") is None
+    finally:
+        second_store.close()
+        store.close()
+
+def test_store_startup_releases_abandoned_alarm_claim(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    store.upsert_transaction(_transaction("PAY1"))
+    assert store.claim_alarm_trigger("PAY1") is not None
+    store.close()
+
+    monkeypatch.setattr("app.store.time.time", lambda: 10_000_000_000)
+    reopened = Store(data_dir)
+    try:
+        assert reopened.get_transaction("PAY1")["alarm_state"] == "idle"
+        assert reopened.claim_alarm_trigger("PAY1") is not None
+    finally:
+        reopened.close()
+
+def test_store_startup_does_not_steal_live_alarm_claim(tmp_path):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    store.upsert_transaction(_transaction("PAY1"))
+    claim_token = store.claim_alarm_trigger("PAY1")
+    assert claim_token is not None
+
+    second_store = Store(data_dir)
+    try:
+        assert second_store.get_transaction("PAY1")["alarm_state"] == "in_progress"
+        assert second_store.claim_alarm_trigger("PAY1") is None
+        assert store.mark_alarm_sent("PAY1", claim_token) is True
+    finally:
+        second_store.close()
+        store.close()
+
+def test_store_migrates_alarm_state_without_replaying_completed_rows(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db = sqlite3.connect(data_dir / "spi.db")
+    db.execute(
+        "CREATE TABLE transactions ("
+        "id TEXT PRIMARY KEY, created_at TEXT NOT NULL, ts_ms INTEGER NOT NULL, "
+        "amount INTEGER NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL, "
+        "location_id TEXT NOT NULL DEFAULT '', card_last4 TEXT NOT NULL DEFAULT '', "
+        "receipt_url TEXT NOT NULL DEFAULT '', camera_id TEXT, thumbnail_path TEXT, "
+        "raw TEXT NOT NULL DEFAULT '{}')"
+    )
+    db.execute(
+        "INSERT INTO transactions "
+        "(id, created_at, ts_ms, amount, currency, status) VALUES (?, ?, ?, ?, ?, ?)",
+        ("OLD", "2026-07-16T15:30:00Z", 1, 100, "USD", "COMPLETED"),
+    )
+    db.commit()
+    db.close()
+
+    store = Store(data_dir)
+    try:
+        assert store.get_transaction("OLD")["alarm_state"] == "sent"
+        assert store.claim_alarm_trigger("OLD") is None
+        store.upsert_transaction(_transaction("NEW"))
+        assert store.claim_alarm_trigger("NEW") is not None
+    finally:
+        store.close()
 
 
 # -- Square client -------------------------------------------------------------------

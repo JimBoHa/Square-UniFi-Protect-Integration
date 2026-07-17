@@ -44,6 +44,10 @@
         <label>Username <input id="protect-username" autocomplete="off" required></label>
         <label>Password <input type="password" id="protect-password" required></label>
         <label class="check"><input type="checkbox" id="protect-verify-ssl"> Verify TLS certificate</label>
+        <label>Protect API key (optional) <input type="password" id="protect-api-key" autocomplete="off" placeholder="Leave blank to keep current key"></label>
+        <label>Alarm Manager trigger ID (optional) <input id="protect-alarm-trigger-id" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}" placeholder="Leave blank to keep current ID"></label>
+        <label class="check"><input type="checkbox" id="protect-disable-alarm"> Disable and remove saved alarm settings</label>
+        <p class="hint">To trigger a Protect alarm for each completed sale, configure an Alarm Manager webhook trigger with the same ID.</p>
         <button type="submit">Connect Protect</button>
       </form>
 

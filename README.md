@@ -15,6 +15,9 @@ transaction in one click.
   sandbox); the integration verifies it against the Square API before saving.
 - **Connect your UniFi Protect console** — local-account credentials for your
   UniFi OS console (Dream Machine, NVR, etc.), verified on save.
+- **Trigger Protect alarms for completed sales (optional)** — use a Protect API
+  key and matching Alarm Manager webhook trigger ID to run notifications or
+  Protect automations whenever Square marks a payment completed.
 - **Choose the POS camera** — for each Square location, pick which Protect
   camera watches the register, with a live snapshot preview.
 - **Transaction feed** — payments appear with timestamp, amount, card last-4,
@@ -38,6 +41,11 @@ Open `http://<host>:8000`, then:
 1. **Create the admin password** (first run only).
 2. **Settings → UniFi Protect console** — host/IP of your console plus a local
    Protect user's credentials (a dedicated view-only local user is recommended).
+   To trigger an alarm for completed sales, also create a key under UniFi Site
+   Manager → Settings → API Keys and enter it with the ID of a matching Alarm
+   Manager webhook trigger. The key is verified against Protect's official local
+   integration API before it is saved. Leave alarm fields blank to retain saved
+   values, or use the disable checkbox to remove them.
 3. **Settings → Square account** — a Square access token
    (Developer Dashboard → your application → Credentials). Optionally add your
    webhook signature key and notification URL for real-time ingestion
@@ -67,11 +75,20 @@ the `deep_link_template` key in the settings table; the default is
 > older versions ignore it and return a live frame. Webhook-ingested
 > transactions are captured within seconds of the sale either way.
 
+> **Alarm delivery semantics:** each completed transaction is atomically claimed
+> and marked delivered after Protect accepts the trigger. Failed requests are
+> released for retry by the next poll or duplicate webhook. On startup and retry
+> scans, expired in-progress claims are also released. If a request times out or the
+> process crashes after Protect accepts a trigger but before delivery state is
+> saved, that sale can trigger the alarm again; the Protect endpoint does not
+> provide an idempotency key. Completed sales already stored when alarms are first
+> enabled are marked handled rather than replayed as a historical burst.
+
 ## Security
 
 - **Secrets encrypted at rest** — the Square access token, webhook signature
-  key, and Protect password are Fernet-encrypted in SQLite; the key file is
-  created `0600`.
+  key, Protect password, and Protect API key are Fernet-encrypted in SQLite;
+  the key file is created `0600`.
 - **Admin password** hashed with scrypt; login is throttled after repeated
   failures; sessions are random 256-bit tokens in `HttpOnly`/`SameSite` cookies.
 - **Webhooks verified** — Square's `x-square-hmacsha256-signature` is checked
@@ -88,7 +105,7 @@ from the internet; everything else can stay LAN-only.
 ## Development
 
 ```bash
-.venv/bin/python -m pytest        # 91 functional + security tests
+.venv/bin/python -m pytest
 ```
 
 Tests run against mocked Square and UniFi Protect APIs — no hardware or Square

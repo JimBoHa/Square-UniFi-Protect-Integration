@@ -39,6 +39,7 @@ logger = logging.getLogger("spi")
 SESSION_COOKIE = "spi_session"
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
+SQUARE_WEBHOOK_MAX_BODY_BYTES = 1024 * 1024
 PROTECT_SETTING_KEYS = (
     "protect.host",
     "protect.username",
@@ -573,13 +574,35 @@ def create_app(
 
     # -- Square webhook (unauthenticated; HMAC-verified) ---------------------------
 
+    async def read_square_webhook_body(request: Request) -> bytes:
+        """Read exact HMAC input while enforcing the 1 MiB webhook limit."""
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid Content-Length")
+            if declared_length < 0:
+                raise HTTPException(status_code=400, detail="Invalid Content-Length")
+            if declared_length > SQUARE_WEBHOOK_MAX_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="Webhook payload too large")
+
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > SQUARE_WEBHOOK_MAX_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="Webhook payload too large")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
     @app.post("/webhooks/square")
     async def square_webhook(request: Request) -> JSONResponse:
         signature_key = store.get_setting("square.webhook_signature_key")
         webhook_url = store.get_setting("square.webhook_url")
         if not signature_key or not webhook_url:
             raise HTTPException(status_code=403, detail="Webhook not configured")
-        body = await request.body()
+        body = await read_square_webhook_body(request)
         signature = request.headers.get("x-square-hmacsha256-signature", "")
         if not verify_webhook_signature(signature_key, webhook_url, body, signature):
             raise HTTPException(status_code=401, detail="Invalid webhook signature")

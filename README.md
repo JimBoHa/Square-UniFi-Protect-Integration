@@ -128,7 +128,8 @@ Protect 7.1.87) is
   failures; sessions are random 256-bit tokens in `HttpOnly`/`SameSite` cookies.
 - **Webhooks verified** — Square's `x-square-hmacsha256-signature` is checked
   with a constant-time comparison; unsigned or forged deliveries are rejected,
-  and the endpoint is disabled until a signature key is configured.
+  request bodies are capped at 1 MiB, and the endpoint is disabled until a
+  signature key is configured.
 - **Input validation** — Protect host and camera ids are strictly validated
   (no URL/path injection), thumbnail serving is confined to the thumbnail
   directory, and the frontend renders all server data as text, never markup.

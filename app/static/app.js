@@ -141,6 +141,7 @@ $("#square-form").addEventListener("submit", async (e) => {
         environment: $("#square-env").value,
         webhook_signature_key: $("#square-webhook-key").value.trim(),
         webhook_url: $("#square-webhook-url").value.trim(),
+        clear_webhook: $("#square-clear-webhook").checked,
       }),
     });
     $("#square-token").value = "";

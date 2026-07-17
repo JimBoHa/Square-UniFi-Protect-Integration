@@ -398,6 +398,29 @@ def test_webhook_ingests_payment_with_thumbnail(configured):
     assert txns[0]["thumbnail_url"] is not None
     assert txns[0]["deep_link"] is not None
 
+def test_square_settings_resave_leaves_webhook_config_untouched(configured):
+    store = configured.app.state.store
+    resp = configured.put(
+        "/api/settings/square",
+        json={"access_token": SQUARE_TOKEN, "environment": "production"},
+    )
+    assert resp.status_code == 200
+    assert store.get_setting("square.webhook_signature_key") == WEBHOOK_KEY
+    assert store.get_setting("square.webhook_url") == WEBHOOK_URL
+
+def test_square_settings_rejects_clear_webhook_with_new_credentials(configured):
+    resp = configured.put(
+        "/api/settings/square",
+        json={
+            "access_token": SQUARE_TOKEN,
+            "environment": "production",
+            "webhook_signature_key": WEBHOOK_KEY,
+            "webhook_url": WEBHOOK_URL,
+            "clear_webhook": True,
+        },
+    )
+    assert resp.status_code == 422
+
 def test_square_settings_can_disable_existing_webhook(configured):
     store = configured.app.state.store
     assert store.get_setting("square.webhook_signature_key") == WEBHOOK_KEY
@@ -405,7 +428,7 @@ def test_square_settings_can_disable_existing_webhook(configured):
 
     resp = configured.put(
         "/api/settings/square",
-        json={"access_token": SQUARE_TOKEN, "environment": "production"},
+        json={"access_token": SQUARE_TOKEN, "environment": "production", "clear_webhook": True},
     )
     assert resp.status_code == 200
     assert store.get_setting("square.webhook_signature_key") is None

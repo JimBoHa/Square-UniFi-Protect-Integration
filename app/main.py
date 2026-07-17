@@ -59,6 +59,7 @@ class SquareSettingsBody(BaseModel):
     environment: str = "production"
     webhook_signature_key: str = ""
     webhook_url: str = ""
+    clear_webhook: bool = False
 
 class CameraMappingEntry(BaseModel):
     location_id: str = Field(min_length=1, max_length=64)
@@ -247,6 +248,11 @@ def create_app(
                 status_code=422,
                 detail="Webhook signature key and notification URL must be provided together",
             )
+        if body.clear_webhook and body.webhook_signature_key:
+            raise HTTPException(
+                status_code=422,
+                detail="clear_webhook cannot be combined with new webhook credentials",
+            )
         client = SquareClient(
             body.access_token, environment=body.environment, transport=square_transport
         )
@@ -280,10 +286,12 @@ def create_app(
                 "square.webhook_signature_key", body.webhook_signature_key, secret=True
             )
             store.set_setting("square.webhook_url", body.webhook_url)
-        else:
+        elif body.clear_webhook:
             store.delete_settings(
                 "square.webhook_signature_key", "square.webhook_url"
             )
+        # Blank webhook fields without clear_webhook leave any stored webhook
+        # configuration untouched, so re-saving the access token is safe.
         return {"ok": True, "locations": locations}
 
     # -- cameras & mapping ------------------------------------------------------

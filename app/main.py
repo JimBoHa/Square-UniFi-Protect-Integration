@@ -6,9 +6,11 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -86,6 +88,15 @@ def create_app(
     app.state.store = store
     app.state.login_failures: dict[str, list[float]] = {}
     app.state.login_lock = threading.Lock()
+    # Single worker draining the durable thumbnail-retry queue: webhooks ack
+    # before any Protect I/O and just nudge this drain, which the queue's
+    # leases and backoff keep bounded and evidence-safe.
+    thumbnail_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="spi-thumbnail-drain"
+    )
+    drain_state_lock = threading.Lock()
+    app.state.thumbnail_executor = thumbnail_executor
+    app.state.thumbnail_drain_queued = False
 
     cookie_secure = os.environ.get("SPI_COOKIE_SECURE", "0") == "1"
     if enable_poller is None:
@@ -116,6 +127,39 @@ def create_app(
             environment=store.get_setting("square.environment") or "production",
             transport=square_transport,
         )
+
+    def drain_thumbnail_queue() -> None:
+        with drain_state_lock:
+            app.state.thumbnail_drain_queued = False
+        protect = build_protect()
+        if protect is None:
+            return
+        try:
+            sync.retry_missing_thumbnails(store, protect)
+        except Exception:
+            logger.exception("Thumbnail queue drain failed")
+        finally:
+            try:
+                protect.close()
+            except Exception:
+                logger.exception("Could not close Protect client after queue drain")
+
+    def nudge_thumbnail_queue() -> None:
+        """Schedule a queue drain; nudges coalesce to at most one queued drain."""
+        with drain_state_lock:
+            if app.state.thumbnail_drain_queued:
+                return
+            app.state.thumbnail_drain_queued = True
+        try:
+            thumbnail_executor.submit(drain_thumbnail_queue)
+        except RuntimeError:
+            # Shutting down — the durable queue retries on the next sync.
+            with drain_state_lock:
+                app.state.thumbnail_drain_queued = False
+
+    @app.on_event("shutdown")
+    def _shutdown_thumbnail_executor() -> None:
+        thumbnail_executor.shutdown(wait=True, cancel_futures=True)
 
     def require_protect() -> ProtectClient:
         client = build_protect()
@@ -440,14 +484,12 @@ def create_app(
         )
         if not payment:
             return JSONResponse({"ok": True, "ignored": True})
-        protect = build_protect()
         try:
-            sync.ingest_payment(store, payment, protect)
+            txn = await run_in_threadpool(sync.ingest_payment, store, payment, None)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        finally:
-            if protect:
-                protect.close()
+        if txn.get("camera_id") and not txn.get("thumbnail_path"):
+            nudge_thumbnail_queue()
         return JSONResponse({"ok": True})
 
     # -- static frontend ---------------------------------------------------------

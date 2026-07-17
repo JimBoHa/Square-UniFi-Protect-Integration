@@ -760,15 +760,12 @@ def test_two_pos_devices_map_to_distinct_camera_evidence(configured, monkeypatch
         )
         assert resp.status_code == 200
 
-    txns = {
-        txn["id"]: txn
-        for txn in configured.get("/api/transactions").json()
-    }
     for payment_id, device_id, camera_id in (
         ("PAY_TERM_A", "TERM_A", CAM1),
         ("PAY_TERM_B", "TERM_B", CAM2),
     ):
-        txn = txns[payment_id]
+        # Thumbnails attach asynchronously after the webhook ack.
+        txn = _wait_for_thumbnail(configured, payment_id)
         assert txn["device_id"] == device_id
         assert txn["camera_id"] == camera_id
         assert txn["deep_link"] == (
@@ -778,7 +775,7 @@ def test_two_pos_devices_map_to_distinct_camera_evidence(configured, monkeypatch
         assert thumbnail.status_code == 200
         assert camera_id.encode() in thumbnail.content
 
-    assert [camera_id for camera_id, _ in snapshot_requests] == [CAM1, CAM2]
+    assert sorted(camera_id for camera_id, _ in snapshot_requests) == [CAM1, CAM2]
     assert configured.get("/api/pos-devices").json() == [
         {"location_id": "LOC1", "device_id": "TERM_A", "device_name": "Register A"},
         {"location_id": "LOC1", "device_id": "TERM_B", "device_name": "Register B"},
@@ -820,11 +817,8 @@ def test_payment_without_device_uses_location_fallback(configured, monkeypatch):
         headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
     )
     assert resp.status_code == 200
-    txn = next(
-        item
-        for item in configured.get("/api/transactions").json()
-        if item["id"] == "PAY_NO_DEVICE"
-    )
+    # Thumbnails attach asynchronously after the webhook ack.
+    txn = _wait_for_thumbnail(configured, "PAY_NO_DEVICE")
     assert txn["device_id"] == ""
     assert txn["camera_id"] == CAM1
     assert f"/timeline/{CAM1}?" in txn["deep_link"]

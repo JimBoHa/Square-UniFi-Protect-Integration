@@ -192,3 +192,15 @@ def test_frontend_never_uses_innerhtml():
     js = (Path(__file__).parent.parent / "app" / "static" / "app.js").read_text()
     assert "innerHTML" not in js
     assert "document.write" not in js
+
+def test_transaction_feed_refresh_is_visibility_aware_and_non_overlapping():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js = (static_dir / "app.js").read_text()
+    html = (static_dir / "index.html").read_text()
+    assert "TRANSACTION_REFRESH_MS" in js
+    assert 'document.visibilityState === "visible"' in js
+    assert "transactionLoadInFlight" in js
+    assert "payload === lastTransactionPayload" in js
+    assert 'id="txn-last-updated"' in html

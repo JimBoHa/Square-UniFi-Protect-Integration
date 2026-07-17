@@ -98,6 +98,10 @@ the `deep_link_template` key in the settings table; the default is
 - **Input validation** — Protect host and camera ids are strictly validated
   (no URL/path injection), thumbnail serving is confined to the thumbnail
   directory, and the frontend renders all server data as text, never markup.
+- **Protect TLS** — certificate verification is off by default for local
+  self-signed consoles. Install/trust the console certificate and enable
+  **Verify TLS certificate** whenever possible; otherwise local credentials
+  and the Protect API key rely on the LAN being trusted.
 
 Serve the integration over HTTPS (reverse proxy) and set `SPI_COOKIE_SECURE=1`
 in production. The webhook endpoint is the only route that must be reachable

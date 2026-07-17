@@ -3,13 +3,16 @@
 import base64
 import hashlib
 import hmac
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
+from cryptography.fernet import Fernet
 
 from app.deeplink import build_deep_link
 from app.protect_client import ProtectAuthError, ProtectClient, validate_camera_id, validate_host
-from app.security import CredentialCipher, hash_password, verify_password
+from app.security import CredentialCipher, KEY_FILENAME, hash_password, verify_password
 from app.square_client import SquareClient, verify_webhook_signature
 from app.sync import parse_ts_ms, safe_thumbnail_name
 
@@ -41,6 +44,28 @@ def test_credential_cipher_key_file_permissions(tmp_path):
     CredentialCipher(tmp_path)
     mode = (tmp_path / "secret.key").stat().st_mode & 0o777
     assert mode == 0o600
+
+
+def test_credential_cipher_key_creation_is_atomic_under_concurrency(tmp_path, monkeypatch):
+    worker_count = 32
+    all_generating = threading.Barrier(worker_count)
+    generate_key = Fernet.generate_key
+
+    def synchronized_generate_key():
+        all_generating.wait(timeout=10)
+        return generate_key()
+
+    monkeypatch.setattr(Fernet, "generate_key", staticmethod(synchronized_generate_key))
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(CredentialCipher, tmp_path) for _ in range(worker_count)]
+        ciphers = [future.result(timeout=20) for future in futures]
+
+    token = ciphers[0].encrypt("shared-secret")
+    assert all(cipher.decrypt(token) == "shared-secret" for cipher in ciphers)
+    assert (tmp_path / KEY_FILENAME).stat().st_mode & 0o777 == 0o600
+    assert list(tmp_path.glob(f".{KEY_FILENAME}.*.tmp")) == []
+
 
 def test_credential_cipher_rejects_tampered(tmp_path):
     cipher = CredentialCipher(tmp_path)

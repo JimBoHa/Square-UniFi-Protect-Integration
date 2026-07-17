@@ -827,6 +827,51 @@ def test_webhook_ignores_payment_for_another_merchant(configured):
     assert configured.app.state.store.get_transaction("PAY_FOREIGN") is None
 
 
+def test_slow_webhook_rejects_signature_after_same_account_key_rotation(configured):
+    body = make_webhook_event("PAY_OLD_WEBHOOK_KEY")
+    body_requested = threading.Event()
+    release_body = threading.Event()
+    store = configured.app.state.store
+    original_revision = store.square_account_revision()
+
+    def delayed_body():
+        body_requested.set()
+        assert release_body.wait(timeout=5)
+        yield body
+
+    def send_webhook():
+        return configured.post(
+            "/webhooks/square",
+            content=delayed_body(),
+            headers={
+                "x-square-hmacsha256-signature": _webhook_signature(body)
+            },
+        )
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(send_webhook)
+    try:
+        assert body_requested.wait(timeout=5)
+        rotated = store.configure_square_account(
+            merchant_id=SQUARE_MERCHANT_ID,
+            access_token=SQUARE_TOKEN,
+            environment="production",
+            webhook_signature_key="rotated-webhook-key",
+            webhook_url="https://rotated.example/webhooks/square",
+        )
+        assert not rotated.switched
+        assert rotated.account_revision == original_revision
+        release_body.set()
+        response = future.result(timeout=5)
+    finally:
+        release_body.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid webhook signature"
+    assert store.get_transaction("PAY_OLD_WEBHOOK_KEY") is None
+
+
 def _wait_for_thumbnail(client, payment_id: str, timeout: float = 3.0) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

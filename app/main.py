@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -805,71 +806,72 @@ def create_app(
             chunks.append(chunk)
         return b"".join(chunks)
 
-    def ingest_square_webhook_payment(
-        payment: dict,
-        expected_merchant_id: str,
-        expected_environment: str,
-        expected_account_revision: str | None,
-    ) -> dict:
+    def process_square_webhook(body: bytes, signature: str) -> dict | None:
+        """Verify and ingest against one current account/settings snapshot."""
         with store.integration_guard():
+            square_settings = store.get_settings(
+                (
+                    "square.webhook_signature_key",
+                    "square.webhook_url",
+                    "square.merchant_id",
+                    "square.environment",
+                    "square.account_revision",
+                )
+            )
+            signature_key = square_settings["square.webhook_signature_key"]
+            webhook_url = square_settings["square.webhook_url"]
+            if not signature_key or not webhook_url:
+                raise HTTPException(status_code=403, detail="Webhook not configured")
+            if not verify_webhook_signature(
+                signature_key, webhook_url, body, signature
+            ):
+                raise HTTPException(status_code=401, detail="Invalid webhook signature")
+            try:
+                event = json.loads(body)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422, detail="Invalid JSON payload"
+                ) from exc
+            if (
+                not isinstance(event, dict)
+                or not square_settings["square.merchant_id"]
+                or event.get("merchant_id")
+                != square_settings["square.merchant_id"]
+            ):
+                return None
+            event_data = event.get("data")
+            event_object = (
+                event_data.get("object")
+                if isinstance(event_data, dict)
+                else None
+            )
+            payment = (
+                event_object.get("payment")
+                if isinstance(event_object, dict)
+                else None
+            )
+            if not isinstance(payment, dict) or not payment:
+                return None
             return sync.ingest_payment(
                 store,
                 payment,
                 None,
-                expected_merchant_id=expected_merchant_id,
-                expected_environment=expected_environment,
-                expected_account_revision=expected_account_revision,
+                expected_merchant_id=square_settings["square.merchant_id"],
+                expected_environment=(
+                    square_settings["square.environment"] or "production"
+                ),
+                expected_account_revision=(
+                    square_settings["square.account_revision"]
+                ),
             )
 
     @app.post("/webhooks/square")
     async def square_webhook(request: Request) -> JSONResponse:
-        square_settings = store.get_settings(
-            (
-                "square.webhook_signature_key",
-                "square.webhook_url",
-                "square.merchant_id",
-                "square.environment",
-                "square.account_revision",
-            )
-        )
-        signature_key = square_settings["square.webhook_signature_key"]
-        webhook_url = square_settings["square.webhook_url"]
-        if not signature_key or not webhook_url:
-            raise HTTPException(status_code=403, detail="Webhook not configured")
         body = await read_square_webhook_body(request)
         signature = request.headers.get("x-square-hmacsha256-signature", "")
-        if not verify_webhook_signature(signature_key, webhook_url, body, signature):
-            raise HTTPException(status_code=401, detail="Invalid webhook signature")
-        import json as _json
-
-        try:
-            event = _json.loads(body)
-        except ValueError:
-            raise HTTPException(status_code=422, detail="Invalid JSON payload")
-        if (
-            not isinstance(event, dict)
-            or not square_settings["square.merchant_id"]
-            or event.get("merchant_id") != square_settings["square.merchant_id"]
-        ):
-            return JSONResponse({"ok": True, "ignored": True})
-        event_data = event.get("data")
-        event_object = (
-            event_data.get("object") if isinstance(event_data, dict) else None
-        )
-        payment = (
-            event_object.get("payment")
-            if isinstance(event_object, dict)
-            else None
-        )
-        if not isinstance(payment, dict) or not payment:
-            return JSONResponse({"ok": True, "ignored": True})
         try:
             txn = await run_in_threadpool(
-                ingest_square_webhook_payment,
-                payment,
-                square_settings["square.merchant_id"],
-                square_settings["square.environment"] or "production",
-                square_settings["square.account_revision"],
+                process_square_webhook, body, signature
             )
         except SquareAccountChanged:
             # A verified event can race an explicitly confirmed account
@@ -878,6 +880,8 @@ def create_app(
             return JSONResponse({"ok": True, "ignored": True})
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
+        if txn is None:
+            return JSONResponse({"ok": True, "ignored": True})
         # Both alarm delivery and thumbnail capture are durable queue work;
         # the drain no-ops cheaply when neither has anything pending.
         nudge_protect_work_queue()

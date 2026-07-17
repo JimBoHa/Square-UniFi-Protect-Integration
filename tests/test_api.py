@@ -163,6 +163,18 @@ def test_transactions_without_camera_mapping_still_listed(authed):
     assert all(t["thumbnail_url"] is None for t in txns)
     assert all(t["deep_link"] is None for t in txns)
 
+def test_sync_persists_transactions_when_thumbnail_write_fails(configured, tmp_path):
+    configured.app.state.store.thumbnail_dir = tmp_path / "missing" / "thumbnails"
+
+    resp = configured.post("/api/sync")
+
+    assert resp.status_code == 200
+    assert resp.json()["ingested"] == 2
+    txns = configured.get("/api/transactions").json()
+    assert len(txns) == 2
+    assert all(txn["thumbnail_url"] is None for txn in txns)
+    assert all(txn["deep_link"] is not None for txn in txns)
+
 def test_thumbnail_missing_returns_404(configured):
     assert configured.get("/api/thumbnails/NOPE").status_code == 404
 

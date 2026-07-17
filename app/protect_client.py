@@ -1,13 +1,14 @@
 """Minimal UniFi Protect (UniFi OS) API client.
 
 Talks to a local UniFi Protect console over HTTPS: local-account login,
-camera enumeration via the bootstrap payload, and JPEG snapshots
-(optionally at a historical timestamp for consoles that support it).
+camera enumeration via the bootstrap payload, JPEG snapshots (optionally at a
+historical timestamp), and official API-key Alarm Manager triggers.
 """
 
 from __future__ import annotations
 
 import re
+from urllib.parse import quote
 
 import httpx
 
@@ -43,6 +44,18 @@ def validate_camera_id(camera_id: str) -> str:
     return camera_id
 
 
+def validate_alarm_trigger_id(trigger_id: str) -> str:
+    """Validate a user-defined Alarm Manager webhook path segment."""
+    trigger_id = (trigger_id or "").strip()
+    if not trigger_id or len(trigger_id) > 256 or any(
+        ord(char) < 32 or ord(char) == 127 for char in trigger_id
+    ):
+        raise ValueError(
+            "Alarm trigger id must be 1-256 characters without control characters"
+        )
+    return trigger_id
+
+
 class ProtectClient:
     def __init__(
         self,
@@ -52,10 +65,12 @@ class ProtectClient:
         verify_ssl: bool = False,
         transport: httpx.BaseTransport | None = None,
         timeout: float = 15.0,
+        api_key: str | None = None,
     ):
         self.host = validate_host(host)
         self._username = username
         self._password = password
+        self._api_key = api_key.strip() if api_key else None
         self._csrf_token: str | None = None
         self._logged_in = False
         self._client = httpx.Client(
@@ -110,9 +125,29 @@ class ProtectClient:
                 resp = self._client.request(method, path, headers=headers, **kwargs)
             except httpx.RequestError as exc:
                 raise ProtectError("Network error while contacting UniFi Protect") from exc
-        if resp.status_code >= 400:
+        if not 200 <= resp.status_code < 300:
             raise ProtectError(
                 f"UniFi Protect request {method} {path} failed (HTTP {resp.status_code})"
+            )
+        return resp
+
+    def _integration_request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """Request the official Protect integration API with an API key."""
+        if not self._api_key:
+            raise ProtectAuthError("UniFi Protect API key is not configured")
+        headers = dict(kwargs.pop("headers", {}))
+        headers.setdefault("Accept", "application/json")
+        headers["X-API-Key"] = self._api_key
+        try:
+            resp = self._client.request(method, path, headers=headers, **kwargs)
+        except httpx.RequestError as exc:
+            raise ProtectError("Network error while contacting UniFi Protect") from exc
+        if resp.status_code in (401, 403):
+            raise ProtectAuthError("UniFi Protect rejected the API key")
+        if not 200 <= resp.status_code < 300:
+            raise ProtectError(
+                f"UniFi Protect integration request {method} {path} failed "
+                f"(HTTP {resp.status_code})"
             )
         return resp
 
@@ -145,3 +180,28 @@ class ProtectClient:
             "GET", f"/proxy/protect/api/cameras/{camera_id}/snapshot", params=params
         )
         return resp.content
+
+    def get_integration_info(self) -> dict:
+        """Verify API-key access and return official Protect application metadata."""
+        resp = self._integration_request(
+            "GET", "/proxy/protect/integration/v1/meta/info"
+        )
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise ProtectError("UniFi Protect integration metadata was not JSON") from exc
+        version = data.get("applicationVersion") if isinstance(data, dict) else None
+        if not isinstance(version, str) or not version.strip():
+            raise ProtectError("UniFi Protect integration metadata was invalid")
+        return data
+
+    def trigger_alarm(self, trigger_id: str, timeout: float | None = None) -> None:
+        """Send a user-defined webhook trigger to Protect Alarm Manager."""
+        trigger_id = validate_alarm_trigger_id(trigger_id)
+        request_options = {"timeout": timeout} if timeout is not None else {}
+        self._integration_request(
+            "POST",
+            "/proxy/protect/integration/v1/alarm-manager/webhook/"
+            f"{quote(trigger_id, safe='')}",
+            **request_options,
+        )

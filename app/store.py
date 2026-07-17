@@ -12,6 +12,11 @@ from pathlib import Path
 from .security import CredentialCipher, hash_session_token
 
 SESSION_TTL_SECONDS = 12 * 3600
+ALARM_IDLE = "idle"
+ALARM_IN_PROGRESS = "in_progress"
+ALARM_SENT = "sent"
+ALARM_CLAIM_LEASE_SECONDS = 60
+ALARM_ENABLED_AFTER_SETTING = "protect.alarm_enabled_after_ms"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -43,7 +48,10 @@ CREATE TABLE IF NOT EXISTS transactions (
     receipt_url TEXT NOT NULL DEFAULT '',
     camera_id TEXT,
     thumbnail_path TEXT,
-    raw TEXT NOT NULL DEFAULT '{}'
+    raw TEXT NOT NULL DEFAULT '{}',
+    alarm_state TEXT NOT NULL DEFAULT 'idle',
+    alarm_claim_token TEXT,
+    alarm_claimed_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_transactions_ts ON transactions (ts_ms DESC);
 CREATE TABLE IF NOT EXISTS thumbnail_retries (
@@ -76,10 +84,12 @@ class Store:
         self._db.row_factory = sqlite3.Row
         with self._lock:
             self._db.executescript(_SCHEMA)
-            self._db.execute("BEGIN")
+            # Serialize schema inspection and ALTER statements across workers.
+            self._db.execute("BEGIN IMMEDIATE")
             try:
                 self._migrate_transactions()
                 self._migrate_schema()
+                self._migrate_alarms()
                 # Upgrade existing databases: any transaction that already
                 # missed its thumbnail must enter the durable retry queue.
                 self._db.execute(
@@ -93,11 +103,68 @@ class Store:
                     "WHERE t.id = thumbnail_retries.transaction_id "
                     "AND t.camera_id IS NOT NULL AND t.thumbnail_path IS NULL)"
                 )
+                self._release_expired_alarm_claims_locked()
             except Exception:
                 self._db.rollback()
                 raise
             else:
                 self._db.commit()
+
+    def _migrate_alarms(self) -> None:
+        """Add alarm delivery columns; never replay pre-existing completed sales."""
+        columns = {
+            row["name"]
+            for row in self._db.execute("PRAGMA table_info(transactions)").fetchall()
+        }
+        if "alarm_state" not in columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN alarm_state TEXT "
+                "NOT NULL DEFAULT 'idle'"
+            )
+            # Existing completed rows predate alarm delivery. Treat them as
+            # handled so enabling the feature cannot replay historical sales.
+            self._db.execute(
+                "UPDATE transactions SET alarm_state = ? "
+                "WHERE UPPER(status) = 'COMPLETED'",
+                (ALARM_SENT,),
+            )
+        if "alarm_claim_token" not in columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN alarm_claim_token TEXT"
+            )
+        if "alarm_claimed_at" not in columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN alarm_claimed_at REAL"
+            )
+        configured_alarm_keys = {
+            row["key"]
+            for row in self._db.execute(
+                "SELECT key FROM settings WHERE key IN (?, ?, ?)",
+                (
+                    "protect.api_key",
+                    "protect.alarm_trigger_id",
+                    ALARM_ENABLED_AFTER_SETTING,
+                ),
+            ).fetchall()
+        }
+        if {
+            "protect.api_key",
+            "protect.alarm_trigger_id",
+        }.issubset(configured_alarm_keys) and (
+            ALARM_ENABLED_AFTER_SETTING not in configured_alarm_keys
+        ):
+            # Upgrade early alarm-feature databases without replaying
+            # imports that happened before this process started.
+            self._db.execute(
+                "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, 0)",
+                (ALARM_ENABLED_AFTER_SETTING, str(int(time.time() * 1000))),
+            )
+            self._db.execute(
+                "UPDATE transactions SET alarm_state = ?, "
+                "alarm_claim_token = NULL, alarm_claimed_at = NULL "
+                "WHERE UPPER(status) = 'COMPLETED' AND alarm_state != ?",
+                (ALARM_SENT, ALARM_SENT),
+            )
 
     def _migrate_schema(self) -> None:
         mapping_columns = {
@@ -197,14 +264,71 @@ class Store:
     # -- settings ----------------------------------------------------------
 
     def set_setting(self, key: str, value: str, secret: bool = False) -> None:
-        stored = self.cipher.encrypt(value) if secret else value
+        self.update_settings({key: (value, secret)})
+
+    def update_settings(
+        self,
+        updates: dict[str, tuple[str, bool]],
+        delete_keys: tuple[str, ...] = (),
+        suppress_completed_alarms: bool = False,
+        activate_alarm_at_ms: int | None = None,
+    ) -> bool:
+        """Apply settings atomically; return whether alarm activation occurred."""
+        stored_updates = [
+            (key, self.cipher.encrypt(value) if secret else value, int(secret))
+            for key, (value, secret) in updates.items()
+        ]
+        alarm_activated = False
         with self._lock:
-            self._db.execute(
-                "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=excluded.encrypted",
-                (key, stored, int(secret)),
-            )
-            self._db.commit()
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                for key in delete_keys:
+                    self._db.execute("DELETE FROM settings WHERE key = ?", (key,))
+                self._db.executemany(
+                    "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                    "encrypted=excluded.encrypted",
+                    stored_updates,
+                )
+                if activate_alarm_at_ms is not None:
+                    configured_keys = {
+                        row["key"]
+                        for row in self._db.execute(
+                            "SELECT key FROM settings WHERE key IN (?, ?, ?)",
+                            (
+                                "protect.api_key",
+                                "protect.alarm_trigger_id",
+                                ALARM_ENABLED_AFTER_SETTING,
+                            ),
+                        ).fetchall()
+                    }
+                    if {
+                        "protect.api_key",
+                        "protect.alarm_trigger_id",
+                    }.issubset(configured_keys) and (
+                        ALARM_ENABLED_AFTER_SETTING not in configured_keys
+                    ):
+                        self._db.execute(
+                            "INSERT INTO settings (key, value, encrypted) "
+                            "VALUES (?, ?, 0)",
+                            (
+                                ALARM_ENABLED_AFTER_SETTING,
+                                str(int(activate_alarm_at_ms)),
+                            ),
+                        )
+                        alarm_activated = True
+                if suppress_completed_alarms or alarm_activated:
+                    self._db.execute(
+                        "UPDATE transactions SET alarm_state = ?, "
+                        "alarm_claim_token = NULL, alarm_claimed_at = NULL "
+                        "WHERE UPPER(status) = 'COMPLETED' AND alarm_state != ?",
+                        (ALARM_SENT, ALARM_SENT),
+                    )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return alarm_activated
 
     def set_setting_if_absent(self, key: str, value: str, secret: bool = False) -> bool:
         """Store a setting only if no caller has created the key."""
@@ -218,13 +342,27 @@ class Store:
         return cursor.rowcount == 1
 
     def get_setting(self, key: str) -> str | None:
+        return self.get_settings((key,))[key]
+
+    def get_settings(self, keys: tuple[str, ...]) -> dict[str, str | None]:
+        """Read related settings from one locked database snapshot."""
+        if not keys:
+            return {}
+        placeholders = ", ".join("?" for _ in keys)
         with self._lock:
-            row = self._db.execute(
-                "SELECT value, encrypted FROM settings WHERE key = ?", (key,)
-            ).fetchone()
-        if row is None:
-            return None
-        return self.cipher.decrypt(row["value"]) if row["encrypted"] else row["value"]
+            rows = self._db.execute(
+                f"SELECT key, value, encrypted FROM settings "
+                f"WHERE key IN ({placeholders})",
+                keys,
+            ).fetchall()
+        values = {key: None for key in keys}
+        for row in rows:
+            values[row["key"]] = (
+                self.cipher.decrypt(row["value"])
+                if row["encrypted"]
+                else row["value"]
+            )
+        return values
 
     def delete_setting(self, key: str) -> None:
         with self._lock:
@@ -394,6 +532,31 @@ class Store:
                     self._db.execute(
                         "DELETE FROM thumbnail_retries WHERE transaction_id = ?",
                         (txn["id"],),
+                    )
+                # Backfilled sales completed before alarm activation must
+                # never fire an alarm.
+                activation = self._db.execute(
+                    "SELECT value, encrypted FROM settings WHERE key = ?",
+                    (ALARM_ENABLED_AFTER_SETTING,),
+                ).fetchone()
+                try:
+                    enabled_after_ms = (
+                        int(activation["value"])
+                        if activation is not None and not activation["encrypted"]
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    enabled_after_ms = None
+                if (
+                    enabled_after_ms is not None
+                    and str(txn.get("status", "")).upper() == "COMPLETED"
+                    and int(txn["ts_ms"]) < enabled_after_ms
+                ):
+                    self._db.execute(
+                        "UPDATE transactions SET alarm_state = ?, "
+                        "alarm_claim_token = NULL, alarm_claimed_at = NULL "
+                        "WHERE id = ? AND alarm_state != ?",
+                        (ALARM_SENT, txn["id"], ALARM_SENT),
                     )
                 self._db.commit()
             except Exception:
@@ -651,6 +814,65 @@ class Store:
                     (location_id,),
                 ).fetchone()
         return row["ts"] if row and row["ts"] is not None else None
+
+    def _release_expired_alarm_claims_locked(self) -> None:
+        """Release abandoned claims without stealing work from a live process."""
+        cutoff = time.time() - ALARM_CLAIM_LEASE_SECONDS
+        self._db.execute(
+            "UPDATE transactions SET alarm_state = ?, alarm_claim_token = NULL, "
+            "alarm_claimed_at = NULL WHERE alarm_state = ? "
+            "AND (alarm_claimed_at IS NULL OR alarm_claimed_at <= ?)",
+            (ALARM_IDLE, ALARM_IN_PROGRESS, cutoff),
+        )
+
+    def pending_alarm_transaction_ids(self, limit: int = 100) -> list[str]:
+        """Completed alarm deliveries awaiting an attempt, oldest first."""
+        limit = max(1, min(int(limit), 500))
+        with self._lock:
+            self._release_expired_alarm_claims_locked()
+            rows = self._db.execute(
+                "SELECT id FROM transactions WHERE UPPER(status) = 'COMPLETED' "
+                "AND alarm_state = ? ORDER BY ts_ms ASC LIMIT ?",
+                (ALARM_IDLE, limit),
+            ).fetchall()
+            self._db.commit()
+        return [row["id"] for row in rows]
+
+    def claim_alarm_trigger(self, txn_id: str) -> str | None:
+        """Atomically claim an unhandled completed transaction for delivery."""
+        claim_token = secrets.token_urlsafe(18)
+        with self._lock:
+            self._release_expired_alarm_claims_locked()
+            cursor = self._db.execute(
+                "UPDATE transactions SET alarm_state = ?, alarm_claim_token = ?, "
+                "alarm_claimed_at = ? "
+                "WHERE id = ? AND UPPER(status) = 'COMPLETED' AND alarm_state = ?",
+                (ALARM_IN_PROGRESS, claim_token, time.time(), txn_id, ALARM_IDLE),
+            )
+            self._db.commit()
+        return claim_token if cursor.rowcount == 1 else None
+
+    def mark_alarm_sent(self, txn_id: str, claim_token: str) -> bool:
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE transactions SET alarm_state = ?, alarm_claim_token = NULL, "
+                "alarm_claimed_at = NULL WHERE id = ? AND alarm_state = ? "
+                "AND alarm_claim_token = ?",
+                (ALARM_SENT, txn_id, ALARM_IN_PROGRESS, claim_token),
+            )
+            self._db.commit()
+        return cursor.rowcount == 1
+
+    def release_alarm_claim(self, txn_id: str, claim_token: str) -> bool:
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE transactions SET alarm_state = ?, alarm_claim_token = NULL, "
+                "alarm_claimed_at = NULL WHERE id = ? AND alarm_state = ? "
+                "AND alarm_claim_token = ?",
+                (ALARM_IDLE, txn_id, ALARM_IN_PROGRESS, claim_token),
+            )
+            self._db.commit()
+        return cursor.rowcount == 1
 
     # -- sessions ----------------------------------------------------------
 

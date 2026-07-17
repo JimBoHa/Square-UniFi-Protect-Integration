@@ -12,15 +12,18 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.protect_client import ProtectClient
 from app.square_client import SquareClient, SquarePermissionError
 from app.store import Store
 from app.sync import ingest_payment, retry_missing_thumbnails
 
-from app.protect_client import ProtectClient
-from app.sync import ingest_payment
-
 from .conftest import (
     ADMIN_PASSWORD,
+    PROTECT_ALARM_CALLS,
+    PROTECT_ALARM_RESPONSES,
+    PROTECT_ALARM_TRIGGER_ID,
+    PROTECT_API_KEY,
+    PROTECT_META_KEYS,
     PROTECT_PASS,
     PROTECT_USER,
     SQUARE_TOKEN,
@@ -98,6 +101,76 @@ def test_protect_settings_success(authed):
     assert resp.status_code == 200
     assert resp.json()["cameras"] == 2
     assert authed.get("/api/status").json()["protect_configured"] is True
+
+def test_protect_alarm_settings_verify_and_encrypt_api_key(authed, tmp_path):
+    bad = authed.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.1",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+            "api_key": "wrong-api-key",
+            "alarm_trigger_id": PROTECT_ALARM_TRIGGER_ID,
+        },
+    )
+    assert bad.status_code == 401
+    assert authed.app.state.store.get_setting("protect.api_key") is None
+
+    good = authed.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.1",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+            "api_key": PROTECT_API_KEY,
+            "alarm_trigger_id": PROTECT_ALARM_TRIGGER_ID,
+        },
+    )
+    assert good.status_code == 200
+    assert good.json()["alarm_configured"] is True
+    assert PROTECT_META_KEYS == ["wrong-api-key", PROTECT_API_KEY]
+    assert authed.app.state.store.get_setting("protect.api_key") == PROTECT_API_KEY
+    assert (
+        authed.app.state.store.get_setting("protect.alarm_trigger_id")
+        == PROTECT_ALARM_TRIGGER_ID
+    )
+    assert PROTECT_API_KEY.encode() not in (tmp_path / "data" / "spi.db").read_bytes()
+
+    PROTECT_META_KEYS.clear()
+    preserved = authed.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.1",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+        },
+    )
+    assert preserved.status_code == 200
+    assert preserved.json()["alarm_configured"] is True
+    assert PROTECT_META_KEYS == [PROTECT_API_KEY]
+
+def test_protect_alarm_settings_can_be_disabled(authed):
+    _enable_alarm(authed)
+
+    resp = authed.delete("/api/settings/protect/alarm")
+    assert resp.status_code == 200
+    assert resp.json()["alarm_configured"] is False
+    assert authed.app.state.store.get_setting("protect.api_key") is None
+    assert authed.app.state.store.get_setting("protect.alarm_trigger_id") is None
+
+def test_protect_settings_reject_control_characters_in_alarm_trigger(authed):
+    resp = authed.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.1",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+            "api_key": PROTECT_API_KEY,
+            "alarm_trigger_id": "trigger\nall",
+        },
+    )
+    assert resp.status_code == 422
+    assert PROTECT_META_KEYS == []
 
 def test_square_settings_validates_token(authed):
     resp = authed.put(
@@ -403,15 +476,20 @@ def make_webhook_event(
     payment_id: str = "PAY_HOOK",
     device_id: str = "",
     device_name: str = "",
+    status: str = "COMPLETED",
+    created_at: str = "2026-07-16T16:00:00.000Z",
+    updated_at: str | None = None,
 ) -> bytes:
     payment = {
         "id": payment_id,
-        "created_at": "2026-07-16T16:00:00.000Z",
+        "created_at": created_at,
         "amount_money": {"amount": 500, "currency": "USD"},
-        "status": "COMPLETED",
+        "status": status,
         "location_id": "LOC1",
         "card_details": {"card": {"last_4": "9999"}},
     }
+    if updated_at is not None:
+        payment["updated_at"] = updated_at
     if device_id or device_name:
         payment["device_details"] = {
             "device_id": device_id,
@@ -434,6 +512,29 @@ def _wait_for_thumbnail(client, payment_id: str, timeout: float = 3.0) -> dict:
             return txn
         time.sleep(0.01)
     raise AssertionError(f"thumbnail enrichment did not finish for {payment_id}")
+
+
+def _wait_for_alarm_state(
+    client, payment_id: str, state: str, timeout: float = 3.0
+) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        txn = client.app.state.store.get_transaction(payment_id)
+        if txn and txn["alarm_state"] == state:
+            return txn
+        time.sleep(0.01)
+    raise AssertionError(
+        f"alarm state for {payment_id} did not become {state}"
+    )
+
+
+def _wait_for_protect_jobs(client, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not client.app.state.thumbnail_jobs:
+            return
+        time.sleep(0.01)
+    raise AssertionError("webhook Protect work did not finish")
 
 
 def test_webhook_stores_payment_then_enriches_thumbnail(configured):
@@ -530,6 +631,75 @@ def test_webhook_ack_and_transaction_listing_do_not_wait_for_snapshot(tmp_path):
             assert isolated.get(txn["thumbnail_url"]).status_code == 200
     finally:
         release_snapshot.set()
+        app.state.store.close()
+
+
+def test_webhook_ack_does_not_wait_for_alarm_delivery(tmp_path):
+    alarm_started = threading.Event()
+    release_alarm = threading.Event()
+
+    def blocking_alarm(request: httpx.Request) -> httpx.Response:
+        if "/alarm-manager/webhook/" in request.url.path:
+            alarm_started.set()
+            if not release_alarm.wait(timeout=10):
+                raise httpx.ReadTimeout("alarm test timed out", request=request)
+        return protect_handler(request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(blocking_alarm),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/protect",
+                json={
+                    "host": "192.168.1.1",
+                    "username": PROTECT_USER,
+                    "password": PROTECT_PASS,
+                    "api_key": PROTECT_API_KEY,
+                    "alarm_trigger_id": PROTECT_ALARM_TRIGGER_ID,
+                },
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/square",
+                json={
+                    "access_token": SQUARE_TOKEN,
+                    "environment": "production",
+                    "webhook_signature_key": WEBHOOK_KEY,
+                    "webhook_url": WEBHOOK_URL,
+                },
+            ).status_code == 200
+
+            body = make_webhook_event(
+                "PAY_ALARM_BLOCKED", created_at="2099-07-16T16:00:00.000Z"
+            )
+            response = isolated.post(
+                "/webhooks/square",
+                content=body,
+                headers={
+                    "x-square-hmacsha256-signature": _webhook_signature(body)
+                },
+            )
+            assert response.status_code == 200
+            assert alarm_started.wait(timeout=3)
+            assert not release_alarm.is_set()
+            assert (
+                isolated.app.state.store.get_transaction("PAY_ALARM_BLOCKED")
+                is not None
+            )
+            release_alarm.set()
+            _wait_for_alarm_state(isolated, "PAY_ALARM_BLOCKED", "sent")
+    finally:
+        release_alarm.set()
         app.state.store.close()
 
 
@@ -890,6 +1060,105 @@ def test_sparse_payment_update_preserves_device_camera_evidence(configured, monk
     assert f"/timeline/{CAM1}?" in txn["deep_link"]
     assert configured.get(txn["thumbnail_url"]).content == original_image
     assert snapshot_requests == []
+
+def _enable_alarm(client):
+    resp = client.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.1",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+            "api_key": PROTECT_API_KEY,
+            "alarm_trigger_id": PROTECT_ALARM_TRIGGER_ID,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+def test_enable_before_first_sync_suppresses_backfill_then_triggers_live_sale(configured):
+    _enable_alarm(configured)
+
+    assert configured.post("/api/sync").status_code == 200
+    assert PROTECT_ALARM_CALLS == []
+    assert configured.post("/api/sync").status_code == 200
+
+    body = make_webhook_event(
+        "PAY_LIVE", created_at="2099-07-16T16:00:00.000Z"
+    )
+    assert configured.post(
+        "/webhooks/square",
+        content=body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+    ).status_code == 200
+    _wait_for_alarm_state(configured, "PAY_LIVE", "sent")
+    assert PROTECT_ALARM_CALLS == [PROTECT_ALARM_TRIGGER_ID]
+
+    assert configured.post(
+        "/webhooks/square",
+        content=body,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(body)},
+    ).status_code == 200
+    _wait_for_protect_jobs(configured)
+    assert PROTECT_ALARM_CALLS == [PROTECT_ALARM_TRIGGER_ID]
+
+def test_enabling_alarm_does_not_replay_existing_completed_sales(configured):
+    assert configured.post("/api/sync").status_code == 200
+    _enable_alarm(configured)
+
+    assert configured.post("/api/sync").status_code == 200
+    assert PROTECT_ALARM_CALLS == []
+
+def test_pending_payment_triggers_when_it_becomes_completed(configured):
+    _enable_alarm(configured)
+
+    pending = make_webhook_event(
+        "PAY_TRANSITION",
+        status="PENDING",
+        created_at="2099-07-16T16:00:00.000Z",
+    )
+    assert configured.post(
+        "/webhooks/square",
+        content=pending,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(pending)},
+    ).status_code == 200
+    assert PROTECT_ALARM_CALLS == []
+
+    completed = make_webhook_event(
+        "PAY_TRANSITION",
+        status="COMPLETED",
+        created_at="2099-07-16T16:00:00.000Z",
+    )
+    assert configured.post(
+        "/webhooks/square",
+        content=completed,
+        headers={"x-square-hmacsha256-signature": _webhook_signature(completed)},
+    ).status_code == 200
+    _wait_for_alarm_state(configured, "PAY_TRANSITION", "sent")
+    assert PROTECT_ALARM_CALLS == [PROTECT_ALARM_TRIGGER_ID]
+
+def test_alarm_failure_persists_transaction_and_retries(configured):
+    _enable_alarm(configured)
+    PROTECT_ALARM_RESPONSES.extend([500, 204])
+    body = make_webhook_event(
+        "PAY_RETRY", created_at="2099-07-16T16:00:00.000Z"
+    )
+    headers = {"x-square-hmacsha256-signature": _webhook_signature(body)}
+
+    assert configured.post("/webhooks/square", content=body, headers=headers).status_code == 200
+    transaction = _wait_for_alarm_state(configured, "PAY_RETRY", "idle")
+    deadline = time.monotonic() + 3
+    while not PROTECT_ALARM_CALLS and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert transaction is not None
+    assert transaction["alarm_state"] == "idle"
+    assert PROTECT_ALARM_CALLS
+
+    assert configured.post("/api/sync").status_code == 200
+    assert configured.app.state.store.get_transaction("PAY_RETRY")["alarm_state"] == "sent"
+    assert len(PROTECT_ALARM_CALLS) == 2
+
+    assert configured.post("/webhooks/square", content=body, headers=headers).status_code == 200
+    _wait_for_protect_jobs(configured)
+    assert len(PROTECT_ALARM_CALLS) == 2
 
 def test_webhook_ignores_non_payment_events(configured):
     body = json.dumps({"type": "inventory.count.updated", "data": {}}).encode()

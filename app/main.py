@@ -20,6 +20,7 @@ from .protect_client import (
     ProtectAuthError,
     ProtectClient,
     ProtectError,
+    validate_alarm_trigger_id,
     validate_camera_id,
     validate_host,
 )
@@ -31,13 +32,21 @@ from .square_client import (
     SquarePermissionError,
     verify_webhook_signature,
 )
-from .store import Store
+from .store import ALARM_ENABLED_AFTER_SETTING, Store
 
 logger = logging.getLogger("spi")
 
 SESSION_COOKIE = "spi_session"
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
+PROTECT_SETTING_KEYS = (
+    "protect.host",
+    "protect.username",
+    "protect.password",
+    "protect.verify_ssl",
+    "protect.api_key",
+    "protect.alarm_trigger_id",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +64,9 @@ class ProtectSettingsBody(BaseModel):
     username: str
     password: str
     verify_ssl: bool = False
+    api_key: str = Field(default="", max_length=512)
+    alarm_trigger_id: str = Field(default="", max_length=256)
+    disable_alarm: bool = False
 
 class SquareSettingsBody(BaseModel):
     access_token: str
@@ -106,18 +118,20 @@ def create_app(
 
     # -- client construction from stored settings ---------------------------
 
-    def build_protect() -> ProtectClient | None:
-        host = store.get_setting("protect.host")
-        username = store.get_setting("protect.username")
-        password = store.get_setting("protect.password")
+    def build_protect(settings: dict[str, str | None] | None = None) -> ProtectClient | None:
+        settings = settings or store.get_settings(PROTECT_SETTING_KEYS)
+        host = settings["protect.host"]
+        username = settings["protect.username"]
+        password = settings["protect.password"]
         if not (host and username and password):
             return None
         return ProtectClient(
             host,
             username,
             password,
-            verify_ssl=store.get_setting("protect.verify_ssl") == "1",
+            verify_ssl=settings["protect.verify_ssl"] == "1",
             transport=protect_transport,
+            api_key=settings["protect.api_key"],
         )
 
     def build_square() -> SquareClient | None:
@@ -130,32 +144,38 @@ def create_app(
             transport=square_transport,
         )
 
-    def drain_thumbnail_queue() -> None:
+    def drain_protect_work_queue() -> None:
         with drain_state_lock:
             app.state.thumbnail_drain_queued = False
-        protect = build_protect()
+        protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
+        protect = build_protect(protect_settings)
         if protect is None:
             return
         try:
+            # Sale alarms first: a slow snapshot request must not delay the
+            # Alarm Manager automation for a completed sale.
+            sync.retry_pending_alarms(
+                store, protect, protect_settings["protect.alarm_trigger_id"]
+            )
             sync.retry_missing_thumbnails(store, protect)
         except Exception:
-            logger.exception("Thumbnail queue drain failed")
+            logger.exception("Protect work drain failed")
         finally:
             try:
                 protect.close()
             except Exception:
                 logger.exception("Could not close Protect client after queue drain")
 
-    def nudge_thumbnail_queue() -> None:
+    def nudge_protect_work_queue() -> None:
         """Schedule a queue drain; nudges coalesce to at most one queued drain."""
         with drain_state_lock:
             if app.state.thumbnail_drain_queued:
                 return
             app.state.thumbnail_drain_queued = True
         try:
-            thumbnail_executor.submit(drain_thumbnail_queue)
+            thumbnail_executor.submit(drain_protect_work_queue)
         except RuntimeError:
-            # Shutting down — the durable queue retries on the next sync.
+            # Shutting down — the durable queues retry on the next sync.
             with drain_state_lock:
                 app.state.thumbnail_drain_queued = False
 
@@ -257,33 +277,96 @@ def create_app(
 
     # -- settings --------------------------------------------------------------
 
+    def clear_protect_alarm_settings() -> dict:
+        store.update_settings(
+            {},
+            delete_keys=(
+                "protect.api_key",
+                "protect.alarm_trigger_id",
+                ALARM_ENABLED_AFTER_SETTING,
+            ),
+            suppress_completed_alarms=True,
+        )
+        return {"ok": True, "alarm_configured": False}
+
+    @app.delete("/api/settings/protect/alarm")
+    def delete_protect_alarm(_=authed) -> dict:
+        """Disable alarms locally even when the Protect console is offline."""
+        return clear_protect_alarm_settings()
+
     @app.put("/api/settings/protect")
     def set_protect(body: ProtectSettingsBody, _=authed) -> dict:
+        if body.disable_alarm:
+            return {
+                **clear_protect_alarm_settings(),
+                "cameras": None,
+            }
         try:
             host = validate_host(body.host)
+            submitted_trigger_id = (
+                validate_alarm_trigger_id(body.alarm_trigger_id)
+                if body.alarm_trigger_id
+                else ""
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
+        submitted_api_key = body.api_key.strip()
+        stored_alarm_settings = store.get_settings(
+            ("protect.api_key", "protect.alarm_trigger_id")
+        )
+        stored_api_key = stored_alarm_settings["protect.api_key"]
+        stored_trigger_id = stored_alarm_settings["protect.alarm_trigger_id"]
+        effective_api_key = submitted_api_key or stored_api_key
+        effective_trigger_id = submitted_trigger_id or stored_trigger_id
+        if effective_trigger_id and not effective_api_key:
+            raise HTTPException(
+                status_code=422,
+                detail="Protect API key is required when an alarm trigger id is set",
+            )
         client = ProtectClient(
             host,
             body.username,
             body.password,
             verify_ssl=body.verify_ssl,
             transport=protect_transport,
+            api_key=effective_api_key,
         )
         try:
             client.login()
             cameras = client.get_cameras()
+            if effective_api_key:
+                client.get_integration_info()
         except ProtectAuthError as exc:
             raise HTTPException(status_code=401, detail=str(exc))
         except (ProtectError, OSError) as exc:
             raise HTTPException(status_code=502, detail=f"Could not reach UniFi Protect: {exc}")
         finally:
             client.close()
-        store.set_setting("protect.host", host)
-        store.set_setting("protect.username", body.username)
-        store.set_setting("protect.password", body.password, secret=True)
-        store.set_setting("protect.verify_ssl", "1" if body.verify_ssl else "0")
-        return {"ok": True, "cameras": len(cameras)}
+        settings_updates = {
+            "protect.host": (host, False),
+            "protect.username": (body.username, False),
+            "protect.password": (body.password, True),
+            "protect.verify_ssl": ("1" if body.verify_ssl else "0", False),
+        }
+        if submitted_api_key:
+            settings_updates["protect.api_key"] = (submitted_api_key, True)
+        if submitted_trigger_id:
+            settings_updates["protect.alarm_trigger_id"] = (
+                submitted_trigger_id,
+                False,
+            )
+        alarm_is_configured = bool(effective_api_key and effective_trigger_id)
+        store.update_settings(
+            settings_updates,
+            activate_alarm_at_ms=(
+                int(time.time() * 1000) if alarm_is_configured else None
+            ),
+        )
+        return {
+            "ok": True,
+            "cameras": len(cameras),
+            "alarm_configured": alarm_is_configured,
+        }
 
     @app.put("/api/settings/square")
     def set_square(body: SquareSettingsBody, _=authed) -> dict:
@@ -458,9 +541,15 @@ def create_app(
         square = build_square()
         if square is None:
             return 0
-        protect = build_protect()
+        protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
+        protect = build_protect(protect_settings)
         try:
-            return sync.sync_payments(store, square, protect)
+            return sync.sync_payments(
+                store,
+                square,
+                protect,
+                alarm_trigger_id=protect_settings["protect.alarm_trigger_id"],
+            )
         finally:
             square.close()
             if protect:
@@ -502,8 +591,9 @@ def create_app(
             txn = await run_in_threadpool(sync.ingest_payment, store, payment, None)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        if txn.get("camera_id") and not txn.get("thumbnail_path"):
-            nudge_thumbnail_queue()
+        # Both alarm delivery and thumbnail capture are durable queue work;
+        # the drain no-ops cheaply when neither has anything pending.
+        nudge_protect_work_queue()
         return JSONResponse({"ok": True})
 
     # -- static frontend ---------------------------------------------------------

@@ -23,6 +23,8 @@ THUMBNAIL_RETRY_LEASE_SECONDS = 5 * 60
 THUMBNAIL_RETRY_BASE_DELAY_SECONDS = 30
 THUMBNAIL_RETRY_MAX_DELAY_SECONDS = 60 * 60
 _THUMBNAIL_ERRORS = (ProtectError, httpx.RequestError, ValueError, OSError)
+ALARM_RETRY_BATCH_SIZE = 10
+ALARM_RETRY_NETWORK_TIMEOUT_SECONDS = 5
 
 
 def parse_ts_ms(created_at: str) -> int:
@@ -179,8 +181,100 @@ def retry_missing_thumbnails(
     return completed
 
 
+def deliver_completed_alarm(
+    store: Store,
+    txn_id: str,
+    protect: ProtectClient | None,
+    alarm_trigger_id: str | None,
+    *,
+    timeout: float | None = None,
+) -> bool:
+    """Best-effort Alarm Manager delivery after the transaction is durable."""
+    if protect is None or not alarm_trigger_id:
+        return True
+    try:
+        claim_token = store.claim_alarm_trigger(txn_id)
+    except Exception as exc:
+        logger.warning("Could not claim alarm trigger for %s: %s", txn_id, exc)
+        return False
+    if not claim_token:
+        return True
+
+    try:
+        protect.trigger_alarm(alarm_trigger_id, timeout=timeout)
+    except Exception as exc:
+        try:
+            store.release_alarm_claim(txn_id, claim_token)
+        except Exception as release_exc:
+            logger.warning(
+                "Could not release alarm trigger claim for %s: %s",
+                txn_id,
+                release_exc,
+            )
+        logger.warning("Alarm trigger failed for %s: %s", txn_id, exc)
+        return False
+
+    try:
+        marked_sent = store.mark_alarm_sent(txn_id, claim_token)
+    except Exception as exc:
+        # Leave the claim in progress. Startup resets it for an at-least-once
+        # retry rather than risking an immediate duplicate delivery.
+        logger.warning("Alarm sent but state update failed for %s: %s", txn_id, exc)
+        return False
+    else:
+        if not marked_sent:
+            logger.warning("Alarm sent but claim ownership changed for %s", txn_id)
+            return False
+    return True
+
+
+def _load_pending_alarm_ids(
+    store: Store,
+    protect: ProtectClient | None,
+    alarm_trigger_id: str | None,
+) -> list[str]:
+    if protect is None or not alarm_trigger_id:
+        return []
+    try:
+        return store.pending_alarm_transaction_ids()
+    except Exception as exc:
+        logger.warning("Could not load pending alarm triggers: %s", exc)
+        return []
+
+
+def retry_pending_alarms(
+    store: Store,
+    protect: ProtectClient | None,
+    alarm_trigger_id: str | None,
+    *,
+    batch_size: int = ALARM_RETRY_BATCH_SIZE,
+) -> int:
+    """Deliver a bounded batch of pending sale alarms, oldest first.
+
+    Stops at the first hard failure so an unreachable console cannot burn the
+    whole batch; the durable alarm state retries on the next nudge or sync.
+    """
+    delivered = 0
+    for txn_id in _load_pending_alarm_ids(store, protect, alarm_trigger_id)[
+        : max(0, int(batch_size))
+    ]:
+        if not deliver_completed_alarm(
+            store,
+            txn_id,
+            protect,
+            alarm_trigger_id,
+            timeout=ALARM_RETRY_NETWORK_TIMEOUT_SECONDS,
+        ):
+            break
+        delivered += 1
+    return delivered
+
+
 def sync_payments(
-    store: Store, square: SquareClient, protect: ProtectClient | None
+    store: Store,
+    square: SquareClient,
+    protect: ProtectClient | None,
+    alarm_trigger_id: str | None = None,
 ) -> int:
     """Pull recent Square payments and ingest them. Returns count ingested."""
     count = 0
@@ -222,8 +316,10 @@ def sync_payments(
                 except ValueError as exc:
                     logger.warning("Skipping malformed payment: %s", exc)
     finally:
-        # Retry persisted misses after fresh payments. This still runs when
-        # Square listing fails, and never contributes to the ingested count.
+        # Durable Protect work runs even when Square listing fails, and never
+        # contributes to the ingested count: first any pending sale alarms,
+        # then persisted thumbnail misses.
+        retry_pending_alarms(store, protect, alarm_trigger_id)
         if protect is not None:
             try:
                 retry_missing_thumbnails(store, protect)

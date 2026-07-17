@@ -13,12 +13,18 @@ from app.main import create_app
 
 PROTECT_USER = "protect-admin"
 PROTECT_PASS = "protect-pass-123"
+PROTECT_API_KEY = "protect-api-key-secret-789"
+PROTECT_ALARM_TRIGGER_ID = "square-completed-sale"
 SQUARE_TOKEN = "sq-test-token-abc123"
 ADMIN_PASSWORD = "hunter2-hunter2"
 WEBHOOK_KEY = "whsec_test_key_456"
 WEBHOOK_URL = "https://shop.example.com/webhooks/square"
 
 FAKE_JPEG = b"\xff\xd8\xff\xe0" + b"JFIF-fake-image-data" * 4 + b"\xff\xd9"
+
+PROTECT_META_KEYS: list[str | None] = []
+PROTECT_ALARM_CALLS: list[str] = []
+PROTECT_ALARM_RESPONSES: list[int] = []
 
 SQUARE_PAYMENTS = [
     {
@@ -53,6 +59,21 @@ def protect_handler(request: httpx.Request) -> httpx.Response:
             headers={"x-csrf-token": "csrf-token-1", "set-cookie": "TOKEN=t1; Path=/"},
             json={"id": "user1"},
         )
+    if path == "/proxy/protect/integration/v1/meta/info":
+        api_key = request.headers.get("x-api-key")
+        PROTECT_META_KEYS.append(api_key)
+        if api_key != PROTECT_API_KEY:
+            return httpx.Response(401, json={"error": "Invalid API key"})
+        return httpx.Response(200, json={"applicationVersion": "7.1.87"})
+    alarm_match = re.fullmatch(
+        r"/proxy/protect/integration/v1/alarm-manager/webhook/([^/]+)", path
+    )
+    if alarm_match:
+        if request.headers.get("x-api-key") != PROTECT_API_KEY:
+            return httpx.Response(401, json={"error": "Invalid API key"})
+        PROTECT_ALARM_CALLS.append(alarm_match.group(1))
+        status_code = PROTECT_ALARM_RESPONSES.pop(0) if PROTECT_ALARM_RESPONSES else 204
+        return httpx.Response(status_code)
     if path == "/proxy/protect/api/bootstrap":
         return httpx.Response(
             200,
@@ -75,6 +96,17 @@ def protect_handler(request: httpx.Request) -> httpx.Response:
             headers={"content-type": "image/jpeg"},
         )
     return httpx.Response(404)
+
+
+@pytest.fixture(autouse=True)
+def reset_protect_integration_mock():
+    PROTECT_META_KEYS.clear()
+    PROTECT_ALARM_CALLS.clear()
+    PROTECT_ALARM_RESPONSES.clear()
+    yield
+    PROTECT_META_KEYS.clear()
+    PROTECT_ALARM_CALLS.clear()
+    PROTECT_ALARM_RESPONSES.clear()
 
 
 def square_handler(request: httpx.Request) -> httpx.Response:

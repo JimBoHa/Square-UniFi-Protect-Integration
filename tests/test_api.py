@@ -105,6 +105,58 @@ def test_protect_settings_success(authed):
     assert resp.json()["cameras"] == 2
     assert authed.get("/api/status").json()["protect_configured"] is True
 
+def test_deep_link_settings_default_response_does_not_expose_secrets(configured):
+    resp = configured.get("/api/settings/deep-link")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "template": "",
+        "default_template": (
+            "https://{host}/protect/timelapse/{camera_id}?start={ts_ms}"
+        ),
+    }
+    for secret in (SQUARE_TOKEN, PROTECT_PASS, PROTECT_API_KEY, WEBHOOK_KEY):
+        assert secret not in resp.text
+
+def test_deep_link_settings_custom_template_and_blank_restore(configured):
+    template = "https://{host}/protect/timeline/{camera_id}?at={ts_ms}"
+    saved = configured.put(
+        "/api/settings/deep-link",
+        json={"template": f"  {template}  "},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["template"] == template
+    assert configured.app.state.store.get_setting("deep_link_template") == template
+
+    configured.post("/api/sync")
+    txn = configured.get("/api/transactions").json()[0]
+    assert txn["deep_link"] == (
+        f"https://192.168.1.1/protect/timeline/{CAM1}?at={txn['ts_ms']}"
+    )
+
+    restored = configured.put("/api/settings/deep-link", json={"template": ""})
+    assert restored.status_code == 200
+    assert restored.json()["template"] == ""
+    assert configured.app.state.store.get_setting("deep_link_template") is None
+    txn = configured.get("/api/transactions").json()[0]
+    assert txn["deep_link"] == (
+        f"https://192.168.1.1/protect/timelapse/{CAM1}?start={txn['ts_ms']}"
+    )
+
+def test_deep_link_settings_reject_invalid_without_replacing_saved_value(configured):
+    template = "https://{host}/protect/timeline/{camera_id}?at={ts_ms}"
+    assert configured.put(
+        "/api/settings/deep-link", json={"template": template}
+    ).status_code == 200
+
+    resp = configured.put(
+        "/api/settings/deep-link",
+        json={
+            "template": "https://evil.example/{host}/{camera_id}?at={ts_ms}",
+        },
+    )
+    assert resp.status_code == 422
+    assert configured.app.state.store.get_setting("deep_link_template") == template
+
 def test_protect_alarm_settings_verify_and_encrypt_api_key(authed, tmp_path):
     bad = authed.put(
         "/api/settings/protect",

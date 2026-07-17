@@ -153,6 +153,29 @@ $("#protect-disable-alarm").addEventListener("click", async () => {
   }
 });
 
+$("#deep-link-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    const result = await api("/api/settings/deep-link", {
+      method: "PUT",
+      body: JSON.stringify(deepLinkSettingsRequest($("#deep-link-template"))),
+    });
+    applyDeepLinkSettings(
+      $("#deep-link-template"),
+      $("#deep-link-status"),
+      result,
+    );
+    message(
+      result.template
+        ? "Custom Protect timeline link saved."
+        : "Protect timeline link restored to the built-in default.",
+      "ok",
+    );
+  } catch (err) {
+    message(err.message, "error");
+  }
+});
+
 $("#square-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {
@@ -179,6 +202,14 @@ async function loadSettingsView() {
   const rows = $("#mapping-rows");
   rows.textContent = "";
   let cameras = [], locations = [], mappings = [], devices = [];
+  try {
+    const settings = await api("/api/settings/deep-link");
+    applyDeepLinkSettings(
+      $("#deep-link-template"),
+      $("#deep-link-status"),
+      settings,
+    );
+  } catch { /* Session routing and API errors are handled by api(). */ }
   try { cameras = await api("/api/cameras"); } catch { /* Protect not configured yet */ }
   try { locations = await api("/api/locations"); } catch { /* Square not configured yet */ }
   try { devices = await api("/api/pos-devices"); } catch { /* No observed devices yet */ }

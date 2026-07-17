@@ -51,6 +51,16 @@
         <button type="button" id="protect-disable-alarm">Disable alarm trigger</button>
       </form>
 
+      <h3>Protect timeline link</h3>
+      <form id="deep-link-form">
+        <label>Deep-link template
+          <input id="deep-link-template" maxlength="2048" autocomplete="off" spellcheck="false" aria-describedby="deep-link-help deep-link-status">
+        </label>
+        <p id="deep-link-help" class="hint">Leave blank to use the built-in default. Custom values must begin with https://{host}/ and include {camera_id} and {ts_ms}.</p>
+        <p id="deep-link-status" class="hint" role="status"></p>
+        <button type="submit">Save timeline link</button>
+      </form>
+
       <h2>Square account</h2>
       <form id="square-form">
         <label>Access token <input type="password" id="square-token" autocomplete="off" required></label>
@@ -97,6 +107,7 @@
   </main>
 
   <script src="/format.js"></script>
+  <script src="/deep-link-form.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

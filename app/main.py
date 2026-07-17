@@ -89,6 +89,9 @@ class CameraMappingEntry(BaseModel):
 class CameraMappingBody(BaseModel):
     mappings: list[CameraMappingEntry]
 
+class DeepLinkSettingsBody(BaseModel):
+    template: str = Field(default="", max_length=2048)
+
 
 # ---------------------------------------------------------------------------
 # App factory
@@ -501,6 +504,29 @@ def create_app(
         # Blank webhook fields without clear_webhook leave any stored webhook
         # configuration untouched, so re-saving the access token is safe.
         return {"ok": True, "locations": locations}
+
+    def deep_link_settings_response() -> dict[str, str]:
+        return {
+            "template": store.get_setting("deep_link_template") or "",
+            "default_template": deeplink.DEFAULT_TEMPLATE,
+        }
+
+    @app.get("/api/settings/deep-link")
+    def get_deep_link_settings(_=authed) -> dict[str, str]:
+        """Return only the non-secret Protect timeline-link configuration."""
+        return deep_link_settings_response()
+
+    @app.put("/api/settings/deep-link")
+    def set_deep_link_settings(body: DeepLinkSettingsBody, _=authed) -> dict:
+        try:
+            template = deeplink.validate_deep_link_template(body.template)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        if not template or template == deeplink.DEFAULT_TEMPLATE:
+            store.delete_setting("deep_link_template")
+        else:
+            store.set_setting("deep_link_template", template)
+        return {"ok": True, **deep_link_settings_response()}
 
     # -- cameras & mapping ------------------------------------------------------
 

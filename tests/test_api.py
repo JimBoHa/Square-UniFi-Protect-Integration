@@ -261,8 +261,10 @@ def test_transaction_thumbnail_served(configured):
     assert resp.content.endswith(str(txn["ts_ms"]).encode())
 
 def test_sync_is_idempotent(configured):
-    configured.post("/api/sync")
-    configured.post("/api/sync")
+    first = configured.post("/api/sync")
+    second = configured.post("/api/sync")
+    assert first.json()["ingested"] == 2
+    assert second.json()["ingested"] == 0
     assert len(configured.get("/api/transactions").json()) == 2
 
 def test_transactions_without_camera_mapping_still_listed(authed):

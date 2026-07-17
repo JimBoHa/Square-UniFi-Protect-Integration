@@ -393,15 +393,20 @@ def create_app(
     # -- settings --------------------------------------------------------------
 
     def clear_protect_alarm_settings() -> dict:
-        store.update_settings(
-            {},
-            delete_keys=(
-                "protect.api_key",
-                "protect.alarm_trigger_id",
-                ALARM_ENABLED_AFTER_SETTING,
-            ),
-            suppress_completed_alarms=True,
-        )
+        with store.protect_settings_guard():
+            # Wait for any claimed delivery to finish before reporting the
+            # trigger disabled. New drains take the shared side of the
+            # provider-state guard.
+            with store.integration_guard(exclusive=True):
+                store.update_settings(
+                    {},
+                    delete_keys=(
+                        "protect.api_key",
+                        "protect.alarm_trigger_id",
+                        ALARM_ENABLED_AFTER_SETTING,
+                    ),
+                    suppress_completed_alarms=True,
+                )
         return {"ok": True, "alarm_configured": False}
 
     @app.delete("/api/settings/protect/alarm")
@@ -472,6 +477,11 @@ def create_app(
                 **clear_protect_alarm_settings(),
                 "cameras": None,
             }
+        with store.protect_settings_guard():
+            return set_protect_locked(body)
+
+    def set_protect_locked(body: ProtectSettingsBody) -> dict:
+        """Validate and commit one serialized Protect settings mutation."""
         try:
             host = validate_host(body.host)
             submitted_trigger_id = (
@@ -615,10 +625,11 @@ def create_app(
             )
 
         try:
-            if console_switch_requested:
-                with store.integration_guard(exclusive=True):
-                    console_switched = commit_protect_settings()
-            else:
+            # Keep slow credential probes outside the provider writer so
+            # webhook persistence and reads remain available. The mutation
+            # guard still prevents another PUT/DELETE from changing the
+            # retained settings snapshot before this atomic commit.
+            with store.integration_guard(exclusive=True):
                 console_switched = commit_protect_settings()
         except ProtectConsoleSwitchConfirmationRequired as exc:
             raise HTTPException(status_code=409, detail=str(exc))

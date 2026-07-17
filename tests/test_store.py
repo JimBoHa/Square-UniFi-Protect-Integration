@@ -987,6 +987,42 @@ def test_only_one_concurrent_protect_console_switch_can_commit(tmp_path):
         first.close()
 
 
+def test_protect_settings_guard_serializes_store_instances(tmp_path):
+    data_dir = tmp_path / "data"
+    first = Store(data_dir)
+    second = Store(data_dir)
+    first_entered = threading.Event()
+    second_attempted = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+
+    def hold_first() -> None:
+        with first.protect_settings_guard():
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+
+    def take_second() -> None:
+        second_attempted.set()
+        with second.protect_settings_guard():
+            second_entered.set()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first_future = executor.submit(hold_first)
+            assert first_entered.wait(timeout=5)
+            second_future = executor.submit(take_second)
+            assert second_attempted.wait(timeout=5)
+            assert not second_entered.wait(timeout=0.05)
+            release_first.set()
+            first_future.result(timeout=5)
+            second_future.result(timeout=5)
+            assert second_entered.is_set()
+    finally:
+        release_first.set()
+        second.close()
+        first.close()
+
+
 def test_windows_integration_guard_allows_readers_and_makes_writer_wait(
     tmp_path,
     monkeypatch,

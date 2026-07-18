@@ -496,3 +496,14 @@ def test_all_api_responses_default_to_no_store(configured):
         resp = configured.get(path)
         assert resp.status_code == 200
         assert resp.headers["cache-control"] == "private, no-store"
+
+
+def test_frontend_only_treats_session_401_as_logout():
+    """Upstream-credential 401s from settings endpoints must not bounce the
+    operator to the login view; only the app session's own 401 may."""
+    from pathlib import Path
+
+    js = (Path(__file__).parent.parent / "app" / "static" / "app.js").read_text()
+    assert 'data.detail === "Authentication required"' in js
+    # The redirect decision must consider the parsed body, not status alone.
+    assert 'resp.status === 401 && path !== "/api/login") {' not in js

@@ -33,12 +33,20 @@ async function api(path, options = {}) {
     credentials: "same-origin",
     ...requestOptions,
   });
-  if (resp.status === 401 && path !== "/api/login") {
+  const data = await resp.json().catch(() => ({}));
+  // Only an expired/missing app session should bounce to the login view.
+  // Settings endpoints also return 401 when UniFi Protect or Square reject
+  // the submitted credentials; those must surface as inline errors instead
+  // of asking the operator to log out and back in.
+  const sessionExpired =
+    resp.status === 401 &&
+    path !== "/api/login" &&
+    data.detail === "Authentication required";
+  if (sessionExpired) {
     show("#view-login");
     $("#nav").hidden = true;
     throw new Error("Please log in");
   }
-  const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     const error = new Error(data.detail || `Request failed (${resp.status})`);
     error.status = resp.status;

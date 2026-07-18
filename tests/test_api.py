@@ -2707,3 +2707,50 @@ def test_dashboard_tiles_ui_wiring():
     assert "startDashboardRefresh" in js
     for tile in ("protect", "square", "webhook", "queues"):
         assert f'data-tile="{tile}"' in html
+
+
+def test_sync_ingests_square_facts_when_protect_console_unreachable(tmp_path):
+    """A Protect outage defers camera evidence but must not block ingestion."""
+    protect_down = {"value": False}
+
+    def flaky_protect(request: httpx.Request) -> httpx.Response:
+        if protect_down["value"]:
+            raise httpx.ConnectError("console offline", request=request)
+        return protect_handler(request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(flaky_protect),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/protect",
+                json={
+                    "host": "192.168.1.1",
+                    "username": PROTECT_USER,
+                    "password": PROTECT_PASS,
+                },
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/square",
+                json={"access_token": SQUARE_TOKEN, "environment": "sandbox"},
+            ).status_code == 200
+
+            protect_down["value"] = True
+            resp = isolated.post("/api/sync")
+            assert resp.status_code == 200
+            assert resp.json()["ingested"] > 0
+            txns = isolated.get("/api/transactions").json()
+            assert txns
+            assert all(txn["thumbnail_url"] is None for txn in txns)
+    finally:
+        app.state.store.close()

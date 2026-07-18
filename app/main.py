@@ -296,6 +296,9 @@ def create_app(
             transport=square_transport,
         )
 
+    class ProtectConsoleIdentityMismatch(ProtectError):
+        """A different NVR answered on the configured Protect host."""
+
     def verify_protect_console_identity(
         protect: ProtectClient,
         settings: dict[str, str | None],
@@ -306,7 +309,7 @@ def create_app(
             return
         _, observed_console_id = protect.get_cameras_with_console_identity()
         if observed_console_id != expected_console_id:
-            raise ProtectError(
+            raise ProtectConsoleIdentityMismatch(
                 "UniFi Protect console identity changed or disappeared; "
                 "reconnect Protect before processing camera evidence or alarms"
             )
@@ -1443,7 +1446,24 @@ def create_app(
                 protect = build_protect(protect_settings)
                 try:
                     if protect:
-                        verify_protect_console_identity(protect, protect_settings)
+                        try:
+                            verify_protect_console_identity(
+                                protect, protect_settings
+                            )
+                        except ProtectConsoleIdentityMismatch:
+                            raise
+                        except (ProtectError, OSError) as exc:
+                            # A Protect outage must not block Square ingestion:
+                            # ingest payment facts now and let the durable
+                            # retry queue capture camera evidence later. Only a
+                            # positively observed identity mismatch hard-fails.
+                            logger.warning(
+                                "Protect unreachable during sync; "
+                                "deferring camera evidence: %s",
+                                exc,
+                            )
+                            protect.close()
+                            protect = None
                     return sync.sync_payments(
                         store,
                         square,

@@ -160,6 +160,23 @@ Serve the integration over HTTPS (reverse proxy) and set `SPI_COOKIE_SECURE=1`
 in production. The webhook endpoint is the only route that must be reachable
 from the internet; everything else can stay LAN-only.
 
+## FAQ
+
+**Do I need the Square "Application ID" (or "Sandbox Application ID")?**
+No — not for anything this integration does today. Square's Application ID
+identifies your *application* in OAuth authorization flows and in Square's
+client-side SDKs (such as the Web Payments SDK that renders card forms in a
+browser). This integration only makes server-side Payments/Locations/Webhook
+API calls, and those authenticate with the **access token** alone. Copy the
+access token from the same Credentials page and ignore the Application ID.
+It will only become relevant if/when the "Connect with Square" OAuth sign-in
+feature lands, where it serves as the OAuth client id.
+
+**Sandbox or Production?** Use the Sandbox token (and select *Sandbox* in
+Settings) to trial the integration with fake payments you create from the
+Square developer dashboard; switch to the Production token for real sales.
+The two are separate environments with separate tokens.
+
 ## Development
 
 ```bash

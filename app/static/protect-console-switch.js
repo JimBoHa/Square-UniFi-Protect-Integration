@@ -24,6 +24,34 @@ function publishLatestSettingsLoad(loadGeneration, latestGeneration, publish) {
   return true;
 }
 
+function settingsSnapshotsMatch({
+  cameraGeneration,
+  locationRevision,
+  mappingGeneration,
+  mappingRevision,
+}) {
+  return (
+    (cameraGeneration === null || cameraGeneration === mappingGeneration) &&
+    (locationRevision === null || locationRevision === mappingRevision)
+  );
+}
+
+function publishCoherentSettingsLoad(
+  loadGeneration,
+  latestGeneration,
+  snapshots,
+  publish,
+) {
+  if (loadGeneration !== latestGeneration) return "discard";
+  if (!settingsSnapshotsMatch(snapshots)) return "reload";
+  publish();
+  return "published";
+}
+
+function settingsSnapshotMismatchAction(retriesRemaining) {
+  return retriesRemaining > 0 ? "retry" : "show-reload";
+}
+
 function clearProtectConsoleView(mappingRows, saveButton, previewWrap, previewImage) {
   mappingRows.textContent = "";
   saveButton.hidden = true;
@@ -36,6 +64,9 @@ if (typeof module !== "undefined") {
     protectConnectionMessage,
     protectConsoleSwitchTokenRequest,
     publishLatestSettingsLoad,
+    settingsSnapshotsMatch,
+    publishCoherentSettingsLoad,
+    settingsSnapshotMismatchAction,
     clearProtectConsoleView,
   };
 }

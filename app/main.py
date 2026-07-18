@@ -1206,9 +1206,17 @@ def create_app(
     @app.get("/api/camera-mapping")
     def get_mapping(_=authed) -> JSONResponse:
         with store.integration_guard():
+            protect_generation = store.get_setting(
+                PROTECT_CONSOLE_GENERATION_SETTING
+            )
+            square_account_revision = store.square_account_revision()
             return JSONResponse(
                 store.get_camera_mappings(),
-                headers={"Cache-Control": "private, no-store"},
+                headers={
+                    "Cache-Control": "private, no-store",
+                    "X-Protect-Console-Generation": protect_generation or "",
+                    "X-Square-Account-Revision": square_account_revision or "",
+                },
             )
 
     @app.put("/api/camera-mapping")

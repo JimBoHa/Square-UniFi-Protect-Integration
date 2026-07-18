@@ -898,6 +898,6 @@ def test_account_switch_ui_reveals_destructive_confirmation_after_409():
     # Stale-load protection lives in the shared settings loader: only the
     # latest load's render publishes the account revision.
     assert "createLatestSettingsLoader" in js
-    assert "settings.accountRevision" in js
+    assert "settings.mappingRevision" in js
     assert "X-Square-Account-Revision" in js
     assert "evidence_cleanup_pending" in js

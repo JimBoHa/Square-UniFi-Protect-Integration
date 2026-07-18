@@ -451,6 +451,14 @@ async function refreshSquareStatus() {
 }
 
 async function fetchSettingsView() {
+  // Clear any previous console's rows/preview before the provider reads so a
+  // switch never leaves stale evidence on screen while data loads.
+  clearProtectConsoleView(
+    $("#mapping-rows"),
+    $("#save-mapping"),
+    $("#camera-preview-wrap"),
+    $("#camera-preview"),
+  );
   // Connection indicators refresh alongside every settings load; they render
   // into their own elements, so they need no stale-load generation guard.
   void refreshSquareStatus();
@@ -460,24 +468,35 @@ async function fetchSettingsView() {
 
 async function fetchMappingData() {
   let cameras = [], locations = [], mappings = [], devices = [];
-  let accountRevision = "";
-  let protectGeneration = "";
+  let locationRevision = null;
+  let cameraGeneration = null;
+  let mappingRevision = "";
+  let mappingGeneration = "";
   loadDeepLinkSettings();
   try {
     const result = await api("/api/cameras", { includeResponse: true });
     cameras = result.data;
-    protectGeneration =
+    cameraGeneration =
       result.response.headers.get("x-protect-console-generation") || "";
   } catch { /* Protect not configured yet */ }
   try {
     const result = await api("/api/locations", { includeResponse: true });
     locations = result.data;
-    accountRevision = result.response.headers.get("x-square-account-revision") || "";
+    locationRevision =
+      result.response.headers.get("x-square-account-revision") || "";
   } catch { /* Square not configured yet */ }
   try { devices = await api("/api/pos-devices"); } catch { /* No observed devices yet */ }
-  try { mappings = await api("/api/camera-mapping"); } catch { return null; }
+  try {
+    const result = await api("/api/camera-mapping", { includeResponse: true });
+    mappings = result.data;
+    mappingGeneration =
+      result.response.headers.get("x-protect-console-generation") || "";
+    mappingRevision =
+      result.response.headers.get("x-square-account-revision") || "";
+  } catch { return null; }
   return {
-    cameras, locations, mappings, devices, accountRevision, protectGeneration,
+    cameras, locations, mappings, devices,
+    cameraGeneration, locationRevision, mappingGeneration, mappingRevision,
   };
 }
 
@@ -564,16 +583,34 @@ function collectMappings(container) {
   return mappings;
 }
 
+let settingsSnapshotRetriesRemaining = 1;
+
 function renderSettingsView(settings) {
   const rows = $("#mapping-rows");
-  rows.textContent = "";
+  const saveButton = $("#save-mapping");
   if (settings === null) return;
-  // Only the winning (latest) load publishes the tokens used to fence
-  // camera-mapping saves against a concurrent account or console switch.
-  squareAccountRevision = settings.accountRevision || "";
-  cameraMappingGeneration = settings.protectGeneration || "";
+  if (!settingsSnapshotsMatch(settings)) {
+    // A provider switch landed between the individual reads; the snapshots
+    // describe two different accounts/consoles and must not be mixed.
+    if (settingsSnapshotMismatchAction(settingsSnapshotRetriesRemaining) === "retry") {
+      settingsSnapshotRetriesRemaining -= 1;
+      void loadSettingsView();
+      return;
+    }
+    const hint = document.createElement("p");
+    hint.className = "hint";
+    hint.textContent =
+      "Provider settings kept changing while this page loaded. Reload the page to try again.";
+    rows.appendChild(hint);
+    return;
+  }
+  settingsSnapshotRetriesRemaining = 1;
+  // Only the winning (latest) coherent load publishes the tokens used to
+  // fence camera-mapping saves against a concurrent account/console switch.
+  squareAccountRevision = settings.mappingRevision || "";
+  cameraMappingGeneration = settings.mappingGeneration || "";
   const usable = buildMappingRows(rows, settings);
-  $("#save-mapping").hidden = !usable;
+  saveButton.hidden = !usable;
 }
 
 const loadSettingsView = createLatestSettingsLoader(

@@ -31,6 +31,8 @@ PROTECTED_ENDPOINTS = [
     ("GET", "/api/thumbnails/PAY_001"),
     ("POST", "/api/sync"),
     ("PUT", "/api/settings/protect"),
+    ("GET", "/api/settings/deep-link"),
+    ("PUT", "/api/settings/deep-link"),
     ("PUT", "/api/settings/square"),
     ("POST", "/api/logout"),
 ]

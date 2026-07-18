@@ -110,9 +110,10 @@ Open `http://<host>:8000`, then:
 | `SPI_COOKIE_SECURE` | `0` | Set `1` when serving over HTTPS |
 | `SPI_ENCRYPTION_KEY` | — | Fernet key overriding the on-disk key file |
 
-The deep-link URL format can be adjusted for your Protect version by setting
-the `deep_link_template` key in the settings table; the default (verified on
-Protect 7.1.87) is
+The Protect timeline URL can be adjusted under **Settings → Protect timeline
+link**. Custom templates must start with `https://{host}/` and include
+`{camera_id}` and `{ts_ms}`; leave the field blank to restore the built-in
+default (verified on Protect 7.1.87):
 `https://{host}/protect/timelapse/{camera_id}?start={ts_ms}`.
 
 > **Note on historical thumbnails:** verified against a UNVR G2 running

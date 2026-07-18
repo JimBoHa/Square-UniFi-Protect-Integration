@@ -118,6 +118,15 @@ for (const btn of document.querySelectorAll("nav button[data-view]")) {
 
 // ---------------------------------------------------------------- settings
 
+const loadDeepLinkSettings = createLatestDeepLinkSettingsLoader(
+  () => api("/api/settings/deep-link"),
+  (settings) => applyDeepLinkSettings(
+    $("#deep-link-template"),
+    $("#deep-link-status"),
+    settings,
+  ),
+);
+
 $("#protect-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {
@@ -148,6 +157,30 @@ $("#protect-disable-alarm").addEventListener("click", async () => {
     $("#protect-api-key").value = "";
     $("#protect-alarm-trigger-id").value = "";
     message("Protect alarm trigger disabled.", "ok");
+  } catch (err) {
+    message(err.message, "error");
+  }
+});
+
+$("#deep-link-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    const result = await api("/api/settings/deep-link", {
+      method: "PUT",
+      body: JSON.stringify(deepLinkSettingsRequest($("#deep-link-template"))),
+    });
+    loadDeepLinkSettings.invalidate();
+    applyDeepLinkSettings(
+      $("#deep-link-template"),
+      $("#deep-link-status"),
+      result,
+    );
+    message(
+      result.template
+        ? "Custom Protect timeline link saved."
+        : "Protect timeline link restored to the built-in default.",
+      "ok",
+    );
   } catch (err) {
     message(err.message, "error");
   }
@@ -186,6 +219,7 @@ async function loadSettingsView() {
   const rows = $("#mapping-rows");
   rows.textContent = "";
   let cameras = [], locations = [], mappings = [], devices = [];
+  loadDeepLinkSettings();
   try { cameras = await api("/api/cameras"); } catch { /* Protect not configured yet */ }
   try { locations = await api("/api/locations"); } catch { /* Square not configured yet */ }
   try { devices = await api("/api/pos-devices"); } catch { /* No observed devices yet */ }

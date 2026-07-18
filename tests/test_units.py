@@ -11,7 +11,11 @@ import httpx
 import pytest
 from cryptography.fernet import Fernet
 
-from app.deeplink import build_deep_link
+from app.deeplink import (
+    DEFAULT_TEMPLATE,
+    build_deep_link,
+    validate_deep_link_template,
+)
 from app.protect_client import (
     ProtectAuthError,
     ProtectClient,
@@ -164,6 +168,49 @@ def test_deep_link_custom_template():
         "u.local", "cam1", 5, template="https://{host}/protect/timeline?cams={camera_id}&t={ts_ms}"
     )
     assert link == "https://u.local/protect/timeline?cams=cam1&t=5"
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        DEFAULT_TEMPLATE,
+        "https://{host}/protect/timeline/{camera_id}?at={ts_ms}",
+        "  https://{host}/protect/{camera_id}#timestamp={ts_ms}  ",
+    ],
+)
+def test_deep_link_template_validation_accepts_safe_urls(template):
+    assert validate_deep_link_template(template) == template.strip()
+
+def test_deep_link_template_validation_treats_blank_as_default_override():
+    assert validate_deep_link_template("  ") == ""
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "http://{host}/protect/{camera_id}?at={ts_ms}",
+        "javascript://{host}/{camera_id}?at={ts_ms}",
+        "https://evil.example/{host}/{camera_id}?at={ts_ms}",
+        "https://{host}@evil.example/{camera_id}?at={ts_ms}",
+        "https://{host}:443/{camera_id}?at={ts_ms}",
+        "https://{host}/protect/{camera_id}",
+        "https://{host}/protect?at={ts_ms}",
+        "https://{host}/protect/{camera_id}?at={ts_ms}&extra={unknown}",
+        "https://{host}/protect/{{camera_id}}?at={ts_ms}",
+        "https://{host}/protect/\n{camera_id}?at={ts_ms}",
+        "https://{host}\\evil.example/{camera_id}?at={ts_ms}",
+    ],
+)
+def test_deep_link_template_validation_rejects_unsafe_urls(template):
+    with pytest.raises(ValueError):
+        validate_deep_link_template(template)
+
+def test_deep_link_build_rejects_unsafe_legacy_template():
+    with pytest.raises(ValueError):
+        build_deep_link(
+            "u.local",
+            "cam1",
+            5,
+            template="https://evil.example/{host}/{camera_id}?at={ts_ms}",
+        )
 
 def test_deep_link_rejects_bad_values():
     with pytest.raises(ValueError):

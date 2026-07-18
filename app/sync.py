@@ -32,6 +32,8 @@ ALARM_RETRY_NETWORK_TIMEOUT_SECONDS = 5
 
 def parse_ts_ms(created_at: str) -> int:
     dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise ValueError("Square timestamp must include a timezone offset")
     return int(dt.timestamp() * 1000)
 
 

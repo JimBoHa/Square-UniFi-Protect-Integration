@@ -247,6 +247,12 @@ def test_poll_interval_accepts_finite_values_at_least_one_second(value, expected
 def test_parse_ts_ms_known_value():
     assert parse_ts_ms("2021-01-01T00:00:00Z") == 1609459200000
     assert parse_ts_ms("2021-01-01T00:00:00.500Z") == 1609459200500
+    assert parse_ts_ms("2020-12-31T16:00:00-08:00") == 1609459200000
+
+
+def test_parse_ts_ms_rejects_timezone_less_value():
+    with pytest.raises(ValueError, match="timezone offset"):
+        parse_ts_ms("2021-01-01T00:00:00")
 
 def test_safe_thumbnail_name_sanitizes():
     assert safe_thumbnail_name("PAY_001") == "PAY_001.jpg"
@@ -957,12 +963,18 @@ def test_sync_uses_offline_client_timestamp_for_snapshot(tmp_path):
     finally:
         store.close()
 
-def test_sync_skips_nonempty_malformed_offline_timestamp(tmp_path):
+@pytest.mark.parametrize(
+    "client_created_at",
+    ["not-a-timestamp", "2026-07-16T08:30:00"],
+)
+def test_sync_skips_nonempty_malformed_offline_timestamp(
+    tmp_path, client_created_at
+):
     payment = {
         "id": "PAY_BAD_TIME",
         "created_at": "2026-07-16T16:30:00Z",
         "is_offline_payment": True,
-        "offline_payment_details": {"client_created_at": "not-a-timestamp"},
+        "offline_payment_details": {"client_created_at": client_created_at},
         "amount_money": {"amount": 1200, "currency": "USD"},
         "status": "COMPLETED",
         "location_id": "LOC1",

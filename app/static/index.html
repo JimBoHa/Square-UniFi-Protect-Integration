@@ -102,6 +102,8 @@
       </h2>
       <form id="protect-form">
         <label>Host / IP <input id="protect-host" placeholder="192.168.1.1" required></label>
+        <button type="button" id="protect-discover">Find console on my network</button>
+        <div id="protect-discover-results" class="hint"></div>
         <label>Username <input id="protect-username" autocomplete="off" required></label>
         <label>Password <input type="password" id="protect-password" required></label>
         <label class="check"><input type="checkbox" id="protect-verify-ssl"> Verify TLS certificate</label>

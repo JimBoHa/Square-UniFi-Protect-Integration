@@ -153,6 +153,45 @@ const loadDeepLinkSettings = createLatestDeepLinkSettingsLoader(
   ),
 );
 
+$("#protect-discover").addEventListener("click", async () => {
+  const button = $("#protect-discover");
+  if (button.disabled) return;
+  button.disabled = true;
+  const results = $("#protect-discover-results");
+  results.textContent = "Scanning the local network (a few seconds)…";
+  const typedHost = $("#protect-host").value.trim();
+  try {
+    const devices = await api("/api/discover/protect", {
+      method: "POST",
+      body: JSON.stringify({ host: typedHost }),
+    });
+    results.textContent = "";
+    const consoles = devices.filter((d) => d.is_console);
+    if (!consoles.length) {
+      results.textContent = typedHost
+        ? "No console answered. Check the IP, or your console may be on another network segment."
+        : "No console found on this network. If yours is on another network segment, type its IP above and press this button to verify it.";
+      return;
+    }
+    for (const device of consoles) {
+      const row = document.createElement("div");
+      const pick = document.createElement("button");
+      pick.type = "button";
+      pick.textContent = `Use ${device.name} (${device.model} at ${device.ip})`;
+      pick.addEventListener("click", () => {
+        $("#protect-host").value = device.ip;
+        results.textContent = `Selected ${device.name} — confirm this really is your console before entering credentials, then sign in below and press Connect Protect.`;
+      });
+      row.appendChild(pick);
+      results.appendChild(row);
+    }
+  } catch (err) {
+    results.textContent = err.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+
 $("#protect-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {

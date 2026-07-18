@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import deeplink, sync
+from . import deeplink, discovery, sync
 from .protect_client import (
     ProtectAuthError,
     ProtectClient,
@@ -123,6 +123,9 @@ class CameraMappingEntry(BaseModel):
 
 class WebhookRegisterBody(BaseModel):
     notification_url: str = Field(min_length=12, max_length=512)
+
+class DiscoverProtectBody(BaseModel):
+    host: str = Field(default="", max_length=255)
 
 class SquareOAuthAppBody(BaseModel):
     client_id: str = Field(min_length=8, max_length=128)
@@ -475,6 +478,32 @@ def create_app(
     def delete_protect_alarm(_=authed) -> dict:
         """Disable alarms locally even when the Protect console is offline."""
         return clear_protect_alarm_settings()
+
+    discovery_scan_lock = threading.Lock()
+
+    @app.post("/api/discover/protect")
+    def discover_protect(body: DiscoverProtectBody, _=authed) -> list[dict]:
+        """Scan the LAN for UniFi consoles; optionally probe one address.
+
+        Broadcast/subnet discovery finds consoles on this network; consoles
+        on routed VLANs only answer a direct probe, so the UI passes the
+        typed host here to identify it before connecting. POST because the
+        scan emits network traffic; one scan runs at a time.
+        """
+        extra: tuple[str, ...] = ()
+        if body.host:
+            try:
+                extra = (validate_host(body.host).partition(":")[0],)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+        if not discovery_scan_lock.acquire(blocking=False):
+            raise HTTPException(
+                status_code=409, detail="A network scan is already running"
+            )
+        try:
+            return discovery.discover_consoles(extra_hosts=extra)
+        finally:
+            discovery_scan_lock.release()
 
     @app.put("/api/settings/protect")
     def set_protect(body: ProtectSettingsBody, _=authed) -> dict:

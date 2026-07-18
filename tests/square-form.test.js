@@ -7,6 +7,7 @@ const test = require("node:test");
 
 const {
   resetSquareWebhookFields,
+  squareOAuthResultFeedback,
   squareWebhookRequestFields,
 } = require("../app/static/square-form.js");
 
@@ -62,6 +63,32 @@ test("remove flow blanks stale credentials and resets after success", () => {
   assert.equal(form.key.value, "");
   assert.equal(form.url.value, "");
   assert.equal(form.clear.checked, false);
+});
+
+test("OAuth result feedback preserves success and explains denied consent", () => {
+  assert.deepEqual(squareOAuthResultFeedback("?square_oauth=connected"), {
+    text: "Square account connected via OAuth.",
+    kind: "ok",
+  });
+  assert.deepEqual(squareOAuthResultFeedback("?square_oauth=denied"), {
+    text: "Square connection was canceled. Open Settings and press “Connect with Square” to try again.",
+    kind: "",
+  });
+  assert.equal(squareOAuthResultFeedback(""), null);
+  assert.equal(squareOAuthResultFeedback("?square_oauth=unknown"), null);
+});
+
+test("handled OAuth results are displayed and removed from the URL", () => {
+  const app = fs.readFileSync(
+    path.join(__dirname, "../app/static/app.js"),
+    "utf8",
+  );
+  assert.match(
+    app,
+    /const oauthFeedback = squareOAuthResultFeedback\(window\.location\.search\)/,
+  );
+  assert.match(app, /message\(oauthFeedback\.text, oauthFeedback\.kind\)/);
+  assert.match(app, /window\.history\.replaceState\(\{\}, "", "\/"\)/);
 });
 
 test("Square form helper is available before the application script", () => {

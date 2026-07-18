@@ -627,6 +627,14 @@ def create_app(
                 )
             except ValueError:
                 link = None
+        if txn.get("thumbnail_path"):
+            thumbnail_status = "ready"
+        elif not txn.get("camera_id"):
+            thumbnail_status = "unmapped"
+        elif int(txn.get("thumbnail_retry_attempts", 0)) > 0:
+            thumbnail_status = "retrying"
+        else:
+            thumbnail_status = "queued"
         return {
             "id": txn["id"],
             "created_at": txn["created_at"],
@@ -643,6 +651,10 @@ def create_app(
             "deep_link": link,
             "thumbnail_url": (
                 f"/api/thumbnails/{txn['id']}" if txn.get("thumbnail_path") else None
+            ),
+            "thumbnail_status": thumbnail_status,
+            "thumbnail_retry_attempts": int(
+                txn.get("thumbnail_retry_attempts", 0)
             ),
         }
 

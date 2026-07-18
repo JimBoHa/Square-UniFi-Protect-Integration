@@ -644,9 +644,38 @@ def test_transaction_thumbnail_served(configured):
     resp = configured.get(txn["thumbnail_url"])
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "image/jpeg"
+    assert txn["thumbnail_status"] == "ready"
+    assert txn["thumbnail_retry_attempts"] == 0
     # The mock embeds the requested ts in the image; the snapshot must have been
     # taken at the transaction's timestamp, not "now".
     assert resp.content.endswith(str(txn["ts_ms"]).encode())
+
+
+def test_transaction_feed_reports_thumbnail_retry_status(configured):
+    assert configured.post("/api/sync").status_code == 200
+    store = configured.app.state.store
+    txn = store.list_transactions(limit=1)[0]
+    with store._lock:
+        store._db.execute(
+            "UPDATE transactions SET thumbnail_path = NULL WHERE id = ?",
+            (txn["id"],),
+        )
+        store._db.execute(
+            "INSERT INTO thumbnail_retries (transaction_id, attempts, last_error) "
+            "VALUES (?, 2, 'console unavailable') "
+            "ON CONFLICT(transaction_id) DO UPDATE SET attempts = 2, "
+            "last_error = 'console unavailable'",
+            (txn["id"],),
+        )
+        store._db.commit()
+
+    listed = next(
+        item for item in configured.get("/api/transactions").json()
+        if item["id"] == txn["id"]
+    )
+    assert listed["thumbnail_url"] is None
+    assert listed["thumbnail_status"] == "retrying"
+    assert listed["thumbnail_retry_attempts"] == 2
 
 def test_sync_is_idempotent(configured):
     first = configured.post("/api/sync")
@@ -756,6 +785,7 @@ def test_transactions_without_camera_mapping_still_listed(authed):
     txns = authed.get("/api/transactions").json()
     assert all(t["thumbnail_url"] is None for t in txns)
     assert all(t["deep_link"] is None for t in txns)
+    assert all(t["thumbnail_status"] == "unmapped" for t in txns)
 
 
 def test_snapshot_transport_error_stores_transaction_without_thumbnail(tmp_path):

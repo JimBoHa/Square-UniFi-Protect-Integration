@@ -447,6 +447,17 @@ def test_transaction_feed_pagination_wiring():
     assert "min-width: 0" in css
     assert "@media (max-width: 520px)" in css
 
+
+def test_transaction_feed_describes_missing_thumbnail_state():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js = (static_dir / "app.js").read_text()
+    assert 'unmapped: "camera not mapped"' in js
+    assert 'queued: "footage queued"' in js
+    assert 'retrying: "capture retrying"' in js
+
+
 def test_pos_device_mapping_ui_wiring():
     from pathlib import Path
 

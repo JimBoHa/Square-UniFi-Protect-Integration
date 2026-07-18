@@ -152,12 +152,15 @@ def create_app(
         )
 
     def build_square() -> SquareClient | None:
-        token = store.get_setting("square.access_token")
+        settings = store.get_settings(
+            ("square.access_token", "square.environment")
+        )
+        token = settings["square.access_token"]
         if not token:
             return None
         return SquareClient(
             token,
-            environment=store.get_setting("square.environment") or "production",
+            environment=settings["square.environment"] or "production",
             transport=square_transport,
         )
 

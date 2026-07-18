@@ -9,6 +9,7 @@ import logging
 import math
 import random
 import time
+from collections.abc import Iterator
 
 import httpx
 
@@ -156,7 +157,7 @@ class SquareClient:
             raise SquareError("Square did not return the access token's merchant id")
         return merchant_id
 
-    def list_payments(
+    def iter_payment_pages(
         self,
         begin_time: str | None = None,
         limit: int | None = None,
@@ -164,22 +165,22 @@ class SquareClient:
         updated_at_begin_time: str | None = None,
         sort_field: str | None = None,
         sort_order: str = "DESC",
-    ) -> list[dict]:
-        """Completed and pending payments in the requested order, following pagination.
+    ) -> Iterator[list[dict]]:
+        """Yield validated payment pages in the requested order.
 
-        By default, exhaust all cursor pages.  A positive limit caps the total
-        number of returned payments.
+        A positive limit caps the total number of yielded payments across all
+        pages. Each page is yielded before the next Square request is made.
         """
         if limit is not None and limit <= 0:
             raise ValueError("limit must be positive or None")
         if sort_order not in {"ASC", "DESC"}:
             raise ValueError("sort_order must be 'ASC' or 'DESC'")
 
-        payments: list[dict] = []
+        yielded = 0
         cursor: str | None = None
         seen_cursors: set[str] = set()
         while True:
-            remaining = limit - len(payments) if limit is not None else 100
+            remaining = limit - yielded if limit is not None else 100
             params: dict = {"sort_order": sort_order, "limit": min(remaining, 100)}
             if begin_time:
                 params["begin_time"] = begin_time
@@ -198,17 +199,47 @@ class SquareClient:
                     payment_from_api(payment)
             except (TypeError, ValueError) as exc:
                 raise SquareError("Square returned invalid payment data") from exc
-            payments.extend(page)
             next_cursor = data.get("cursor")
             if next_cursor is not None and not isinstance(next_cursor, str):
                 raise SquareError("Square returned an invalid response")
-            if not next_cursor or (limit is not None and len(payments) >= limit):
-                break
-            if next_cursor in seen_cursors:
-                raise SquareError("Square returned a repeated pagination cursor")
-            seen_cursors.add(next_cursor)
+
+            yielded_page = page if limit is None else page[:remaining]
+            yielded += len(yielded_page)
+            has_more = bool(next_cursor) and (
+                limit is None or yielded < limit
+            )
+            if has_more:
+                if next_cursor in seen_cursors:
+                    raise SquareError("Square returned a repeated pagination cursor")
+                seen_cursors.add(next_cursor)
+
+            yield yielded_page
+            if not has_more:
+                return
             cursor = next_cursor
-        return payments if limit is None else payments[:limit]
+
+    def list_payments(
+        self,
+        begin_time: str | None = None,
+        limit: int | None = None,
+        location_id: str | None = None,
+        updated_at_begin_time: str | None = None,
+        sort_field: str | None = None,
+        sort_order: str = "DESC",
+    ) -> list[dict]:
+        """Return validated payments after exhausting all requested pages."""
+        return [
+            payment
+            for page in self.iter_payment_pages(
+                begin_time=begin_time,
+                limit=limit,
+                location_id=location_id,
+                updated_at_begin_time=updated_at_begin_time,
+                sort_field=sort_field,
+                sort_order=sort_order,
+            )
+            for payment in page
+        ]
 
 
 def verify_webhook_signature(

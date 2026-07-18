@@ -1049,6 +1049,71 @@ def test_square_transport_error_is_normalized():
     client.close()
 
 
+def test_square_retries_rate_limit_until_success(monkeypatch):
+    requests = 0
+    delays = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests < 3:
+            return httpx.Response(429, headers={"Retry-After": "0.25"})
+        return httpx.Response(200, json={"locations": []})
+
+    monkeypatch.setattr("app.square_client.time.sleep", delays.append)
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        assert client.list_locations() == []
+    finally:
+        client.close()
+
+    assert requests == 3
+    assert delays == [0.25, 0.25]
+
+
+def test_square_rate_limit_retries_are_bounded_and_jittered(monkeypatch):
+    requests = 0
+    delays = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(429)
+
+    monkeypatch.setattr("app.square_client.time.sleep", delays.append)
+    monkeypatch.setattr("app.square_client.random.uniform", lambda _low, high: high)
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match=r"HTTP 429"):
+            client.list_locations()
+    finally:
+        client.close()
+
+    assert requests == 4
+    assert delays == [0.625, 1.25, 2.5]
+
+
+def test_square_rate_limit_caps_retry_after(monkeypatch):
+    delays = []
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            return httpx.Response(429, headers={"Retry-After": "3600"})
+        return httpx.Response(200, json={"locations": []})
+
+    monkeypatch.setattr("app.square_client.time.sleep", delays.append)
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        assert client.list_locations() == []
+    finally:
+        client.close()
+
+    assert delays == [10.0]
+
+
 def test_square_html_response_is_normalized():
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"<html>private Square body</html>")

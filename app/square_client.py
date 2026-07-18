@@ -5,8 +5,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
+import math
+import random
+import time
 
 import httpx
+
+logger = logging.getLogger("spi.square")
 
 SQUARE_VERSION = "2025-01-23"
 
@@ -14,6 +20,9 @@ BASE_URLS = {
     "production": "https://connect.squareup.com",
     "sandbox": "https://connect.squareupsandbox.com",
 }
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_BASE_DELAY_SECONDS = 0.5
+RATE_LIMIT_MAX_DELAY_SECONDS = 10.0
 
 
 class SquareError(Exception):
@@ -54,10 +63,22 @@ class SquareClient:
         self._client.close()
 
     def _get(self, path: str, params: dict | None = None) -> dict:
-        try:
-            resp = self._client.get(path, params=params)
-        except httpx.RequestError as exc:
-            raise SquareError("Network error while contacting Square") from exc
+        attempt = 0
+        while True:
+            try:
+                resp = self._client.get(path, params=params)
+            except httpx.RequestError as exc:
+                raise SquareError("Network error while contacting Square") from exc
+            if resp.status_code != 429 or attempt >= RATE_LIMIT_MAX_RETRIES:
+                break
+            delay = self._rate_limit_delay(resp, attempt)
+            logger.warning(
+                "Square rate limited %s; retrying in %.2f seconds",
+                path,
+                delay,
+            )
+            time.sleep(delay)
+            attempt += 1
         if resp.status_code == 401:
             raise SquareAuthError("Square rejected the access token")
         if resp.status_code == 403:
@@ -71,6 +92,23 @@ class SquareClient:
         if not isinstance(data, dict):
             raise SquareError("Square returned an invalid response")
         return data
+
+    @staticmethod
+    def _rate_limit_delay(resp: httpx.Response, attempt: int) -> float:
+        retry_after = resp.headers.get("retry-after")
+        if retry_after is not None:
+            try:
+                requested_delay = float(retry_after)
+            except ValueError:
+                requested_delay = -1.0
+            if math.isfinite(requested_delay) and requested_delay >= 0:
+                return min(requested_delay, RATE_LIMIT_MAX_DELAY_SECONDS)
+        backoff = min(
+            RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** max(0, attempt)),
+            RATE_LIMIT_MAX_DELAY_SECONDS,
+        )
+        jitter = random.uniform(0, backoff * 0.25)
+        return min(backoff + jitter, RATE_LIMIT_MAX_DELAY_SECONDS)
 
     @staticmethod
     def _object_list(data: dict, key: str) -> list[dict]:

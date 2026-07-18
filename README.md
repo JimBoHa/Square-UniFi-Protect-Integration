@@ -91,7 +91,7 @@ Open `http://<host>:8000`, then:
 3. **Settings → Square account** — a Square access token
    (Developer Dashboard → your application → Credentials). Optionally add your
    webhook signature key and notification URL for real-time ingestion
-   (subscribe the webhook to `payment.updated` pointing at
+   (subscribe the webhook to both `payment.created` and `payment.updated`, pointing at
    `https://<your-host>/webhooks/square`). Existing installations must reconnect
    Square once after upgrading so webhook events can be bound to that merchant.
 4. **Settings → POS camera** — pick the camera that watches each location's

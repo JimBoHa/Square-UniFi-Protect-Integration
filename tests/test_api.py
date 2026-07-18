@@ -874,6 +874,7 @@ def make_webhook_event(
     created_at: str = "2026-07-16T16:00:00.000Z",
     updated_at: str | None = None,
     merchant_id: str = SQUARE_MERCHANT_ID,
+    event_type: str = "payment.updated",
 ) -> bytes:
     payment = {
         "id": payment_id,
@@ -893,7 +894,7 @@ def make_webhook_event(
     return json.dumps(
         {
             "merchant_id": merchant_id,
-            "type": "payment.updated",
+            "type": event_type,
             "data": {"object": {"payment": payment}},
         }
     ).encode()
@@ -953,8 +954,9 @@ def _wait_for_protect_jobs(client, timeout: float = 3.0) -> None:
     raise AssertionError("webhook Protect work did not finish")
 
 
-def test_webhook_stores_payment_then_enriches_thumbnail(configured):
-    body = make_webhook_event()
+@pytest.mark.parametrize("event_type", ["payment.created", "payment.updated"])
+def test_webhook_stores_payment_then_enriches_thumbnail(configured, event_type):
+    body = make_webhook_event(event_type=event_type)
     resp = configured.post(
         "/webhooks/square",
         content=body,

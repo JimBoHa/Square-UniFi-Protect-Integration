@@ -943,10 +943,14 @@ def test_snapshot_transport_error_stores_transaction_without_thumbnail(tmp_path)
                     "password": PROTECT_PASS,
                 },
             ).status_code == 200
-            assert isolated.put(
+            square_response = isolated.put(
                 "/api/settings/square",
                 json={"access_token": SQUARE_TOKEN, "environment": "production"},
-            ).status_code == 200
+            )
+            assert square_response.status_code == 200
+            isolated.headers["X-Square-Account-Revision"] = square_response.json()[
+                "account_revision"
+            ]
             assert isolated.put(
                 "/api/camera-mapping",
                 json={
@@ -1170,7 +1174,7 @@ def test_webhook_ack_and_transaction_listing_do_not_wait_for_snapshot(tmp_path):
                     "password": PROTECT_PASS,
                 },
             ).status_code == 200
-            assert isolated.put(
+            square_response = isolated.put(
                 "/api/settings/square",
                 json={
                     "access_token": SQUARE_TOKEN,
@@ -1178,7 +1182,11 @@ def test_webhook_ack_and_transaction_listing_do_not_wait_for_snapshot(tmp_path):
                     "webhook_signature_key": WEBHOOK_KEY,
                     "webhook_url": WEBHOOK_URL,
                 },
-            ).status_code == 200
+            )
+            assert square_response.status_code == 200
+            isolated.headers["X-Square-Account-Revision"] = square_response.json()[
+                "account_revision"
+            ]
             assert isolated.put(
                 "/api/camera-mapping",
                 json={
@@ -1371,7 +1379,7 @@ def test_webhook_burst_acks_immediately_and_queue_drains_all(tmp_path):
                     "password": PROTECT_PASS,
                 },
             ).status_code == 200
-            assert isolated.put(
+            square_response = isolated.put(
                 "/api/settings/square",
                 json={
                     "access_token": SQUARE_TOKEN,
@@ -1379,7 +1387,11 @@ def test_webhook_burst_acks_immediately_and_queue_drains_all(tmp_path):
                     "webhook_signature_key": WEBHOOK_KEY,
                     "webhook_url": WEBHOOK_URL,
                 },
-            ).status_code == 200
+            )
+            assert square_response.status_code == 200
+            isolated.headers["X-Square-Account-Revision"] = square_response.json()[
+                "account_revision"
+            ]
             assert isolated.put(
                 "/api/camera-mapping",
                 json={
@@ -1449,7 +1461,7 @@ def test_single_coalesced_webhook_drain_exhausts_due_batches(tmp_path):
                     "alarm_trigger_id": PROTECT_ALARM_TRIGGER_ID,
                 },
             ).status_code == 200
-            assert isolated.put(
+            square_response = isolated.put(
                 "/api/settings/square",
                 json={
                     "access_token": SQUARE_TOKEN,
@@ -1457,7 +1469,11 @@ def test_single_coalesced_webhook_drain_exhausts_due_batches(tmp_path):
                     "webhook_signature_key": WEBHOOK_KEY,
                     "webhook_url": WEBHOOK_URL,
                 },
-            ).status_code == 200
+            )
+            assert square_response.status_code == 200
+            isolated.headers["X-Square-Account-Revision"] = square_response.json()[
+                "account_revision"
+            ]
             assert isolated.put(
                 "/api/camera-mapping",
                 json={
@@ -1567,7 +1583,7 @@ def test_square_settings_failure_rolls_back_entire_bundle(configured):
             "/api/settings/square",
             json={
                 "access_token": SQUARE_TOKEN,
-                "environment": "sandbox",
+                "environment": "production",
                 "webhook_signature_key": "replacement-signature-key",
                 "webhook_url": "https://replacement.example/webhooks/square",
             },

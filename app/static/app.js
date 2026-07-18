@@ -14,6 +14,9 @@ let transactionHasNext = false;
 let transactionPageCount = 0;
 let transactionSnapshot = null;
 let lastTransactionPayload = null;
+let settingsLoadGeneration = 0;
+let squareAccountSwitchConfirmationToken = "";
+let squareAccountRevision = "";
 
 function show(viewId) {
   for (const sec of document.querySelectorAll("main > section")) sec.hidden = true;
@@ -27,11 +30,11 @@ function message(text, kind) {
 }
 
 async function api(path, options = {}) {
-  const { includeResponse = false, ...requestOptions } = options;
+  const { includeResponse = false, headers = {}, ...requestOptions } = options;
   const resp = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
     ...requestOptions,
+    headers: { "Content-Type": "application/json", ...headers },
   });
   const data = await resp.json().catch(() => ({}));
   // Only an expired/missing app session should bounce to the login view.
@@ -48,8 +51,17 @@ async function api(path, options = {}) {
     throw new Error("Please log in");
   }
   if (!resp.ok) {
-    const error = new Error(data.detail || `Request failed (${resp.status})`);
+    const detail = data.detail;
+    const error = new Error(
+      detail && typeof detail === "object" && detail.message
+        ? detail.message
+        : detail || `Request failed (${resp.status})`,
+    );
     error.status = resp.status;
+    if (detail && typeof detail === "object") {
+      error.code = detail.code;
+      error.confirmationToken = detail.confirmation_token;
+    }
     throw error;
   }
   return includeResponse ? { data, response: resp } : data;
@@ -314,6 +326,8 @@ $("#square-form").addEventListener("submit", async (e) => {
         access_token: $("#square-token").value.trim(),
         environment: $("#square-env").value,
         ...webhookFields,
+        confirm_account_switch: $("#square-confirm-account-switch").checked,
+        account_switch_confirmation_token: squareAccountSwitchConfirmationToken,
       }),
     });
     $("#square-token").value = "";
@@ -322,9 +336,34 @@ $("#square-form").addEventListener("submit", async (e) => {
       $("#square-webhook-url"),
       $("#square-clear-webhook"),
     );
-    message(`Connected to Square (${result.locations.length} locations).`, "ok");
+    $("#square-confirm-account-switch").checked = false;
+    $("#square-account-switch-warning").hidden = true;
+    squareAccountSwitchConfirmationToken = "";
+    squareAccountRevision = result.account_revision || "";
+    const switched = result.account_switched
+      ? result.evidence_cleanup_pending
+        ? " Previous account data was disconnected. Orphan thumbnail cleanup will retry automatically."
+        : result.webhook_configured
+          ? " Previous account data was erased."
+          : " Previous account data and saved webhook credentials were erased; configure this account's webhook to restore live updates."
+      : "";
+    message(
+      `Connected to Square (${result.locations.length} locations).${switched}`,
+      "ok",
+    );
+    if (result.account_switched) {
+      lastTransactionPayload = null;
+      renderTransactions([]);
+      void loadTransactions({ reset: true });
+    }
     loadSettingsView();
   } catch (err) {
+    if (err.code === "square_account_switch_confirmation_required") {
+      squareAccountSwitchConfirmationToken = err.confirmationToken || "";
+      $("#square-confirm-account-switch").checked = false;
+      $("#square-account-switch-warning").hidden = false;
+      $("#square-confirm-account-switch").focus();
+    }
     message(err.message, "error");
   }
 });
@@ -378,12 +417,17 @@ async function fetchSettingsView() {
 
 async function fetchMappingData() {
   let cameras = [], locations = [], mappings = [], devices = [];
+  let accountRevision = "";
   loadDeepLinkSettings();
   try { cameras = await api("/api/cameras"); } catch { /* Protect not configured yet */ }
-  try { locations = await api("/api/locations"); } catch { /* Square not configured yet */ }
+  try {
+    const result = await api("/api/locations", { includeResponse: true });
+    locations = result.data;
+    accountRevision = result.response.headers.get("x-square-account-revision") || "";
+  } catch { /* Square not configured yet */ }
   try { devices = await api("/api/pos-devices"); } catch { /* No observed devices yet */ }
   try { mappings = await api("/api/camera-mapping"); } catch { return null; }
-  return { cameras, locations, mappings, devices };
+  return { cameras, locations, mappings, devices, accountRevision };
 }
 
 
@@ -473,6 +517,9 @@ function renderSettingsView(settings) {
   const rows = $("#mapping-rows");
   rows.textContent = "";
   if (settings === null) return;
+  // Only the winning (latest) load publishes the revision used to fence
+  // camera-mapping saves against a concurrent account switch.
+  squareAccountRevision = settings.accountRevision || "";
   const usable = buildMappingRows(rows, settings);
   $("#save-mapping").hidden = !usable;
 }
@@ -492,7 +539,11 @@ function previewCamera(cameraId) {
 $("#save-mapping").addEventListener("click", async () => {
   const mappings = collectMappings($("#mapping-rows"));
   try {
-    await api("/api/camera-mapping", { method: "PUT", body: JSON.stringify({ mappings }) });
+    await api("/api/camera-mapping", {
+      method: "PUT",
+      headers: { "X-Square-Account-Revision": squareAccountRevision },
+      body: JSON.stringify({ mappings }),
+    });
     message("Camera selection saved.", "ok");
   } catch (err) {
     message(err.message, "error");

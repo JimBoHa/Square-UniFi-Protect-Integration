@@ -164,6 +164,11 @@
           developer-dashboard steps needed.</p>
         <label class="check"><input type="checkbox" id="square-clear-webhook"> Remove saved webhook configuration</label>
         <p class="hint">Leaving the webhook fields blank keeps any saved webhook configuration.</p>
+        <div id="square-account-switch-warning" class="destructive-warning" role="alert" hidden>
+          <strong>Different Square account detected.</strong>
+          <p>Switching permanently erases the previous account's local transactions, thumbnails, observed POS devices, camera mappings, sync history, and saved Square webhook credentials.</p>
+          <label class="check"><input type="checkbox" id="square-confirm-account-switch"> I understand. Switch accounts and erase the previous account's local data.</label>
+        </div>
         <button type="submit">Connect Square</button>
       </form>
 

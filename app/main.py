@@ -37,7 +37,13 @@ from .square_client import (
     SquarePermissionError,
     verify_webhook_signature,
 )
-from .store import ALARM_ENABLED_AFTER_SETTING, Store, TransactionSnapshotExpired
+from .store import (
+    ALARM_ENABLED_AFTER_SETTING,
+    SquareAccountChanged,
+    SquareAccountSwitchRequired,
+    Store,
+    TransactionSnapshotExpired,
+)
 
 logger = logging.getLogger("spi")
 
@@ -55,6 +61,13 @@ PROTECT_SETTING_KEYS = (
     "protect.api_key",
     "protect.alarm_trigger_id",
 )
+SQUARE_CLIENT_SETTING_KEYS = (
+    "square.access_token",
+    "square.environment",
+    "square.merchant_id",
+    "square.account_revision",
+)
+SQUARE_ACCOUNT_SWITCH_CODE = "square_account_switch_confirmation_required"
 MAX_CAMERA_MAPPINGS = 500
 PRIVATE_NO_STORE = "private, no-store"
 MIN_POLL_INTERVAL_SECONDS = 1.0
@@ -113,6 +126,8 @@ class SquareSettingsBody(BaseModel):
     webhook_signature_key: str = ""
     webhook_url: str = ""
     clear_webhook: bool = False
+    confirm_account_switch: bool = False
+    account_switch_confirmation_token: str = Field(default="", max_length=4096)
 
 class CameraMappingEntry(BaseModel):
     location_id: str = Field(min_length=1, max_length=64)
@@ -162,6 +177,7 @@ def create_app(
     app.state.store = store
     app.state.login_failures: dict[str, list[float]] = {}
     app.state.login_lock = threading.Lock()
+    square_account_lock = threading.RLock()
     # Single worker draining the durable thumbnail-retry queue: webhooks ack
     # before any Protect I/O and just nudge this drain, which the queue's
     # leases and backoff keep bounded and evidence-safe.
@@ -251,11 +267,12 @@ def create_app(
             }
         )
 
-    def build_square() -> SquareClient | None:
-        _maybe_refresh_oauth_token()
-        settings = store.get_settings(
-            ("square.access_token", "square.environment")
-        )
+    def build_square(
+        settings: dict[str, str | None] | None = None,
+    ) -> SquareClient | None:
+        if settings is None:
+            _maybe_refresh_oauth_token()
+            settings = store.get_settings(SQUARE_CLIENT_SETTING_KEYS)
         token = settings["square.access_token"]
         if not token:
             return None
@@ -265,7 +282,7 @@ def create_app(
             transport=square_transport,
         )
 
-    def drain_protect_work_queue() -> None:
+    def _drain_protect_work_queue() -> None:
         with drain_state_lock:
             app.state.thumbnail_drain_queued = False
         protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
@@ -306,6 +323,12 @@ def create_app(
                 protect.close()
             except Exception:
                 logger.exception("Could not close Protect client after queue drain")
+
+    def drain_protect_work_queue() -> None:
+        # A completed account switch cannot be followed by an old merchant's
+        # already-claimed alarm or thumbnail work in this process.
+        with square_account_lock, store.integration_guard():
+            _drain_protect_work_queue()
 
     def nudge_protect_work_queue() -> None:
         """Schedule a queue drain; nudges coalesce to at most one queued drain."""
@@ -626,30 +649,58 @@ def create_app(
             raise HTTPException(status_code=502, detail=f"Could not reach Square: {exc}")
         finally:
             client.close()
-        settings_updates = {
-            "square.access_token": (body.access_token, True),
-            "square.environment": (body.environment, False),
-            "square.merchant_id": (merchant_id, False),
-        }
-        delete_keys = ()
-        if body.webhook_signature_key and body.webhook_url:
-            settings_updates.update(
-                {
-                    "square.webhook_signature_key": (
-                        body.webhook_signature_key,
-                        True,
+        try:
+            with square_account_lock:
+                account_configuration = store.configure_square_account(
+                    merchant_id=merchant_id,
+                    access_token=body.access_token,
+                    environment=body.environment,
+                    webhook_signature_key=(
+                        body.webhook_signature_key
+                        if body.webhook_signature_key
+                        else None
                     ),
-                    "square.webhook_url": (body.webhook_url, False),
-                }
-            )
-        elif body.clear_webhook:
-            delete_keys = (
-                "square.webhook_signature_key", "square.webhook_url"
-            )
-        store.update_settings(settings_updates, delete_keys=delete_keys)
-        # Blank webhook fields without clear_webhook leave any stored webhook
-        # configuration untouched, so re-saving the access token is safe.
-        return {"ok": True, "locations": locations}
+                    webhook_url=body.webhook_url if body.webhook_url else None,
+                    clear_webhook=body.clear_webhook,
+                    confirm_account_switch=body.confirm_account_switch,
+                    account_switch_confirmation_token=(
+                        body.account_switch_confirmation_token
+                    ),
+                )
+                saved_webhook = store.get_settings(
+                    ("square.webhook_signature_key", "square.webhook_url")
+                )
+        except SquareAccountSwitchRequired as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": SQUARE_ACCOUNT_SWITCH_CODE,
+                    "message": (
+                        "These credentials belong to a different Square account. "
+                        "Confirm the account switch to erase the previous account's "
+                        "local transactions, thumbnails, POS devices, camera mappings, "
+                        "sync history, and saved Square webhook credentials."
+                    ),
+                    "confirmation_token": exc.confirmation_token,
+                },
+            ) from exc
+
+        webhook_configured = bool(
+            saved_webhook["square.webhook_signature_key"]
+            and saved_webhook["square.webhook_url"]
+        )
+        # Blank webhook fields retain saved credentials only for the same
+        # merchant. A switch clears them unless a new pair was submitted.
+        return {
+            "ok": True,
+            "locations": locations,
+            "account_switched": account_configuration.switched,
+            "webhook_configured": webhook_configured,
+            "account_revision": account_configuration.account_revision,
+            "evidence_cleanup_pending": (
+                account_configuration.evidence_cleanup_pending
+            ),
+        }
 
     def deep_link_settings_response() -> dict[str, str]:
         return {
@@ -873,18 +924,30 @@ def create_app(
         }
 
     @app.get("/api/locations")
-    def locations(_=authed) -> list[dict]:
-        client = require_square()
-        try:
-            return client.list_locations()
-        except SquareError as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
-        finally:
-            client.close()
+    def locations(response: Response, _=authed) -> list[dict]:
+        with square_account_lock, store.integration_guard():
+            client = require_square()
+            try:
+                result = client.list_locations()
+                # Location IDs and the account revision form one account-bound
+                # mapping snapshot and must never be replayed from a cache.
+                response.headers["Cache-Control"] = "private, no-store"
+                account_revision = store.square_account_revision()
+                if account_revision:
+                    response.headers["X-Square-Account-Revision"] = account_revision
+                return result
+            except SquareError as exc:
+                raise HTTPException(status_code=502, detail=str(exc))
+            finally:
+                client.close()
 
     @app.get("/api/pos-devices")
-    def pos_devices(_=authed) -> list[dict]:
-        return store.get_observed_devices()
+    def pos_devices(_=authed) -> JSONResponse:
+        with store.integration_guard():
+            return JSONResponse(
+                store.get_observed_devices(),
+                headers={"Cache-Control": "private, no-store"},
+            )
 
     @app.get("/api/camera-preview/{camera_id}")
     def camera_preview(camera_id: str, _=authed) -> Response:
@@ -906,11 +969,15 @@ def create_app(
         )
 
     @app.get("/api/camera-mapping")
-    def get_mapping(_=authed) -> list[dict]:
-        return store.get_camera_mappings()
+    def get_mapping(_=authed) -> JSONResponse:
+        with store.integration_guard():
+            return JSONResponse(
+                store.get_camera_mappings(),
+                headers={"Cache-Control": "private, no-store"},
+            )
 
     @app.put("/api/camera-mapping")
-    def set_mapping(body: CameraMappingBody, _=authed) -> dict:
+    def set_mapping(body: CameraMappingBody, request: Request, _=authed) -> dict:
         if len(body.mappings) > MAX_CAMERA_MAPPINGS:
             raise HTTPException(
                 status_code=422,
@@ -932,18 +999,28 @@ def create_app(
                 validate_camera_id(entry.camera_id)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc))
-        store.replace_camera_mappings(
-            [
-                (
-                    entry.location_id,
-                    entry.device_id,
-                    entry.device_name,
-                    entry.camera_id,
-                    entry.camera_name,
-                )
-                for entry in body.mappings
-            ]
-        )
+        account_revision = request.headers.get("x-square-account-revision")
+        if not account_revision:
+            raise HTTPException(
+                status_code=409,
+                detail="Reload settings before saving camera mappings",
+            )
+        try:
+            store.replace_camera_mappings(
+                [
+                    (
+                        entry.location_id,
+                        entry.device_id,
+                        entry.device_name,
+                        entry.camera_id,
+                        entry.camera_name,
+                    )
+                    for entry in body.mappings
+                ],
+                expected_account_revision=account_revision,
+            )
+        except SquareAccountChanged as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         nudge_protect_work_queue()
         return {"ok": True, "count": len(body.mappings)}
 
@@ -1058,71 +1135,93 @@ def create_app(
 
     @app.get("/api/transactions")
     def transactions(
-        response: Response,
         limit: int = 50,
         offset: int = 0,
         snapshot: int | None = None,
         _=authed,
-    ) -> list[dict]:
-        try:
-            rows, transaction_snapshot = store.list_transactions_page(
-                limit, offset, snapshot
+    ) -> JSONResponse:
+        with store.integration_guard():
+            try:
+                rows, transaction_snapshot = store.list_transactions_page(
+                    limit, offset, snapshot
+                )
+            except TransactionSnapshotExpired as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Transaction page expired; return to the newest page",
+                ) from exc
+            # Render the account-bound payload while the shared guard is held,
+            # so an acknowledged switch cannot bisect the read and encoding.
+            return JSONResponse(
+                [txn_response(t) for t in rows],
+                headers={
+                    "X-Transaction-Snapshot": str(transaction_snapshot),
+                    "Cache-Control": PRIVATE_NO_STORE,
+                },
             )
-        except TransactionSnapshotExpired as exc:
-            raise HTTPException(
-                status_code=409,
-                detail="Transaction page expired; return to the newest page",
-            ) from exc
-        response.headers["Cache-Control"] = PRIVATE_NO_STORE
-        # Preserve the existing list response while issuing an optional
-        # durable ordering token for clients that paginate across live writes.
-        response.headers["X-Transaction-Snapshot"] = str(transaction_snapshot)
-        return [txn_response(t) for t in rows]
 
     @app.get("/api/thumbnails/{txn_id}")
     def thumbnail(txn_id: str, _=authed) -> Response:
-        txn = store.get_transaction(txn_id)
-        if not txn or not txn.get("thumbnail_path"):
-            raise HTTPException(status_code=404, detail="No thumbnail for this transaction")
-        path = (store.thumbnail_dir / txn["thumbnail_path"]).resolve()
+        with store.integration_guard():
+            txn = store.get_transaction(txn_id)
+            if not txn or not txn.get("thumbnail_path"):
+                raise HTTPException(
+                    status_code=404, detail="No thumbnail for this transaction"
+                )
+            path = (store.thumbnail_dir / txn["thumbnail_path"]).resolve()
 
-        def missing_thumbnail() -> None:
-            if store.requeue_missing_thumbnail(txn_id, txn["thumbnail_path"]):
-                nudge_protect_work_queue()
-            raise HTTPException(status_code=404, detail="Thumbnail not found")
+            def missing_thumbnail() -> None:
+                if store.requeue_missing_thumbnail(txn_id, txn["thumbnail_path"]):
+                    nudge_protect_work_queue()
+                raise HTTPException(status_code=404, detail="Thumbnail not found")
 
-        if store.thumbnail_dir.resolve() not in path.parents or not path.is_file():
-            missing_thumbnail()
-        try:
-            image = _read_thumbnail_bytes(path)
-        except OSError:
-            # The file can disappear or be atomically replaced after is_file().
-            # Reconcile the durable reference instead of letting a lazy response
-            # fail after headers have already been sent.
-            missing_thumbnail()
-        return Response(
-            content=image,
-            media_type="image/jpeg",
-            headers={"Cache-Control": PRIVATE_NO_STORE},
-        )
+            if (
+                store.thumbnail_dir.resolve() not in path.parents
+                or not path.is_file()
+            ):
+                missing_thumbnail()
+            try:
+                image = _read_thumbnail_bytes(path)
+            except OSError:
+                # The file can disappear or be atomically replaced after
+                # is_file(). Reconcile the durable reference instead of letting
+                # a lazy response fail after headers have been sent.
+                missing_thumbnail()
+            return Response(
+                content=image,
+                media_type="image/jpeg",
+                headers={"Cache-Control": PRIVATE_NO_STORE},
+            )
 
     def run_sync() -> int:
-        square = build_square()
-        if square is None:
-            return 0
-        protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
-        protect = build_protect(protect_settings)
-        try:
-            return sync.sync_payments(
-                store,
-                square,
-                protect,
-                alarm_trigger_id=protect_settings["protect.alarm_trigger_id"],
-            )
-        finally:
-            square.close()
-            if protect:
-                protect.close()
+        with square_account_lock:
+            try:
+                store.retry_orphan_thumbnail_cleanup()
+            except Exception as exc:
+                logger.warning("Could not retry orphan thumbnail cleanup: %s", exc)
+            with store.integration_guard():
+                square_settings = store.get_settings(SQUARE_CLIENT_SETTING_KEYS)
+                square = build_square(square_settings)
+                if square is None:
+                    return 0
+                protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
+                protect = build_protect(protect_settings)
+                try:
+                    return sync.sync_payments(
+                        store,
+                        square,
+                        protect,
+                        alarm_trigger_id=protect_settings["protect.alarm_trigger_id"],
+                        expected_merchant_id=square_settings["square.merchant_id"],
+                        expected_environment=square_settings["square.environment"],
+                        expected_account_revision=(
+                            square_settings["square.account_revision"]
+                        ),
+                    )
+                finally:
+                    square.close()
+                    if protect:
+                        protect.close()
 
     @app.post("/api/sync")
     def manual_sync(_=authed) -> dict:
@@ -1130,6 +1229,8 @@ def create_app(
             return {"ok": True, "ingested": run_sync()}
         except (SquareError, ProtectError) as exc:
             raise HTTPException(status_code=502, detail=str(exc))
+        except SquareAccountChanged as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
 
     # -- Square webhook (unauthenticated; HMAC-verified) ---------------------------
 
@@ -1155,6 +1256,22 @@ def create_app(
             chunks.append(chunk)
         return b"".join(chunks)
 
+    def ingest_square_webhook_payment(
+        payment: dict,
+        expected_merchant_id: str,
+        expected_environment: str,
+        expected_account_revision: str | None,
+    ) -> dict:
+        with store.integration_guard():
+            return sync.ingest_payment(
+                store,
+                payment,
+                None,
+                expected_merchant_id=expected_merchant_id,
+                expected_environment=expected_environment,
+                expected_account_revision=expected_account_revision,
+            )
+
     @app.post("/webhooks/square")
     async def square_webhook(request: Request) -> JSONResponse:
         square_settings = store.get_settings(
@@ -1162,6 +1279,8 @@ def create_app(
                 "square.webhook_signature_key",
                 "square.webhook_url",
                 "square.merchant_id",
+                "square.environment",
+                "square.account_revision",
             )
         )
         signature_key = square_settings["square.webhook_signature_key"]
@@ -1197,7 +1316,18 @@ def create_app(
         if not isinstance(payment, dict) or not payment:
             return JSONResponse({"ok": True, "ignored": True})
         try:
-            txn = await run_in_threadpool(sync.ingest_payment, store, payment, None)
+            txn = await run_in_threadpool(
+                ingest_square_webhook_payment,
+                payment,
+                square_settings["square.merchant_id"],
+                square_settings["square.environment"] or "production",
+                square_settings["square.account_revision"],
+            )
+        except SquareAccountChanged:
+            # A verified event can race an explicitly confirmed account
+            # switch. Treat the stale merchant's event as acknowledged but
+            # never let it repopulate the new account.
+            return JSONResponse({"ok": True, "ignored": True})
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         # Both alarm delivery and thumbnail capture are durable queue work;

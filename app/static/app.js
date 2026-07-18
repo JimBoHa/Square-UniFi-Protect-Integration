@@ -234,6 +234,22 @@ function setConnStatus(id, state, text) {
   el.querySelector(".conn-text").textContent = text;
 }
 
+async function refreshProtectStatus() {
+  setConnStatus("#protect-status", "checking", "Checking…");
+  try {
+    const health = await api("/api/health/protect");
+    if (!health.configured) {
+      setConnStatus("#protect-status", "", "Not connected");
+    } else if (health.ok) {
+      setConnStatus("#protect-status", "ok", health.detail);
+    } else {
+      setConnStatus("#protect-status", "bad", health.detail);
+    }
+  } catch (err) {
+    setConnStatus("#protect-status", "bad", err.message);
+  }
+}
+
 async function refreshSquareStatus() {
   setConnStatus("#square-status", "checking", "Checking…");
   try {
@@ -254,6 +270,7 @@ async function fetchSettingsView() {
   // Connection indicators refresh alongside every settings load; they render
   // into their own elements, so they need no stale-load generation guard.
   void refreshSquareStatus();
+  void refreshProtectStatus();
   let cameras = [], locations = [], mappings = [], devices = [];
   loadDeepLinkSettings();
   try { cameras = await api("/api/cameras"); } catch { /* Protect not configured yet */ }

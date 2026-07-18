@@ -585,6 +585,27 @@ def create_app(
 
     # -- cameras & mapping ------------------------------------------------------
 
+    @app.get("/api/health/protect")
+    def protect_health(_=authed) -> dict:
+        """Live connectivity check so the UI can show a trustworthy indicator."""
+        client = build_protect()
+        if client is None:
+            return {"configured": False, "ok": False, "detail": "Not configured"}
+        try:
+            cameras = client.get_cameras()
+        except ProtectAuthError as exc:
+            return {"configured": True, "ok": False, "detail": str(exc)}
+        except ProtectError as exc:
+            return {"configured": True, "ok": False, "detail": str(exc)}
+        finally:
+            client.close()
+        return {
+            "configured": True,
+            "ok": True,
+            "cameras": len(cameras),
+            "detail": f"Connected — {len(cameras)} cameras",
+        }
+
     @app.get("/api/cameras")
     def cameras(_=authed) -> list[dict]:
         client = require_protect()

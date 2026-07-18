@@ -23,7 +23,9 @@ def main() -> None:
     tls_enabled = os.environ.get("SPI_TLS", "0") == "1"
     if tls_enabled:
         # HTTPS makes Secure session cookies safe to require.
-        os.environ.setdefault("SPI_COOKIE_SECURE", "1")
+        # Do not let a stale launcher/service environment explicitly override
+        # the transport guarantee selected by SPI_TLS.
+        os.environ["SPI_COOKIE_SECURE"] = "1"
     from .main import create_app  # after env adjustments
 
     uvicorn.run(

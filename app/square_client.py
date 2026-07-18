@@ -83,22 +83,32 @@ class SquareClient:
 
     def list_locations(self) -> list[dict]:
         data = self._get("/v2/locations")
-        locations = self._object_list(data, "locations")
-        return [
-            {
-                "id": loc.get("id", ""),
-                "name": loc.get("name", ""),
-                "status": loc.get("status", ""),
-            }
-            for loc in locations
-        ]
+        normalized = []
+        for location in self._object_list(data, "locations"):
+            location_id = location.get("id")
+            name = location.get("name")
+            status = location.get("status")
+            if not isinstance(location_id, str) or not location_id:
+                raise SquareError("Square returned an invalid response")
+            if name is not None and not isinstance(name, str):
+                raise SquareError("Square returned an invalid response")
+            if status is not None and not isinstance(status, str):
+                raise SquareError("Square returned an invalid response")
+            normalized.append(
+                {
+                    "id": location_id,
+                    "name": name or "",
+                    "status": status or "",
+                }
+            )
+        return normalized
 
     def merchant_id(self) -> str:
         """Return the merchant bound to this access token."""
         data = self._get("/v2/merchants/me")
         merchant = data.get("merchant") if isinstance(data, dict) else None
         merchant_id = merchant.get("id", "") if isinstance(merchant, dict) else ""
-        if not merchant_id:
+        if not isinstance(merchant_id, str) or not merchant_id:
             raise SquareError("Square did not return the access token's merchant id")
         return merchant_id
 

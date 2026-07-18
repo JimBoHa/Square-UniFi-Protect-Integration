@@ -373,7 +373,10 @@ def test_protect_settings_malformed_camera_response_returns_502(tmp_path, malfor
         app.state.store.close()
 
 
-@pytest.mark.parametrize("malformed", ["html", "location-shape", "payment-shape"])
+@pytest.mark.parametrize(
+    "malformed",
+    ["html", "location-shape", "location-id", "merchant-id", "payment-shape"],
+)
 def test_square_settings_malformed_response_returns_502(tmp_path, malformed):
     def malformed_square(request: httpx.Request) -> httpx.Response:
         if malformed == "html":
@@ -383,8 +386,16 @@ def test_square_settings_malformed_response_returns_502(tmp_path, malformed):
                 200, json={"locations": ["private location item"]}
             )
         if request.url.path == "/v2/locations":
+            if malformed == "location-id":
+                return httpx.Response(
+                    200, json={"locations": [{"id": ["private location id"]}]}
+                )
             return httpx.Response(200, json={"locations": [{"id": "LOC1"}]})
         if request.url.path == "/v2/merchants/me":
+            if malformed == "merchant-id":
+                return httpx.Response(
+                    200, json={"merchant": {"id": {"private": "merchant id"}}}
+                )
             return httpx.Response(200, json={"merchant": {"id": "MERCHANT_TEST"}})
         return httpx.Response(200, json={"payments": ["private payment item"]})
 
@@ -409,7 +420,7 @@ def test_square_settings_malformed_response_returns_502(tmp_path, malformed):
 
         assert response.status_code == 502
         assert response.json()["detail"].startswith(
-            "Could not reach Square: Square returned"
+            "Could not reach Square: Square "
         )
         assert "private Square body" not in response.text
         assert "private location item" not in response.text

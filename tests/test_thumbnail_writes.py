@@ -92,3 +92,21 @@ def test_failed_thumbnail_write_preserves_published_file(tmp_path, monkeypatch):
 
     assert target.read_bytes() == published
     assert list(tmp_path.glob(f".{target.name}.*.tmp")) == []
+
+
+def test_startup_sweeps_orphaned_temp_files(tmp_path):
+    from app.store import Store
+
+    data_dir = tmp_path / "data"
+    thumb_dir = data_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    orphan = thumb_dir / ".evidence.jpg.abc123.tmp"
+    orphan.write_bytes(b"partial")
+    keeper = thumb_dir / "evidence.jpg"
+    keeper.write_bytes(b"published")
+
+    store = Store(data_dir)
+    store.close()
+
+    assert not orphan.exists()
+    assert keeper.read_bytes() == b"published"

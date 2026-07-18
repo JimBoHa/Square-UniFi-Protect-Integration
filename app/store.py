@@ -86,6 +86,11 @@ class Store:
         os.chmod(self.thumbnail_dir, 0o700)
         for path in self.thumbnail_dir.iterdir():
             if path.is_file() and not path.is_symlink():
+                # Temp files from writes interrupted by a hard crash are never
+                # referenced by the database; sweep them instead of keeping them.
+                if path.name.startswith(".") and path.name.endswith(".tmp"):
+                    path.unlink(missing_ok=True)
+                    continue
                 path.chmod(0o600)
         self.cipher = CredentialCipher(self.data_dir)
         key_path = self.data_dir / "secret.key"

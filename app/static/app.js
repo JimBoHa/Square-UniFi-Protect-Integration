@@ -345,15 +345,25 @@ function renderTransactions(txns) {
 
     let thumb;
     if (txn.thumbnail_url) {
-      thumb = document.createElement("img");
-      thumb.className = "thumb";
-      thumb.src = txn.thumbnail_url;
-      thumb.alt = "POS camera at time of transaction";
-      thumb.title = "Open UniFi Protect timeline at this moment";
+      const image = document.createElement("img");
+      image.className = "thumb";
+      image.src = txn.thumbnail_url;
+      image.alt = "POS camera at time of transaction";
       if (txn.deep_link) {
-        thumb.addEventListener("click", () => {
-          window.open(txn.deep_link, "_blank", "noopener");
-        });
+        const link = document.createElement("a");
+        link.className = "thumbnail-link";
+        link.href = txn.deep_link;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.setAttribute(
+          "aria-label",
+          `Open UniFi Protect footage for transaction at ${new Date(txn.ts_ms).toLocaleString()}`,
+        );
+        link.title = "Open UniFi Protect timeline at this moment";
+        link.appendChild(image);
+        thumb = link;
+      } else {
+        thumb = image;
       }
     } else {
       thumb = document.createElement("div");

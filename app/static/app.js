@@ -58,6 +58,10 @@ async function api(path, options = {}) {
 // ---------------------------------------------------------------- boot
 
 async function boot() {
+  if (new URLSearchParams(window.location.search).get("square_oauth") === "connected") {
+    message("Square account connected via OAuth.", "ok");
+    window.history.replaceState({}, "", "/");
+  }
   const status = await api("/api/status");
   if (!status.setup_complete) {
     show("#view-setup");
@@ -199,6 +203,24 @@ $("#deep-link-form").addEventListener("submit", async (e) => {
   }
 });
 
+$("#square-oauth-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    await api("/api/settings/square/oauth-app", {
+      method: "PUT",
+      body: JSON.stringify({
+        client_id: $("#square-oauth-client-id").value.trim(),
+        client_secret: $("#square-oauth-secret").value.trim(),
+        environment: $("#square-oauth-env").value,
+      }),
+    });
+    $("#square-oauth-secret").value = "";
+    message("Square application saved. Press 'Connect with Square' to sign in.", "ok");
+  } catch (err) {
+    message(err.message, "error");
+  }
+});
+
 $("#square-register-webhook").addEventListener("click", async () => {
   const url = $("#square-webhook-url").value.trim();
   if (!url) {
@@ -224,6 +246,10 @@ $("#square-register-webhook").addEventListener("click", async () => {
   } catch (err) {
     message(err.message, "error");
   }
+});
+
+$("#square-oauth-connect").addEventListener("click", () => {
+  window.location.href = "/oauth/square/start";
 });
 
 $("#square-form").addEventListener("submit", async (e) => {

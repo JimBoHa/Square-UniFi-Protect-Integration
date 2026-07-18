@@ -36,13 +36,37 @@ def _local_ip() -> str | None:
         probe.close()
 
 
+def _cert_covers_current_ip(cert_path: Path, local_ip: str | None) -> bool:
+    if local_ip is None:
+        return True
+    try:
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+        sans = cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName
+        ).value
+        addresses = sans.get_values_for_type(x509.IPAddress)
+    except (ValueError, x509.ExtensionNotFound):
+        return False
+    return ipaddress.ip_address(local_ip) in addresses
+
+
 def ensure_self_signed_cert(data_dir: Path) -> tuple[Path, Path]:
-    """Return (cert_path, key_path), generating them on first use."""
+    """Return (cert_path, key_path), generating them on first use.
+
+    Regenerates the pair when the machine's LAN IP is no longer covered by
+    the certificate's subject alternative names (e.g. after a DHCP change),
+    so LAN browsers keep seeing a name-matching certificate.
+    """
     data_dir = Path(data_dir)
     data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     cert_path = data_dir / CERT_FILENAME
     key_path = data_dir / KEY_FILENAME
-    if cert_path.is_file() and key_path.is_file():
+    local_ip = _local_ip()
+    if (
+        cert_path.is_file()
+        and key_path.is_file()
+        and _cert_covers_current_ip(cert_path, local_ip)
+    ):
         return cert_path, key_path
 
     key = ec.generate_private_key(ec.SECP256R1())
@@ -54,7 +78,6 @@ def ensure_self_signed_cert(data_dir: Path) -> tuple[Path, Path]:
         x509.DNSName("square-unifi-protect.local"),
         x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
     ]
-    local_ip = _local_ip()
     if local_ip:
         alt_names.append(x509.IPAddress(ipaddress.ip_address(local_ip)))
     now = datetime.datetime.now(datetime.timezone.utc)

@@ -25,3 +25,32 @@ def test_uvicorn_kwargs_disabled_and_enabled(tmp_path):
     assert uvicorn_tls_kwargs(tmp_path, False) == {}
     kwargs = uvicorn_tls_kwargs(tmp_path, True)
     assert set(kwargs) == {"ssl_certfile", "ssl_keyfile"}
+
+
+def test_cert_regenerated_when_lan_ip_leaves_sans(tmp_path, monkeypatch):
+    import app.tls as tls
+
+    monkeypatch.setattr(tls, "_local_ip", lambda: "192.0.2.10")
+    cert_path, _ = tls.ensure_self_signed_cert(tmp_path)
+    first = cert_path.read_bytes()
+
+    # Same IP: reused untouched.
+    tls.ensure_self_signed_cert(tmp_path)
+    assert cert_path.read_bytes() == first
+
+    # New DHCP lease: certificate is regenerated to cover the new address.
+    monkeypatch.setattr(tls, "_local_ip", lambda: "192.0.2.99")
+    tls.ensure_self_signed_cert(tmp_path)
+    regenerated = cert_path.read_bytes()
+    assert regenerated != first
+
+    from cryptography import x509
+    import ipaddress
+
+    cert = x509.load_pem_x509_certificate(regenerated)
+    sans = cert.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName
+    ).value
+    assert ipaddress.ip_address("192.0.2.99") in sans.get_values_for_type(
+        x509.IPAddress
+    )

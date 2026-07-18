@@ -109,7 +109,7 @@ Open `http://<host>:8000`, then:
 | `SPI_DISABLE_POLLER` | `0` | Set `1` to disable background polling |
 | `SPI_COOKIE_SECURE` | `0` | Set `1` when serving over HTTPS |
 | `SPI_ENCRYPTION_KEY` | — | Fernet key overriding the on-disk key file |
-| `SPI_TLS` | `0` | Set `1` to serve HTTPS with an auto-generated self-signed certificate (run via `python -m app`); enables Secure cookies automatically |
+| `SPI_TLS` | `0` | Set `1` to serve HTTPS with an auto-generated self-signed certificate (via `python -m app` or the macOS launcher); enables Secure cookies automatically. `python -m app` binds `SPI_HOST` (default `0.0.0.0`); the launcher stays on `127.0.0.1` |
 
 The Protect timeline URL can be adjusted under **Settings → Protect timeline
 link**. Custom templates must use `https://` with `{host}` as the entire hostname and include

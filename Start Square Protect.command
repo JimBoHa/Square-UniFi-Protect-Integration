@@ -44,11 +44,17 @@ done
 
 export SPI_DATA_DIR="${SPI_DATA_DIR:-$PWD/data}"
 
+SCHEME="http"
+[ "${SPI_TLS:-0}" = "1" ] && SCHEME="https"
+
 echo
-echo "Starting Square × UniFi Protect on http://localhost:$PORT"
+echo "Starting Square × UniFi Protect on $SCHEME://localhost:$PORT"
 echo "Your settings and transaction data live in: $SPI_DATA_DIR"
 echo "Keep this window open while using the app; close it (or press Ctrl+C) to stop."
 echo
 
-( sleep 2 && open "http://localhost:$PORT" ) &
-exec .venv/bin/uvicorn app.main:app --factory --host 127.0.0.1 --port "$PORT"
+( sleep 2 && open "$SCHEME://localhost:$PORT" ) &
+# python -m app honors SPI_TLS (self-signed HTTPS + Secure cookies).
+export SPI_HOST="${SPI_HOST:-127.0.0.1}"
+export SPI_PORT="$PORT"
+exec .venv/bin/python -m app

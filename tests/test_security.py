@@ -486,3 +486,10 @@ def test_pos_device_mapping_ui_wiring():
     assert "select.dataset.deviceName" in js
     assert "Other devices (fallback)" in js
     assert "observed Square POS device" in html
+
+
+def test_all_api_responses_default_to_no_store(configured):
+    for path in ("/api/status", "/api/camera-mapping", "/api/settings/deep-link"):
+        resp = configured.get(path)
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "private, no-store"

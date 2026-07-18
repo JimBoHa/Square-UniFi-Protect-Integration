@@ -111,7 +111,7 @@ Open `http://<host>:8000`, then:
 | `SPI_ENCRYPTION_KEY` | — | Fernet key overriding the on-disk key file |
 
 The Protect timeline URL can be adjusted under **Settings → Protect timeline
-link**. Custom templates must start with `https://{host}/` and include
+link**. Custom templates must use `https://` with `{host}` as the entire hostname and include
 `{camera_id}` and `{ts_ms}`; leave the field blank to restore the built-in
 default (verified on Protect 7.1.87):
 `https://{host}/protect/timelapse/{camera_id}?start={ts_ms}`.

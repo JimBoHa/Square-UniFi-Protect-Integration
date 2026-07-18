@@ -137,6 +137,16 @@ def create_app(
     if enable_poller is None:
         enable_poller = os.environ.get("SPI_DISABLE_POLLER", "0") != "1"
 
+    @app.middleware("http")
+    async def apply_api_cache_policy(request: Request, call_next):
+        # Every API response can carry account or evidence data; keep all of it
+        # out of browser and intermediary caches. Routes may still set their
+        # own policy, which wins.
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers.setdefault("Cache-Control", PRIVATE_NO_STORE)
+        return response
+
     # -- client construction from stored settings ---------------------------
 
     def build_protect(settings: dict[str, str | None] | None = None) -> ProtectClient | None:

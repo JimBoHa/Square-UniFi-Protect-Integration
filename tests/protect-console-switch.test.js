@@ -240,3 +240,43 @@ test("console-switch helper loads before the app entry point", () => {
   );
   assert.match(app, /Provider settings kept changing[\s\S]*Reload the page/);
 });
+
+test("wizard maps only a coherent provider snapshot with fenced headers", () => {
+  const app = fs.readFileSync(
+    path.join(__dirname, "../app/static/app.js"),
+    "utf8",
+  );
+  const loadStart = app.indexOf("async function loadWizardMapping");
+  const loadEnd = app.indexOf(
+    '$("#wiz-protect-form").addEventListener',
+    loadStart,
+  );
+  const load = app.slice(loadStart, loadEnd);
+  const coherenceCheck = load.indexOf("if (!settingsSnapshotsMatch(data))");
+  const render = load.indexOf('buildMappingRows($("#wiz-mapping-rows"), data)');
+  const squareToken = load.indexOf("wizardSquareAccountRevision = usable");
+  const protectToken = load.indexOf("wizardProtectConsoleGeneration = usable");
+
+  assert.ok(loadStart >= 0);
+  assert.ok(coherenceCheck >= 0);
+  assert.ok(render > coherenceCheck);
+  assert.ok(squareToken > coherenceCheck);
+  assert.ok(protectToken > coherenceCheck);
+
+  const saveStart = app.indexOf(
+    '$("#wiz-save-mapping").addEventListener',
+  );
+  const saveEnd = app.indexOf(
+    '$("#wiz-finish").addEventListener',
+    saveStart,
+  );
+  const save = app.slice(saveStart, saveEnd);
+  assert.match(
+    save,
+    /"X-Square-Account-Revision": wizardSquareAccountRevision/,
+  );
+  assert.match(
+    save,
+    /"X-Protect-Console-Generation": wizardProtectConsoleGeneration/,
+  );
+});

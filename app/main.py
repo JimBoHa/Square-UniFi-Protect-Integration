@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -116,6 +117,9 @@ class CameraMappingEntry(BaseModel):
     device_name: str = Field(default="", max_length=255)
     camera_id: str = Field(min_length=1, max_length=64)
     camera_name: str = Field(default="", max_length=128)
+
+class WebhookRegisterBody(BaseModel):
+    notification_url: str = Field(min_length=12, max_length=512)
 
 class CameraMappingBody(BaseModel):
     mappings: list[CameraMappingEntry]
@@ -582,6 +586,68 @@ def create_app(
         else:
             store.set_setting("deep_link_template", template)
         return {"ok": True, **deep_link_settings_response()}
+
+    WEBHOOK_SUBSCRIPTION_NAME = "square-unifi-protect"
+
+    @app.post("/api/settings/square/webhook/register")
+    def register_webhook(body: WebhookRegisterBody, _=authed) -> dict:
+        """Create (or retarget) our Square webhook subscription automatically.
+
+        Uses Square's Webhook Subscriptions API so the operator never has to
+        open the developer dashboard: the subscription is created for
+        payment.updated, its signature key is fetched, and both are stored.
+        """
+        url = body.notification_url.strip()
+        if not url.lower().startswith("https://"):
+            raise HTTPException(
+                status_code=422,
+                detail="Notification URL must be https:// and publicly reachable",
+            )
+        client = require_square()
+        try:
+            existing = next(
+                (
+                    sub
+                    for sub in client.list_webhook_subscriptions()
+                    if sub.get("name") == WEBHOOK_SUBSCRIPTION_NAME
+                ),
+                None,
+            )
+            if existing:
+                subscription = client.update_webhook_subscription(
+                    str(existing.get("id", "")), url
+                )
+                signature_key = subscription.get("signature_key") or (
+                    client.get_webhook_signature_key(str(existing.get("id", "")))
+                )
+            else:
+                subscription = client.create_webhook_subscription(
+                    WEBHOOK_SUBSCRIPTION_NAME, url, secrets.token_hex(16)
+                )
+                signature_key = subscription.get("signature_key", "")
+            if not signature_key:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Square did not return the webhook signature key",
+                )
+        except SquareAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except SquarePermissionError:
+            raise HTTPException(
+                status_code=403,
+                detail="Square access token cannot manage webhook subscriptions",
+            )
+        except SquareError as exc:
+            raise HTTPException(status_code=502, detail=f"Could not reach Square: {exc}")
+        finally:
+            client.close()
+        store.update_settings(
+            {
+                "square.webhook_signature_key": (signature_key, True),
+                "square.webhook_url": (url, False),
+            }
+        )
+        return {"ok": True, "notification_url": url, "updated": existing is not None}
 
     # -- cameras & mapping ------------------------------------------------------
 

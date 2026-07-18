@@ -80,6 +80,11 @@
         </label>
         <label>Webhook signature key (optional) <input type="password" id="square-webhook-key" autocomplete="off"></label>
         <label>Webhook notification URL (optional) <input id="square-webhook-url" placeholder="https://example.com/webhooks/square"></label>
+        <button type="button" id="square-register-webhook">Register webhook automatically</button>
+        <p class="hint">Automatic registration needs a token allowed to manage webhook subscriptions (usually the application's personal access token from the Square developer dashboard).</p>
+        <p class="hint">Enter the public notification URL above, press this button,
+          and the subscription and signature key are set up for you — no
+          developer-dashboard steps needed.</p>
         <label class="check"><input type="checkbox" id="square-clear-webhook"> Remove saved webhook configuration</label>
         <p class="hint">Leaving the webhook fields blank keeps any saved webhook configuration.</p>
         <button type="submit">Connect Square</button>

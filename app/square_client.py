@@ -67,6 +67,27 @@ class SquareClient:
     def close(self) -> None:
         self._client.close()
 
+    def _request_json(
+        self, method: str, path: str, json_body: dict | None = None
+    ) -> dict:
+        try:
+            resp = self._client.request(method, path, json=json_body)
+        except httpx.RequestError as exc:
+            raise SquareError("Network error while contacting Square") from exc
+        if resp.status_code == 401:
+            raise SquareAuthError("Square rejected the access token")
+        if resp.status_code == 403:
+            raise SquarePermissionError("Square rejected the token's permissions")
+        if resp.status_code >= 400:
+            raise SquareError(f"Square request {path} failed (HTTP {resp.status_code})")
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise SquareError("Square returned a non-JSON response") from exc
+        if not isinstance(data, dict):
+            raise SquareError("Square returned an invalid response")
+        return data
+
     def _get(self, path: str, params: dict | None = None) -> dict:
         attempt = 0
         while True:
@@ -156,6 +177,69 @@ class SquareClient:
         if not isinstance(merchant_id, str) or not merchant_id:
             raise SquareError("Square did not return the access token's merchant id")
         return merchant_id
+
+    def list_webhook_subscriptions(self) -> list[dict]:
+        data = self._get("/v2/webhooks/subscriptions")
+        subscriptions = data.get("subscriptions", [])
+        if not isinstance(subscriptions, list) or any(
+            not isinstance(item, dict) for item in subscriptions
+        ):
+            raise SquareError("Square returned an invalid response")
+        return subscriptions
+
+    def create_webhook_subscription(
+        self, name: str, notification_url: str, idempotency_key: str
+    ) -> dict:
+        data = self._request_json(
+            "POST",
+            "/v2/webhooks/subscriptions",
+            {
+                "idempotency_key": idempotency_key,
+                "subscription": {
+                    "name": name,
+                    "notification_url": notification_url,
+                    "event_types": ["payment.created", "payment.updated"],
+                    "api_version": SQUARE_VERSION,
+                },
+            },
+        )
+        subscription = data.get("subscription")
+        if not isinstance(subscription, dict):
+            raise SquareError("Square returned an invalid response")
+        return subscription
+
+    def update_webhook_subscription(
+        self, subscription_id: str, notification_url: str
+    ) -> dict:
+        data = self._request_json(
+            "PUT",
+            f"/v2/webhooks/subscriptions/{subscription_id}",
+            {
+                # Re-assert the event types and enabled flag so a manually
+                # edited or disabled subscription becomes functional again.
+                "subscription": {
+                    "notification_url": notification_url,
+                    "event_types": ["payment.created", "payment.updated"],
+                    "enabled": True,
+                }
+            },
+        )
+        subscription = data.get("subscription")
+        if not isinstance(subscription, dict):
+            raise SquareError("Square returned an invalid response")
+        return subscription
+
+    def get_webhook_signature_key(self, subscription_id: str) -> str:
+        data = self._get(f"/v2/webhooks/subscriptions/{subscription_id}")
+        subscription = data.get("subscription")
+        key = (
+            subscription.get("signature_key", "")
+            if isinstance(subscription, dict)
+            else ""
+        )
+        if not key:
+            raise SquareError("Square did not return the webhook signature key")
+        return key
 
     def iter_payment_pages(
         self,

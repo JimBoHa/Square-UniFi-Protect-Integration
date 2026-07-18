@@ -36,22 +36,119 @@
       </form>
     </section>
 
+    <!-- First-run wizard -->
+    <section id="view-wizard" hidden>
+      <div class="wizard-progress" aria-hidden="true">
+        <span class="wiz-dot" data-step="1"></span>
+        <span class="wiz-dot" data-step="2"></span>
+        <span class="wiz-dot" data-step="3"></span>
+        <span class="wiz-dot" data-step="4"></span>
+      </div>
+
+      <div class="wiz-step" data-step="1" hidden>
+        <h2>Step 1 of 4 — Connect UniFi Protect</h2>
+        <p class="hint">Enter your console's IP address and a local Protect user.
+          A dedicated view-only account is recommended.</p>
+        <form id="wiz-protect-form">
+          <label>Host / IP <input id="wiz-protect-host" placeholder="192.168.1.1" required></label>
+          <label>Username <input id="wiz-protect-username" autocomplete="off" required></label>
+          <label>Password <input type="password" id="wiz-protect-password" required></label>
+          <button type="submit">Connect Protect</button>
+        </form>
+      </div>
+
+      <div class="wiz-step" data-step="2" hidden>
+        <h2>Step 2 of 4 — Connect Square</h2>
+        <p class="hint">Paste an access token from the Square Developer Dashboard
+          (Credentials page). Use the Sandbox token to try things out safely.</p>
+        <form id="wiz-square-form">
+          <label>Access token <input type="password" id="wiz-square-token" autocomplete="off" required></label>
+          <label>Environment
+            <select id="wiz-square-env">
+              <option value="production">Production</option>
+              <option value="sandbox">Sandbox</option>
+            </select>
+          </label>
+          <button type="submit">Connect Square</button>
+        </form>
+      </div>
+
+      <div class="wiz-step" data-step="3" hidden>
+        <h2>Step 3 of 4 — Choose the POS camera</h2>
+        <p class="hint">Pick which camera watches the register at each location.</p>
+        <div id="wiz-mapping-rows"></div>
+        <button id="wiz-save-mapping">Save camera selection</button>
+      </div>
+
+      <div class="wiz-step" data-step="4" hidden>
+        <h2>You're all set</h2>
+        <p>Transactions will appear in the feed with camera thumbnails.
+          Press <em>Sync now</em> on the Transactions page for an immediate
+          backfill; webhooks and the background poller keep it current.</p>
+        <button id="wiz-finish">Open the transaction feed</button>
+      </div>
+
+      <p class="wiz-nav">
+        <a href="#" id="wiz-skip">Skip setup — I'll use the Settings page instead</a>
+      </p>
+    </section>
+
     <!-- Settings -->
     <section id="view-settings" hidden>
-      <h2>UniFi Protect console</h2>
+      <h2>UniFi Protect console
+        <span id="protect-status" class="conn-status" role="status" hidden>
+          <span class="conn-dot"></span><span class="conn-text"></span>
+        </span>
+      </h2>
       <form id="protect-form">
         <label>Host / IP <input id="protect-host" placeholder="192.168.1.1" required></label>
+        <button type="button" id="protect-discover">Find console on my network</button>
+        <div id="protect-discover-results" class="hint"></div>
         <label>Username <input id="protect-username" autocomplete="off" required></label>
         <label>Password <input type="password" id="protect-password" required></label>
         <label class="check"><input type="checkbox" id="protect-verify-ssl"> Verify TLS certificate</label>
         <label>Protect API key (optional) <input type="password" id="protect-api-key" autocomplete="off" placeholder="Leave blank to keep current key"></label>
         <label>Alarm Manager trigger ID (optional) <input id="protect-alarm-trigger-id" maxlength="256" placeholder="Leave blank to keep current ID"></label>
-        <p class="hint">To trigger a Protect alarm for each completed sale, configure an Alarm Manager webhook trigger with the same ID.</p>
+        <p class="hint">To trigger a Protect alarm for each completed sale, configure an Alarm Manager webhook trigger with the same ID. Blank alarm fields retain saved values only when the same console is verified.</p>
+        <label class="check"><input type="checkbox" id="protect-confirm-console-switch"> Confirm console switch and clear old camera mappings and evidence</label>
+        <p class="hint">Any change to the saved host/IP or port is treated as a different console, including another alias for the same device. A changed or missing NVR identity also requires confirmation.</p>
         <button type="submit">Connect Protect</button>
         <button type="button" id="protect-disable-alarm">Disable alarm trigger</button>
       </form>
 
-      <h2>Square account</h2>
+      <h3>Protect timeline link</h3>
+      <form id="deep-link-form">
+        <label>Deep-link template
+          <input id="deep-link-template" maxlength="2048" autocomplete="off" spellcheck="false" aria-describedby="deep-link-help deep-link-status">
+        </label>
+        <p id="deep-link-help" class="hint">Leave blank to use the built-in default. Custom values must use https:// with {host} as the entire hostname and include {camera_id} and {ts_ms}.</p>
+        <p id="deep-link-status" class="hint" role="status"></p>
+        <button type="submit">Save timeline link</button>
+      </form>
+
+      <h2>Square account
+        <span id="square-status" class="conn-status" role="status" hidden>
+          <span class="conn-dot"></span><span class="conn-text"></span>
+        </span>
+      </h2>
+      <p class="hint"><strong>Option A — Connect with Square (recommended):</strong>
+        create one Square application (developer dashboard → Credentials), set its
+        OAuth Redirect URL to <code>https://&lt;this-host&gt;/oauth/square/callback</code>,
+        save its OAuth Application ID and Secret below once, then sign in through
+        Square. Tokens are stored encrypted and refreshed automatically.</p>
+      <form id="square-oauth-form">
+        <label>Application ID <input id="square-oauth-client-id" autocomplete="off"></label>
+        <label>Application Secret <input type="password" id="square-oauth-secret" autocomplete="off"></label>
+        <label>Environment
+          <select id="square-oauth-env">
+            <option value="production">Production</option>
+            <option value="sandbox">Sandbox</option>
+          </select>
+        </label>
+        <button type="submit">Save application</button>
+        <button type="button" id="square-oauth-connect">Connect with Square</button>
+      </form>
+      <p class="hint"><strong>Option B — paste an access token manually:</strong></p>
       <form id="square-form">
         <label>Access token <input type="password" id="square-token" autocomplete="off" required></label>
         <label>Environment
@@ -62,8 +159,18 @@
         </label>
         <label>Webhook signature key (optional) <input type="password" id="square-webhook-key" autocomplete="off"></label>
         <label>Webhook notification URL (optional) <input id="square-webhook-url" placeholder="https://example.com/webhooks/square"></label>
+        <button type="button" id="square-register-webhook">Register webhook automatically</button>
+        <p class="hint">Automatic registration needs a token allowed to manage webhook subscriptions (usually the application's personal access token from the Square developer dashboard).</p>
+        <p class="hint">Enter the public notification URL above, press this button,
+          and the subscription and signature key are set up for you — no
+          developer-dashboard steps needed.</p>
         <label class="check"><input type="checkbox" id="square-clear-webhook"> Remove saved webhook configuration</label>
         <p class="hint">Leaving the webhook fields blank keeps any saved webhook configuration.</p>
+        <div id="square-account-switch-warning" class="destructive-warning" role="alert" hidden>
+          <strong>Different Square account detected.</strong>
+          <p>Switching permanently erases the previous account's local transactions, thumbnails, observed POS devices, camera mappings, sync history, and saved Square webhook credentials.</p>
+          <label class="check"><input type="checkbox" id="square-confirm-account-switch"> I understand. Switch accounts and erase the previous account's local data.</label>
+        </div>
         <button type="submit">Connect Square</button>
       </form>
 
@@ -79,6 +186,12 @@
 
     <!-- Transactions -->
     <section id="view-transactions" hidden>
+      <div id="dashboard-tiles" class="tiles" hidden>
+        <div class="tile" data-tile="protect"><div class="tile-title">UniFi Protect</div><div class="tile-value"></div><div class="tile-hint"></div></div>
+        <div class="tile" data-tile="square"><div class="tile-title">Square</div><div class="tile-value"></div><div class="tile-hint"></div></div>
+        <div class="tile" data-tile="webhook"><div class="tile-title">Webhook</div><div class="tile-value"></div><div class="tile-hint"></div></div>
+        <div class="tile" data-tile="queues"><div class="tile-title">Capture queue</div><div class="tile-value"></div><div class="tile-hint"></div></div>
+      </div>
       <div class="toolbar">
         <h2>Transactions</h2>
         <button id="sync-now">Sync now</button>
@@ -96,7 +209,11 @@
     <p id="message" role="status"></p>
   </main>
 
+  <script src="/protect-console-switch.js"></script>
   <script src="/format.js"></script>
+  <script src="/square-form.js"></script>
+  <script src="/deep-link-form.js"></script>
+  <script src="/settings-loader.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

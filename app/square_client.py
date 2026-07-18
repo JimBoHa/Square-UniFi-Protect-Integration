@@ -5,8 +5,15 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
+import math
+import random
+import time
+from collections.abc import Iterator
 
 import httpx
+
+logger = logging.getLogger("spi.square")
 
 SQUARE_VERSION = "2025-01-23"
 
@@ -14,6 +21,9 @@ BASE_URLS = {
     "production": "https://connect.squareup.com",
     "sandbox": "https://connect.squareupsandbox.com",
 }
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_BASE_DELAY_SECONDS = 0.5
+RATE_LIMIT_MAX_DELAY_SECONDS = 10.0
 
 
 class SquareError(Exception):
@@ -35,10 +45,14 @@ class SquareClient:
         environment: str = "production",
         transport: httpx.BaseTransport | None = None,
         timeout: float = 15.0,
+        rate_limit_max_retries: int = RATE_LIMIT_MAX_RETRIES,
+        rate_limit_max_delay: float = RATE_LIMIT_MAX_DELAY_SECONDS,
     ):
         if environment not in BASE_URLS:
             raise ValueError("environment must be 'production' or 'sandbox'")
         self.environment = environment
+        self.rate_limit_max_retries = rate_limit_max_retries
+        self.rate_limit_max_delay = rate_limit_max_delay
         self._client = httpx.Client(
             base_url=BASE_URLS[environment],
             headers={
@@ -53,9 +67,11 @@ class SquareClient:
     def close(self) -> None:
         self._client.close()
 
-    def _get(self, path: str, params: dict | None = None) -> dict:
+    def _request_json(
+        self, method: str, path: str, json_body: dict | None = None
+    ) -> dict:
         try:
-            resp = self._client.get(path, params=params)
+            resp = self._client.request(method, path, json=json_body)
         except httpx.RequestError as exc:
             raise SquareError("Network error while contacting Square") from exc
         if resp.status_code == 401:
@@ -72,6 +88,56 @@ class SquareClient:
             raise SquareError("Square returned an invalid response")
         return data
 
+    def _get(self, path: str, params: dict | None = None) -> dict:
+        attempt = 0
+        while True:
+            try:
+                resp = self._client.get(path, params=params)
+            except httpx.RequestError as exc:
+                raise SquareError("Network error while contacting Square") from exc
+            if resp.status_code != 429 or attempt >= self.rate_limit_max_retries:
+                break
+            delay = self._rate_limit_delay(resp, attempt)
+            logger.warning(
+                "Square rate limited %s; retrying in %.2f seconds",
+                path,
+                delay,
+            )
+            time.sleep(delay)
+            attempt += 1
+        if resp.status_code == 401:
+            raise SquareAuthError("Square rejected the access token")
+        if resp.status_code == 403:
+            raise SquarePermissionError("Square rejected the token's permissions")
+        if resp.status_code >= 400:
+            raise SquareError(f"Square request {path} failed (HTTP {resp.status_code})")
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise SquareError("Square returned a non-JSON response") from exc
+        if not isinstance(data, dict):
+            raise SquareError("Square returned an invalid response")
+        return data
+
+    def _rate_limit_delay(self, resp: httpx.Response, attempt: int) -> float:
+        # Retry-After may also arrive as an HTTP-date; that form falls back to
+        # exponential backoff below.
+        max_delay = self.rate_limit_max_delay
+        retry_after = resp.headers.get("retry-after")
+        if retry_after is not None:
+            try:
+                requested_delay = float(retry_after)
+            except ValueError:
+                requested_delay = -1.0
+            if math.isfinite(requested_delay) and requested_delay >= 0:
+                return min(requested_delay, max_delay)
+        backoff = min(
+            RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** max(0, attempt)),
+            max_delay,
+        )
+        jitter = random.uniform(0, backoff * 0.25)
+        return min(backoff + jitter, max_delay)
+
     @staticmethod
     def _object_list(data: dict, key: str) -> list[dict]:
         items = data.get(key, [])
@@ -83,26 +149,99 @@ class SquareClient:
 
     def list_locations(self) -> list[dict]:
         data = self._get("/v2/locations")
-        locations = self._object_list(data, "locations")
-        return [
-            {
-                "id": loc.get("id", ""),
-                "name": loc.get("name", ""),
-                "status": loc.get("status", ""),
-            }
-            for loc in locations
-        ]
+        normalized = []
+        for location in self._object_list(data, "locations"):
+            location_id = location.get("id")
+            name = location.get("name")
+            status = location.get("status")
+            if not isinstance(location_id, str) or not location_id:
+                raise SquareError("Square returned an invalid response")
+            if name is not None and not isinstance(name, str):
+                raise SquareError("Square returned an invalid response")
+            if status is not None and not isinstance(status, str):
+                raise SquareError("Square returned an invalid response")
+            normalized.append(
+                {
+                    "id": location_id,
+                    "name": name or "",
+                    "status": status or "",
+                }
+            )
+        return normalized
 
     def merchant_id(self) -> str:
         """Return the merchant bound to this access token."""
         data = self._get("/v2/merchants/me")
         merchant = data.get("merchant") if isinstance(data, dict) else None
         merchant_id = merchant.get("id", "") if isinstance(merchant, dict) else ""
-        if not merchant_id:
+        if not isinstance(merchant_id, str) or not merchant_id:
             raise SquareError("Square did not return the access token's merchant id")
         return merchant_id
 
-    def list_payments(
+    def list_webhook_subscriptions(self) -> list[dict]:
+        data = self._get("/v2/webhooks/subscriptions")
+        subscriptions = data.get("subscriptions", [])
+        if not isinstance(subscriptions, list) or any(
+            not isinstance(item, dict) for item in subscriptions
+        ):
+            raise SquareError("Square returned an invalid response")
+        return subscriptions
+
+    def create_webhook_subscription(
+        self, name: str, notification_url: str, idempotency_key: str
+    ) -> dict:
+        data = self._request_json(
+            "POST",
+            "/v2/webhooks/subscriptions",
+            {
+                "idempotency_key": idempotency_key,
+                "subscription": {
+                    "name": name,
+                    "notification_url": notification_url,
+                    "event_types": ["payment.created", "payment.updated"],
+                    "api_version": SQUARE_VERSION,
+                },
+            },
+        )
+        subscription = data.get("subscription")
+        if not isinstance(subscription, dict):
+            raise SquareError("Square returned an invalid response")
+        return subscription
+
+    def update_webhook_subscription(
+        self, subscription_id: str, notification_url: str
+    ) -> dict:
+        data = self._request_json(
+            "PUT",
+            f"/v2/webhooks/subscriptions/{subscription_id}",
+            {
+                # Re-assert the event types and enabled flag so a manually
+                # edited or disabled subscription becomes functional again.
+                "subscription": {
+                    "notification_url": notification_url,
+                    "event_types": ["payment.created", "payment.updated"],
+                    "enabled": True,
+                }
+            },
+        )
+        subscription = data.get("subscription")
+        if not isinstance(subscription, dict):
+            raise SquareError("Square returned an invalid response")
+        return subscription
+
+    def get_webhook_signature_key(self, subscription_id: str) -> str:
+        data = self._get(f"/v2/webhooks/subscriptions/{subscription_id}")
+        subscription = data.get("subscription")
+        key = (
+            subscription.get("signature_key", "")
+            if isinstance(subscription, dict)
+            else ""
+        )
+        if not key:
+            raise SquareError("Square did not return the webhook signature key")
+        return key
+
+    def iter_payment_pages(
         self,
         begin_time: str | None = None,
         limit: int | None = None,
@@ -110,22 +249,22 @@ class SquareClient:
         updated_at_begin_time: str | None = None,
         sort_field: str | None = None,
         sort_order: str = "DESC",
-    ) -> list[dict]:
-        """Completed and pending payments in the requested order, following pagination.
+    ) -> Iterator[list[dict]]:
+        """Yield validated payment pages in the requested order.
 
-        By default, exhaust all cursor pages.  A positive limit caps the total
-        number of returned payments.
+        A positive limit caps the total number of yielded payments across all
+        pages. Each page is yielded before the next Square request is made.
         """
         if limit is not None and limit <= 0:
             raise ValueError("limit must be positive or None")
         if sort_order not in {"ASC", "DESC"}:
             raise ValueError("sort_order must be 'ASC' or 'DESC'")
 
-        payments: list[dict] = []
+        yielded = 0
         cursor: str | None = None
         seen_cursors: set[str] = set()
         while True:
-            remaining = limit - len(payments) if limit is not None else 100
+            remaining = limit - yielded if limit is not None else 100
             params: dict = {"sort_order": sort_order, "limit": min(remaining, 100)}
             if begin_time:
                 params["begin_time"] = begin_time
@@ -144,17 +283,47 @@ class SquareClient:
                     payment_from_api(payment)
             except (TypeError, ValueError) as exc:
                 raise SquareError("Square returned invalid payment data") from exc
-            payments.extend(page)
             next_cursor = data.get("cursor")
             if next_cursor is not None and not isinstance(next_cursor, str):
                 raise SquareError("Square returned an invalid response")
-            if not next_cursor or (limit is not None and len(payments) >= limit):
-                break
-            if next_cursor in seen_cursors:
-                raise SquareError("Square returned a repeated pagination cursor")
-            seen_cursors.add(next_cursor)
+
+            yielded_page = page if limit is None else page[:remaining]
+            yielded += len(yielded_page)
+            has_more = bool(next_cursor) and (
+                limit is None or yielded < limit
+            )
+            if has_more:
+                if next_cursor in seen_cursors:
+                    raise SquareError("Square returned a repeated pagination cursor")
+                seen_cursors.add(next_cursor)
+
+            yield yielded_page
+            if not has_more:
+                return
             cursor = next_cursor
-        return payments if limit is None else payments[:limit]
+
+    def list_payments(
+        self,
+        begin_time: str | None = None,
+        limit: int | None = None,
+        location_id: str | None = None,
+        updated_at_begin_time: str | None = None,
+        sort_field: str | None = None,
+        sort_order: str = "DESC",
+    ) -> list[dict]:
+        """Return validated payments after exhausting all requested pages."""
+        return [
+            payment
+            for page in self.iter_payment_pages(
+                begin_time=begin_time,
+                limit=limit,
+                location_id=location_id,
+                updated_at_begin_time=updated_at_begin_time,
+                sort_field=sort_field,
+                sort_order=sort_order,
+            )
+            for payment in page
+        ]
 
 
 def verify_webhook_signature(
@@ -239,3 +408,68 @@ def payment_from_api(payment: dict) -> dict:
         "card_last4": text_field(card, "last_4", "card_details.card.last_4"),
         "receipt_url": text_field(payment, "receipt_url"),
     }
+
+
+OAUTH_SCOPES = ("MERCHANT_PROFILE_READ", "PAYMENTS_READ")
+
+
+def oauth_authorize_url(environment: str, client_id: str, state: str) -> str:
+    """Square OAuth consent URL for the configured environment."""
+    if environment not in BASE_URLS:
+        raise ValueError("environment must be 'production' or 'sandbox'")
+    base = BASE_URLS[environment]
+    scope = "+".join(OAUTH_SCOPES)
+    return (
+        f"{base}/oauth2/authorize?client_id={client_id}"
+        f"&scope={scope}&session=false&state={state}"
+    )
+
+
+def oauth_exchange(
+    environment: str,
+    client_id: str,
+    client_secret: str,
+    *,
+    code: str | None = None,
+    refresh_token: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+    timeout: float = 15.0,
+) -> dict:
+    """Exchange an authorization code (or refresh token) for tokens.
+
+    Returns the token payload: access_token, refresh_token, expires_at,
+    merchant_id.
+    """
+    if environment not in BASE_URLS:
+        raise ValueError("environment must be 'production' or 'sandbox'")
+    body: dict = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    if code is not None:
+        body.update({"grant_type": "authorization_code", "code": code})
+    elif refresh_token is not None:
+        body.update({"grant_type": "refresh_token", "refresh_token": refresh_token})
+    else:
+        raise ValueError("code or refresh_token is required")
+    client = httpx.Client(
+        base_url=BASE_URLS[environment], transport=transport, timeout=timeout
+    )
+    try:
+        try:
+            resp = client.post("/oauth2/token", json=body)
+        except httpx.RequestError as exc:
+            raise SquareError("Network error while contacting Square") from exc
+    finally:
+        client.close()
+    if resp.status_code in (400, 401, 403):
+        raise SquareAuthError("Square rejected the OAuth request")
+    if resp.status_code >= 400:
+        raise SquareError(f"Square OAuth failed (HTTP {resp.status_code})")
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise SquareError("Square returned a non-JSON response") from exc
+    if not isinstance(data, dict) or not data.get("access_token"):
+        raise SquareError("Square returned an invalid OAuth response")
+    return data

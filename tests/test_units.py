@@ -11,7 +11,12 @@ import httpx
 import pytest
 from cryptography.fernet import Fernet
 
-from app.deeplink import build_deep_link
+from app.deeplink import (
+    DEFAULT_TEMPLATE,
+    build_deep_link,
+    validate_deep_link_template,
+)
+from app.main import _parse_poll_interval, create_app
 from app.protect_client import (
     ProtectAuthError,
     ProtectClient,
@@ -165,6 +170,49 @@ def test_deep_link_custom_template():
     )
     assert link == "https://u.local/protect/timeline?cams=cam1&t=5"
 
+@pytest.mark.parametrize(
+    "template",
+    [
+        DEFAULT_TEMPLATE,
+        "https://{host}/protect/timeline/{camera_id}?at={ts_ms}",
+        "  https://{host}/protect/{camera_id}#timestamp={ts_ms}  ",
+    ],
+)
+def test_deep_link_template_validation_accepts_safe_urls(template):
+    assert validate_deep_link_template(template) == template.strip()
+
+def test_deep_link_template_validation_treats_blank_as_default_override():
+    assert validate_deep_link_template("  ") == ""
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "http://{host}/protect/{camera_id}?at={ts_ms}",
+        "javascript://{host}/{camera_id}?at={ts_ms}",
+        "https://evil.example/{host}/{camera_id}?at={ts_ms}",
+        "https://{host}@evil.example/{camera_id}?at={ts_ms}",
+        "https://{host}:443/{camera_id}?at={ts_ms}",
+        "https://{host}/protect/{camera_id}",
+        "https://{host}/protect?at={ts_ms}",
+        "https://{host}/protect/{camera_id}?at={ts_ms}&extra={unknown}",
+        "https://{host}/protect/{{camera_id}}?at={ts_ms}",
+        "https://{host}/protect/\n{camera_id}?at={ts_ms}",
+        "https://{host}\\evil.example/{camera_id}?at={ts_ms}",
+    ],
+)
+def test_deep_link_template_validation_rejects_unsafe_urls(template):
+    with pytest.raises(ValueError):
+        validate_deep_link_template(template)
+
+def test_deep_link_build_rejects_unsafe_legacy_template():
+    with pytest.raises(ValueError):
+        build_deep_link(
+            "u.local",
+            "cam1",
+            5,
+            template="https://evil.example/{host}/{camera_id}?at={ts_ms}",
+        )
+
 def test_deep_link_rejects_bad_values():
     with pytest.raises(ValueError):
         build_deep_link("evil.com/path", "cam1", 5)
@@ -174,9 +222,37 @@ def test_deep_link_rejects_bad_values():
 
 # -- sync helpers -------------------------------------------------------------------
 
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_app_rejects_unsafe_poll_interval_before_initialization(
+    tmp_path, monkeypatch, value
+):
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("SPI_POLL_INTERVAL", value)
+    with pytest.raises(
+        ValueError,
+        match="SPI_POLL_INTERVAL must be a finite number of at least 1 second",
+    ):
+        create_app(data_dir=data_dir, enable_poller=True)
+    assert not data_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1", 1.0), ("1.5", 1.5), ("60", 60.0)],
+)
+def test_poll_interval_accepts_finite_values_at_least_one_second(value, expected):
+    assert _parse_poll_interval(value) == expected
+
+
 def test_parse_ts_ms_known_value():
     assert parse_ts_ms("2021-01-01T00:00:00Z") == 1609459200000
     assert parse_ts_ms("2021-01-01T00:00:00.500Z") == 1609459200500
+    assert parse_ts_ms("2020-12-31T16:00:00-08:00") == 1609459200000
+
+
+def test_parse_ts_ms_rejects_timezone_less_value():
+    with pytest.raises(ValueError, match="timezone offset"):
+        parse_ts_ms("2021-01-01T00:00:00")
 
 def test_safe_thumbnail_name_sanitizes():
     assert safe_thumbnail_name("PAY_001") == "PAY_001.jpg"
@@ -230,6 +306,9 @@ def test_sync_queries_every_location_with_its_own_watermark(tmp_path):
         def list_locations(self):
             return [{"id": "LOC1"}, {"id": "LOC2"}]
 
+        def iter_payment_pages(self, **params):
+            yield self.list_payments(**params)
+
         def list_payments(
             self,
             updated_at_begin_time=None,
@@ -256,6 +335,12 @@ def test_sync_queries_every_location_with_its_own_watermark(tmp_path):
             payment("OLD_LOC2", "2026-07-10T08:00:00Z", "LOC2"),
             None,
         )
+        store.advance_square_poll_watermark(
+            "LOC1", parse_ts_ms("2026-07-15T12:00:00Z")
+        )
+        store.advance_square_poll_watermark(
+            "LOC2", parse_ts_ms("2026-07-10T08:00:00Z")
+        )
         square = RecordingSquare()
 
         assert sync_payments(store, square, None) == 2
@@ -265,6 +350,171 @@ def test_sync_queries_every_location_with_its_own_watermark(tmp_path):
         ]
         assert store.get_transaction("PAY_LOC1") is not None
         assert store.get_transaction("PAY_LOC2") is not None
+    finally:
+        store.close()
+
+
+def test_webhook_before_first_poll_keeps_full_backfill(tmp_path, monkeypatch):
+    poll_boundary = "2026-07-17T12:00:00Z"
+    poll_boundary_ms = parse_ts_ms(poll_boundary)
+    monkeypatch.setattr("app.sync._current_time_ms", lambda: poll_boundary_ms)
+
+    def payment(payment_id: str, timestamp: str) -> dict:
+        return {
+            "id": payment_id,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "amount_money": {"amount": 100, "currency": "USD"},
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        }
+
+    live_webhook_payment = payment("PAY_LIVE", poll_boundary)
+    backfill_payment = payment("PAY_BACKFILL", "2026-07-16T13:00:00Z")
+
+    class Square:
+        def __init__(self):
+            self.begin_times = []
+
+        def list_locations(self):
+            return [{"id": "LOC1"}]
+
+        def iter_payment_pages(self, **params):
+            yield self.list_payments(**params)
+
+        def list_payments(self, **params):
+            self.begin_times.append(params["updated_at_begin_time"])
+            return [backfill_payment]
+
+    store = Store(tmp_path / "data")
+    square = Square()
+    try:
+        # This is the webhook path: it stores a recent row without completing
+        # any Square reconciliation window.
+        ingest_payment(store, live_webhook_payment, None)
+        assert store.latest_transaction_updated_ts("LOC1") == poll_boundary_ms
+        assert store.get_square_poll_watermark("LOC1") is None
+
+        assert sync_payments(store, square, None) == 1
+        assert square.begin_times == ["2026-07-16T12:00:00Z"]
+        assert store.get_transaction("PAY_BACKFILL") is not None
+        assert store.get_square_poll_watermark("LOC1") == poll_boundary_ms
+    finally:
+        store.close()
+
+
+def test_quiet_location_watermark_survives_restart(tmp_path, monkeypatch):
+    first_boundary_ms = parse_ts_ms("2026-07-17T12:00:00Z")
+    second_boundary_ms = parse_ts_ms("2026-07-17T12:10:00Z")
+    poll_times = iter([first_boundary_ms, second_boundary_ms])
+    monkeypatch.setattr("app.sync._current_time_ms", lambda: next(poll_times))
+
+    class EmptySquare:
+        def __init__(self):
+            self.begin_times = []
+
+        def list_locations(self):
+            return [{"id": "LOC1"}]
+
+        def iter_payment_pages(self, **params):
+            yield self.list_payments(**params)
+
+        def list_payments(self, **params):
+            self.begin_times.append(params["updated_at_begin_time"])
+            return []
+
+    data_dir = tmp_path / "data"
+    square = EmptySquare()
+    first_store = Store(data_dir)
+    try:
+        assert sync_payments(first_store, square, None) == 0
+        assert first_store.get_square_poll_watermark("LOC1") == first_boundary_ms
+    finally:
+        first_store.close()
+
+    restarted_store = Store(data_dir)
+    try:
+        assert sync_payments(restarted_store, square, None) == 0
+        assert restarted_store.get_square_poll_watermark("LOC1") == second_boundary_ms
+    finally:
+        restarted_store.close()
+
+    assert square.begin_times == [
+        "2026-07-16T12:00:00Z",
+        "2026-07-17T11:55:00Z",
+    ]
+
+
+def test_later_page_failure_does_not_advance_poll_watermark(
+    tmp_path, monkeypatch
+):
+    original_watermark = parse_ts_ms("2026-07-17T10:00:00Z")
+    failed_boundary = parse_ts_ms("2026-07-17T12:00:00Z")
+    successful_boundary = parse_ts_ms("2026-07-17T12:10:00Z")
+    poll_times = iter([failed_boundary, successful_boundary])
+    monkeypatch.setattr("app.sync._current_time_ms", lambda: next(poll_times))
+
+    def payment(payment_id: str, timestamp: str) -> dict:
+        return {
+            "id": payment_id,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "amount_money": {"amount": 100, "currency": "USD"},
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        }
+
+    first_page_payment = payment("PAY_PAGE_1", "2026-07-17T10:30:00Z")
+    second_page_payment = payment("PAY_PAGE_2", "2026-07-17T11:00:00Z")
+    state = {"fail_second_page": True}
+    begin_times = []
+    payment_cursors = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/locations":
+            return httpx.Response(200, json={"locations": [{"id": "LOC1"}]})
+        cursor = request.url.params.get("cursor")
+        payment_cursors.append(cursor)
+        if cursor is None:
+            begin_times.append(request.url.params["updated_at_begin_time"])
+            return httpx.Response(
+                200,
+                json={"payments": [first_page_payment], "cursor": "next1"},
+            )
+        if state["fail_second_page"]:
+            return httpx.Response(
+                503,
+                json={"errors": [{"code": "SERVICE_UNAVAILABLE"}]},
+            )
+        return httpx.Response(200, json={"payments": [second_page_payment]})
+
+    store = Store(tmp_path / "data")
+    store.advance_square_poll_watermark("LOC1", original_watermark)
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match="HTTP 503"):
+            sync_payments(store, client, None)
+        assert store.get_square_poll_watermark("LOC1") == original_watermark
+
+        state["fail_second_page"] = False
+        sync_payments(store, client, None)
+        assert store.get_transaction("PAY_PAGE_1") is not None
+        assert store.get_transaction("PAY_PAGE_2") is not None
+        assert store.get_square_poll_watermark("LOC1") == successful_boundary
+    finally:
+        client.close()
+        store.close()
+
+    assert begin_times == ["2026-07-17T09:55:00Z"] * 2
+    assert payment_cursors == [None, "next1", None, "next1"]
+
+
+def test_square_poll_watermark_never_moves_backward(tmp_path):
+    store = Store(tmp_path / "data")
+    try:
+        store.advance_square_poll_watermark("LOC1", 2000)
+        store.advance_square_poll_watermark("LOC1", 1000)
+        assert store.get_square_poll_watermark("LOC1") == 2000
     finally:
         store.close()
 
@@ -301,6 +551,59 @@ def test_protect_login_and_cameras():
     cameras = client.get_cameras()
     assert [c["name"] for c in cameras] == ["Front Counter", "Back Door"]
     client.close()
+
+
+def test_protect_cameras_with_console_identity_uses_one_bootstrap_request():
+    calls = {"bootstrap": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        calls["bootstrap"] += 1
+        return httpx.Response(
+            200,
+            json={
+                "cameras": [{"id": "cam1", "name": "Counter"}],
+                "nvr": {"id": " nvr-console-1 ", "mac": "00:11:22:33:44:55"},
+            },
+        )
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    cameras, console_identity = client.get_cameras_with_console_identity()
+    client.close()
+
+    assert cameras == [{"id": "cam1", "name": "Counter", "state": ""}]
+    assert console_identity == "nvr-console-1"
+    assert calls["bootstrap"] == 1
+
+
+@pytest.mark.parametrize(
+    ("nvr", "expected_identity"),
+    [
+        ({"mac": "00:11:22:33:44:55"}, "00:11:22:33:44:55"),
+        ({"id": "", "mac": "fallback-mac"}, "fallback-mac"),
+        ({"id": 123, "mac": "fallback-mac"}, "fallback-mac"),
+        ({"id": "x" * 257, "mac": "fallback-mac"}, "fallback-mac"),
+        ({"id": "bad\nvalue", "mac": "fallback-mac"}, "fallback-mac"),
+        (None, None),
+        ([], None),
+        ({"id": 123, "mac": {}}, None),
+    ],
+)
+def test_protect_console_identity_is_optional_and_conservative(
+    nvr, expected_identity
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        return httpx.Response(200, json={"cameras": [], "nvr": nvr})
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    cameras, console_identity = client.get_cameras_with_console_identity()
+    client.close()
+
+    assert cameras == []
+    assert console_identity == expected_identity
 
 def test_protect_bad_credentials():
     client = ProtectClient(
@@ -360,6 +663,11 @@ def test_protect_camera_html_response_is_normalized():
         [],
         {"cameras": {}},
         {"cameras": ["private camera item"]},
+        {"cameras": [{"id": {"private": "camera id"}}]},
+        {"cameras": [{"id": "../private-camera"}]},
+        {"cameras": [{"id": "cam1", "name": ["private camera name"]}]},
+        {"cameras": [{"id": "cam1", "marketName": {}}]},
+        {"cameras": [{"id": "cam1", "state": []}]},
     ],
 )
 def test_protect_camera_response_shapes_are_normalized(payload):
@@ -719,6 +1027,9 @@ def test_alarm_retry_runs_when_square_listing_fails(tmp_path):
         def list_locations(self):
             raise RuntimeError("Square unavailable")
 
+        def iter_payment_pages(self, **params):
+            yield self.list_payments(**params)
+
         def list_payments(self, **_kwargs):
             raise RuntimeError("Square unavailable")
 
@@ -857,6 +1168,9 @@ def test_sync_uses_offline_client_timestamp_for_snapshot(tmp_path):
         def list_locations(self):
             return [{"id": "LOC1"}]
 
+        def iter_payment_pages(self, **params):
+            yield self.list_payments(**params)
+
         def list_payments(self, **params):
             return [payment]
 
@@ -882,12 +1196,18 @@ def test_sync_uses_offline_client_timestamp_for_snapshot(tmp_path):
     finally:
         store.close()
 
-def test_sync_skips_nonempty_malformed_offline_timestamp(tmp_path):
+@pytest.mark.parametrize(
+    "client_created_at",
+    ["not-a-timestamp", "2026-07-16T08:30:00"],
+)
+def test_sync_skips_nonempty_malformed_offline_timestamp(
+    tmp_path, client_created_at
+):
     payment = {
         "id": "PAY_BAD_TIME",
         "created_at": "2026-07-16T16:30:00Z",
         "is_offline_payment": True,
-        "offline_payment_details": {"client_created_at": "not-a-timestamp"},
+        "offline_payment_details": {"client_created_at": client_created_at},
         "amount_money": {"amount": 1200, "currency": "USD"},
         "status": "COMPLETED",
         "location_id": "LOC1",
@@ -896,6 +1216,9 @@ def test_sync_skips_nonempty_malformed_offline_timestamp(tmp_path):
     class Square:
         def list_locations(self):
             return [{"id": "LOC1"}]
+
+        def iter_payment_pages(self, **params):
+            yield self.list_payments(**params)
 
         def list_payments(self, **params):
             return [payment]
@@ -925,6 +1248,100 @@ def test_square_pagination_exhausts_cursor_pages_by_default():
     assert [p["id"] for p in payments] == [f"P{i}" for i in range(102)]
     assert request_limits == [100, 100]
     client.close()
+
+
+def test_square_payment_page_iterator_honors_total_limit():
+    pages = {
+        None: {
+            "payments": [{"id": "P0"}, {"id": "P1"}, {"id": "P2"}],
+            "cursor": "next1",
+        },
+        "next1": {
+            # Deliberately over-return to verify the client still enforces the
+            # caller's total limit rather than trusting the provider page size.
+            "payments": [{"id": "P3"}, {"id": "P4"}],
+            "cursor": "unused",
+        },
+    }
+    request_limits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_limits.append(int(request.url.params["limit"]))
+        return httpx.Response(200, json=pages[request.url.params.get("cursor")])
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        payment_pages = list(client.iter_payment_pages(limit=4))
+    finally:
+        client.close()
+
+    assert [[payment["id"] for payment in page] for page in payment_pages] == [
+        ["P0", "P1", "P2"],
+        ["P3"],
+    ]
+    assert request_limits == [4, 1]
+
+
+def test_square_payment_page_iterator_rejects_repeated_cursor():
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            json={"payments": [{"id": f"P{requests}"}], "cursor": "loop"},
+        )
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    pages = client.iter_payment_pages()
+    try:
+        assert [payment["id"] for payment in next(pages)] == ["P1"]
+        with pytest.raises(SquareError, match="repeated pagination cursor"):
+            next(pages)
+    finally:
+        client.close()
+
+    assert requests == 2
+
+
+def test_sync_persists_page_before_later_square_failure(tmp_path):
+    first_payment = {
+        "id": "P_FIRST_PAGE",
+        "created_at": "2026-07-17T20:00:00Z",
+        "updated_at": "2026-07-17T20:00:00Z",
+        "amount_money": {"amount": 100, "currency": "USD"},
+        "status": "COMPLETED",
+        "location_id": "LOC1",
+    }
+    payment_cursors = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/locations":
+            return httpx.Response(200, json={"locations": [{"id": "LOC1"}]})
+        cursor = request.url.params.get("cursor")
+        payment_cursors.append(cursor)
+        if cursor is None:
+            return httpx.Response(
+                200,
+                json={"payments": [first_payment], "cursor": "next1"},
+            )
+        return httpx.Response(
+            503,
+            json={"errors": [{"code": "SERVICE_UNAVAILABLE"}]},
+        )
+
+    store = Store(tmp_path / "data")
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match="HTTP 503"):
+            sync_payments(store, client, None)
+        assert store.get_transaction("P_FIRST_PAGE") is not None
+        assert payment_cursors == [None, "next1"]
+    finally:
+        client.close()
+        store.close()
+
 
 def test_square_pagination_rejects_repeated_cursor():
     requests = 0
@@ -1049,6 +1466,71 @@ def test_square_transport_error_is_normalized():
     client.close()
 
 
+def test_square_retries_rate_limit_until_success(monkeypatch):
+    requests = 0
+    delays = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests < 3:
+            return httpx.Response(429, headers={"Retry-After": "0.25"})
+        return httpx.Response(200, json={"locations": []})
+
+    monkeypatch.setattr("app.square_client.time.sleep", delays.append)
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        assert client.list_locations() == []
+    finally:
+        client.close()
+
+    assert requests == 3
+    assert delays == [0.25, 0.25]
+
+
+def test_square_rate_limit_retries_are_bounded_and_jittered(monkeypatch):
+    requests = 0
+    delays = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(429)
+
+    monkeypatch.setattr("app.square_client.time.sleep", delays.append)
+    monkeypatch.setattr("app.square_client.random.uniform", lambda _low, high: high)
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match=r"HTTP 429"):
+            client.list_locations()
+    finally:
+        client.close()
+
+    assert requests == 4
+    assert delays == [0.625, 1.25, 2.5]
+
+
+def test_square_rate_limit_caps_retry_after(monkeypatch):
+    delays = []
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            return httpx.Response(429, headers={"Retry-After": "3600"})
+        return httpx.Response(200, json={"locations": []})
+
+    monkeypatch.setattr("app.square_client.time.sleep", delays.append)
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        assert client.list_locations() == []
+    finally:
+        client.close()
+
+    assert delays == [10.0]
+
+
 def test_square_html_response_is_normalized():
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"<html>private Square body</html>")
@@ -1067,6 +1549,9 @@ def test_square_html_response_is_normalized():
         ("locations", []),
         ("locations", {"locations": {}}),
         ("locations", {"locations": ["private location item"]}),
+        ("locations", {"locations": [{"id": ["private location id"]}]}),
+        ("locations", {"locations": [{"id": "LOC1", "name": {}}]}),
+        ("locations", {"locations": [{"id": "LOC1", "status": []}]}),
         ("payments", {"payments": {}}),
         ("payments", {"payments": ["private payment item"]}),
         ("payments", {"payments": [], "cursor": []}),
@@ -1086,6 +1571,22 @@ def test_square_response_shapes_are_normalized(operation, payload):
     assert "private location item" not in str(exc_info.value)
     assert "private payment item" not in str(exc_info.value)
     client.close()
+
+
+@pytest.mark.parametrize("merchant_id", [{"private": "id"}, ["id"], 123, None])
+def test_square_rejects_malformed_merchant_id(merchant_id):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"merchant": {"id": merchant_id}})
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(
+            SquareError,
+            match="Square did not return the access token's merchant id",
+        ):
+            client.merchant_id()
+    finally:
+        client.close()
 
 
 def test_square_permission_error_is_distinct():
@@ -1218,6 +1719,37 @@ def test_snapshot_accepts_valid_jpeg_content_type_variants(content_type):
 
     client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
     assert client.get_snapshot("cam1", ts_ms=1609459200000) == FAKE_JPEG
+    client.close()
+
+
+def test_snapshot_accepts_marker_bytes_inside_metadata_segment():
+    metadata = b"Exif\x00\x00metadata with marker-like \xff\xd9 bytes"
+    app_segment = b"\xff\xe1" + (len(metadata) + 2).to_bytes(2, "big") + metadata
+    image = FAKE_JPEG[:2] + app_segment + FAKE_JPEG[2:]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        return httpx.Response(200, content=image, headers={"content-type": "image/jpeg"})
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    assert client.get_snapshot("cam1") == image
+    client.close()
+
+
+def test_snapshot_does_not_accept_markers_hidden_inside_metadata():
+    metadata = b"not a frame \xff\xc0 fake header \xff\xda fake scan"
+    app_segment = b"\xff\xe1" + (len(metadata) + 2).to_bytes(2, "big") + metadata
+    image = b"\xff\xd8" + app_segment + b"\xff\xd9"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        return httpx.Response(200, content=image, headers={"content-type": "image/jpeg"})
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    with pytest.raises(ProtectError, match="invalid JPEG"):
+        client.get_snapshot("cam1")
     client.close()
 
 

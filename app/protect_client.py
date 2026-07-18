@@ -14,6 +14,7 @@ import httpx
 
 HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?(?::\d{1,5})?$")
 CAMERA_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
+_CONSOLE_ID_MAX_LENGTH = 256
 _SNAPSHOT_CONTENT_TYPES = frozenset(
     {
         "image/jpeg",
@@ -23,9 +24,8 @@ _SNAPSHOT_CONTENT_TYPES = frozenset(
         "binary/octet-stream",
     }
 )
-_JPEG_START_OF_FRAME_MARKERS = tuple(
-    bytes((0xFF, marker))
-    for marker in (
+_JPEG_START_OF_FRAME_CODES = frozenset(
+    (
         0xC0,
         0xC1,
         0xC2,
@@ -51,6 +51,73 @@ class ProtectAuthError(ProtectError):
     pass
 
 
+def _is_complete_jpeg(content: bytes) -> bool:
+    """Validate JPEG structure without treating marker-like metadata as syntax."""
+    if not content.startswith(b"\xff\xd8"):
+        return False
+
+    position = 2
+    in_scan = False
+    saw_frame = False
+    saw_scan = False
+    saw_scan_data = False
+    while position < len(content):
+        if in_scan:
+            marker_start = content.find(b"\xff", position)
+            if marker_start == -1 or marker_start + 1 >= len(content):
+                return False
+            if marker_start > position:
+                saw_scan_data = True
+            marker = content[marker_start + 1]
+            if marker == 0x00:  # Entropy-coded 0xff byte.
+                saw_scan_data = True
+                position = marker_start + 2
+                continue
+            if marker == 0xFF:  # Fill byte before a marker.
+                position = marker_start + 1
+                continue
+            if 0xD0 <= marker <= 0xD7:  # Restart marker within scan data.
+                position = marker_start + 2
+                continue
+            position = marker_start
+            in_scan = False
+            continue
+
+        if content[position] != 0xFF:
+            return False
+        while position < len(content) and content[position] == 0xFF:
+            position += 1
+        if position >= len(content):
+            return False
+        marker = content[position]
+        position += 1
+
+        if marker == 0xD9:  # End of image; trailing bytes are permitted.
+            return saw_frame and saw_scan and saw_scan_data
+        if marker == 0xD8 or marker == 0x00:
+            return False
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            continue
+        if position + 2 > len(content):
+            return False
+        segment_length = int.from_bytes(content[position : position + 2], "big")
+        if segment_length < 2:
+            return False
+        segment_end = position + segment_length
+        if segment_end > len(content):
+            return False
+
+        if marker in _JPEG_START_OF_FRAME_CODES:
+            saw_frame = True
+        if marker == 0xDA:  # Start of scan.
+            if not saw_frame:
+                return False
+            saw_scan = True
+            in_scan = True
+        position = segment_end
+    return False
+
+
 def _validated_snapshot_bytes(resp: httpx.Response) -> bytes:
     """Return a complete JPEG response or reject an upstream error document."""
     content_type = (
@@ -64,13 +131,7 @@ def _validated_snapshot_bytes(resp: httpx.Response) -> bytes:
     # frame header and scan in addition to SOI/EOI so marker-only or wrapped
     # error payloads are not persisted as camera evidence. Trailing bytes are
     # allowed because JPEG decoders permit data after the EOI marker.
-    eoi_position = content.find(b"\xff\xd9", 2)
-    scan_position = content.find(b"\xff\xda", 2, eoi_position)
-    has_frame = scan_position != -1 and any(
-        content.find(marker, 2, scan_position) != -1
-        for marker in _JPEG_START_OF_FRAME_MARKERS
-    )
-    if not content.startswith(b"\xff\xd8") or eoi_position == -1 or not has_frame:
+    if not _is_complete_jpeg(content):
         raise ProtectError("UniFi Protect snapshot response contained invalid JPEG data")
     return content
 
@@ -218,7 +279,12 @@ class ProtectClient:
 
     # -- API -------------------------------------------------------------------
 
-    def get_cameras(self) -> list[dict]:
+    def get_cameras_with_console_identity(self) -> tuple[list[dict], str | None]:
+        """Return cameras and Protect's optional durable console identity.
+
+        Protect bootstrap payloads do not always include an NVR identity, so
+        malformed or absent identity fields must not prevent camera discovery.
+        """
         resp = self._request("GET", "/proxy/protect/api/bootstrap")
         try:
             data = resp.json()
@@ -231,14 +297,50 @@ class ProtectClient:
             not isinstance(camera, dict) for camera in cameras
         ):
             raise ProtectError("UniFi Protect camera response was invalid")
-        return [
-            {
-                "id": cam.get("id", ""),
-                "name": cam.get("name") or cam.get("marketName") or cam.get("id", ""),
-                "state": cam.get("state", ""),
-            }
-            for cam in cameras
-        ]
+        normalized = []
+        for camera in cameras:
+            camera_id = camera.get("id")
+            name = camera.get("name")
+            market_name = camera.get("marketName")
+            state = camera.get("state")
+            try:
+                validate_camera_id(camera_id)
+            except (TypeError, ValueError) as exc:
+                raise ProtectError(
+                    "UniFi Protect camera response was invalid"
+                ) from exc
+            if any(
+                value is not None and not isinstance(value, str)
+                for value in (name, market_name, state)
+            ):
+                raise ProtectError("UniFi Protect camera response was invalid")
+            normalized.append(
+                {
+                    "id": camera_id,
+                    "name": name or market_name or camera_id,
+                    "state": state or "",
+                }
+            )
+        console_identity = None
+        nvr = data.get("nvr")
+        if isinstance(nvr, dict):
+            for field in ("id", "mac"):
+                candidate = nvr.get(field)
+                if not isinstance(candidate, str):
+                    continue
+                candidate = candidate.strip()
+                if (
+                    candidate
+                    and len(candidate) <= _CONSOLE_ID_MAX_LENGTH
+                    and not any(ord(char) < 32 or ord(char) == 127 for char in candidate)
+                ):
+                    console_identity = candidate
+                    break
+        return normalized, console_identity
+
+    def get_cameras(self) -> list[dict]:
+        cameras, _console_identity = self.get_cameras_with_console_identity()
+        return cameras
 
     def get_snapshot(
         self, camera_id: str, ts_ms: int | None = None, width: int = 640

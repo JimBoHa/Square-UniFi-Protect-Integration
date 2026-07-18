@@ -31,6 +31,9 @@ PROTECTED_ENDPOINTS = [
     ("GET", "/api/thumbnails/PAY_001"),
     ("POST", "/api/sync"),
     ("PUT", "/api/settings/protect"),
+    ("GET", "/api/settings/deep-link"),
+    ("PUT", "/api/settings/deep-link"),
+    ("POST", "/api/settings/protect/console-switch-token"),
     ("PUT", "/api/settings/square"),
     ("POST", "/api/logout"),
 ]
@@ -183,6 +186,17 @@ def test_api_never_returns_stored_secrets(configured):
         text = configured.get(path).text
         assert SQUARE_TOKEN not in text
         assert PROTECT_PASS not in text
+
+
+def test_transaction_data_and_camera_media_are_not_cached(configured):
+    preview = configured.get("/api/camera-preview/cam1aaaaaaaaaaaaaaaaaaaaa")
+    assert configured.post("/api/sync").status_code == 200
+    transactions = configured.get("/api/transactions")
+    thumbnail = configured.get(transactions.json()[0]["thumbnail_url"])
+
+    for response in (preview, transactions, thumbnail):
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "private, no-store"
 
 
 # -- input validation / SSRF ---------------------------------------------------------
@@ -399,6 +413,11 @@ def test_transaction_feed_refresh_is_visibility_aware_and_non_overlapping():
     html = (static_dir / "index.html").read_text()
     assert "TRANSACTION_REFRESH_MS" in js
     assert 'document.visibilityState === "visible"' in js
+    # The 15-second refresh must keep running while the Settings section is
+    # open; only browser-tab visibility, login state, and history paging gate
+    # it — never the active app section.
+    assert "transactionRefreshAllowed" in js
+    assert '!$("#view-transactions").hidden' not in js
     assert "transactionLoadInFlight" in js
     assert "payload !== lastTransactionPayload" in js
     assert 'id="txn-last-updated"' in html
@@ -429,12 +448,41 @@ def test_transaction_feed_pagination_wiring():
     assert "transactionSnapshot" in js
     assert 'headers.get("x-transaction-snapshot")' in js
     assert "transactionOffset === 0" in js
+    assert "error.status = resp.status" in js
+    assert "err.status === 409" in js
+    assert "transactionPendingOffset = 0" in js
     assert 'id="txn-prev"' in html
     assert 'id="txn-next"' in html
     assert 'id="txn-page-status"' in html
     assert 'aria-live="polite"' in html
     assert "min-width: 0" in css
     assert "@media (max-width: 520px)" in css
+
+
+def test_transaction_feed_describes_missing_thumbnail_state():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js = (static_dir / "app.js").read_text()
+    assert 'unmapped: "camera not mapped"' in js
+    assert 'queued: "footage queued"' in js
+    assert 'retrying: "capture retrying"' in js
+
+
+def test_transaction_thumbnails_use_accessible_timeline_links():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js = (static_dir / "app.js").read_text()
+    css = (static_dir / "style.css").read_text()
+    assert 'const link = document.createElement("a")' in js
+    assert "link.href = txn.deep_link" in js
+    assert 'link.target = "_blank"' in js
+    assert 'link.rel = "noopener noreferrer"' in js
+    assert '"aria-label"' in js
+    assert "window.open(txn.deep_link" not in js
+    assert ".txn .thumbnail-link:focus-visible" in css
+
 
 def test_pos_device_mapping_ui_wiring():
     from pathlib import Path
@@ -447,3 +495,36 @@ def test_pos_device_mapping_ui_wiring():
     assert "select.dataset.deviceName" in js
     assert "Other devices (fallback)" in js
     assert "observed Square POS device" in html
+
+
+def test_all_api_responses_default_to_no_store(configured):
+    for path in ("/api/status", "/api/camera-mapping", "/api/settings/deep-link"):
+        resp = configured.get(path)
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "private, no-store"
+
+
+def test_frontend_only_treats_session_401_as_logout():
+    """Upstream-credential 401s from settings endpoints must not bounce the
+    operator to the login view; only the app session's own 401 may."""
+    from pathlib import Path
+
+    js = (Path(__file__).parent.parent / "app" / "static" / "app.js").read_text()
+    assert 'data.detail === "Authentication required"' in js
+    # The redirect decision must consider the parsed body, not status alone.
+    assert 'resp.status === 401 && path !== "/api/login") {' not in js
+
+def test_setup_wizard_ui_wiring():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js = (static_dir / "app.js").read_text()
+    html = (static_dir / "index.html").read_text()
+    assert 'id="view-wizard"' in html
+    for step in ("1", "2", "3", "4"):
+        assert f'data-step="{step}"' in html
+    assert "maybeStartWizard" in js
+    assert "enterAppOrWizard" in js
+    assert "buildMappingRows" in js  # shared with Settings, not duplicated
+    assert js.count("function buildMappingRows") == 1
+    assert 'id="wiz-skip"' in html

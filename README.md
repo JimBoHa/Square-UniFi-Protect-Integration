@@ -62,11 +62,19 @@ up everything on first run, starts the app, and opens the dashboard in your
 browser. Keep the Terminal window it opens in the background; closing it stops
 the app.
 
-**Any platform (terminal):**
+**Linux or macOS (terminal):**
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/uvicorn app.main:app --factory --host 0.0.0.0 --port 8000
+```
+
+**Windows (PowerShell):**
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --factory --host 0.0.0.0 --port 8000
 ```
 
 Open `http://<host>:8000`, then:
@@ -78,12 +86,24 @@ Open `http://<host>:8000`, then:
    Manager → Settings → API Keys and enter it with the ID of a matching Alarm
    Manager webhook trigger. The key is verified against Protect's official local
    integration API before it is saved. Leave alarm fields blank to retain saved
-   values, or use the disable button to remove them locally even when the
-   Protect console is unavailable.
+   values when the same console is verified, or use the disable button to remove
+   them locally even when the Protect console is unavailable.
+   Changing the saved host/IP or port—or changing or losing the NVR identity
+   reported by a previously bound console—requires the **Confirm console switch**
+   checkbox. Each confirmation is short-lived and bound to the verified target.
+   Because aliases cannot reliably prove identity, every host-string change is
+   treated as a different console: camera mappings, camera associations,
+   thumbnails, and thumbnail retries are cleared while Square transaction facts
+   remain unassociated. Re-select the POS cameras afterward; the new mappings
+   apply to new sales, not retained history.
+   Upgraded installations that predate console identities bind the first identity
+   seen on a successful reconnect; every later mismatch requires a confirmed reset.
+   If a Protect version never reports an NVR id or MAC, the saved host string is
+   the only available identity boundary.
 3. **Settings → Square account** — a Square access token
    (Developer Dashboard → your application → Credentials). Optionally add your
    webhook signature key and notification URL for real-time ingestion
-   (subscribe the webhook to `payment.updated` pointing at
+   (subscribe the webhook to both `payment.created` and `payment.updated`, pointing at
    `https://<your-host>/webhooks/square`). Existing installations must reconnect
    Square once after upgrading so webhook events can be bound to that merchant.
 4. **Settings → POS camera** — pick the camera that watches each location's
@@ -96,14 +116,17 @@ Open `http://<host>:8000`, then:
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
 | `SPI_DATA_DIR` | `./data` | SQLite DB, encryption key, thumbnails |
+| `SPI_PORT` | `8000` | Port used by `Start Square Protect.command` |
 | `SPI_POLL_INTERVAL` | `60` | Seconds between Square polls |
 | `SPI_DISABLE_POLLER` | `0` | Set `1` to disable background polling |
 | `SPI_COOKIE_SECURE` | `0` | Set `1` when serving over HTTPS |
 | `SPI_ENCRYPTION_KEY` | — | Fernet key overriding the on-disk key file |
+| `SPI_TLS` | `0` | Set `1` to serve HTTPS with an auto-generated self-signed certificate (via `python -m app` or the macOS launcher); enables Secure cookies automatically. `python -m app` binds `SPI_HOST` (default `0.0.0.0`); the launcher stays on `127.0.0.1` |
 
-The deep-link URL format can be adjusted for your Protect version by setting
-the `deep_link_template` key in the settings table; the default (verified on
-Protect 7.1.87) is
+The Protect timeline URL can be adjusted under **Settings → Protect timeline
+link**. Custom templates must use `https://` with `{host}` as the entire hostname and include
+`{camera_id}` and `{ts_ms}`; leave the field blank to restore the built-in
+default (verified on Protect 7.1.87):
 `https://{host}/protect/timelapse/{camera_id}?start={ts_ms}`.
 
 > **Note on historical thumbnails:** verified against a UNVR G2 running
@@ -150,6 +173,23 @@ Protect 7.1.87) is
 Serve the integration over HTTPS (reverse proxy) and set `SPI_COOKIE_SECURE=1`
 in production. The webhook endpoint is the only route that must be reachable
 from the internet; everything else can stay LAN-only.
+
+## FAQ
+
+**Do I need the Square "Application ID" (or "Sandbox Application ID")?**
+Only if you use the "Connect with Square" (OAuth) sign-in, where it serves as
+the OAuth client id. If you paste an access token manually instead, the
+Application ID is not needed: it identifies your *application* in OAuth
+authorization flows and in Square's client-side SDKs (such as the Web Payments
+SDK that renders card forms in a browser), while this integration's
+server-side Payments/Locations/Webhook API calls authenticate with the
+**access token** alone. For manual setup, copy the access token from the same
+Credentials page and ignore the Application ID.
+
+**Sandbox or Production?** Use the Sandbox token (and select *Sandbox* in
+Settings) to trial the integration with fake payments you create from the
+Square developer dashboard; switch to the Production token for real sales.
+The two are separate environments with separate tokens.
 
 ## Development
 

@@ -6,8 +6,11 @@ import hashlib
 import logging
 import os
 import re
+import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 
@@ -28,8 +31,14 @@ ALARM_RETRY_BATCH_SIZE = 10
 ALARM_RETRY_NETWORK_TIMEOUT_SECONDS = 5
 
 
+def _current_time_ms() -> int:
+    return int(time.time() * 1000)
+
+
 def parse_ts_ms(created_at: str) -> int:
     dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise ValueError("Square timestamp must include a timezone offset")
     return int(dt.timestamp() * 1000)
 
 
@@ -41,9 +50,14 @@ def safe_thumbnail_name(payment_id: str) -> str:
 
 
 def write_thumbnail(path, image: bytes) -> None:
-    """Write private camera evidence regardless of the process umask."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags, 0o600)
+    """Atomically replace private camera evidence with a complete image."""
+    target = Path(path)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+    )
+    temp_path = Path(temp_name)
     try:
         os.fchmod(fd, 0o600)
         view = memoryview(image)
@@ -52,8 +66,25 @@ def write_thumbnail(path, image: bytes) -> None:
             if written <= 0:
                 raise OSError("Could not write thumbnail")
             view = view[written:]
-    finally:
+        # os.write is unbuffered; fsync makes the complete temporary image
+        # durable before it can become the path referenced by SQLite.
+        os.fsync(fd)
         os.close(fd)
+        fd = -1
+        os.replace(temp_path, target)
+    except BaseException:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "Could not remove failed thumbnail temp %s: %s", temp_path, exc
+            )
+        raise
 
 
 def versioned_thumbnail_name(
@@ -61,13 +92,15 @@ def versioned_thumbnail_name(
     camera_id: str,
     ts_ms: int,
     updated_ts_ms: int,
+    console_scope: str = "",
 ) -> str:
     """Collision-resistant filename for one Square evidence version."""
     cleaned = _SAFE_ID_RE.sub("", payment_id)[:48]
     if not cleaned:
         raise ValueError("Payment id yields no safe filename")
     evidence = (
-        f"{payment_id}\0{camera_id}\0{int(ts_ms)}\0{int(updated_ts_ms)}".encode()
+        f"{payment_id}\0{camera_id}\0{int(ts_ms)}\0{int(updated_ts_ms)}"
+        f"\0{console_scope}".encode()
     )
     digest = hashlib.sha256(evidence).hexdigest()[:24]
     return f"{cleaned}-{int(ts_ms)}-{digest}.jpg"
@@ -89,7 +122,13 @@ def retry_thumbnail_name(
 
 
 def _ingest_payment_with_status(
-    store: Store, payment: dict, protect: ProtectClient | None
+    store: Store,
+    payment: dict,
+    protect: ProtectClient | None,
+    *,
+    expected_merchant_id: str | None = None,
+    expected_environment: str | None = None,
+    expected_account_revision: str | None = None,
 ) -> tuple[dict, bool]:
     """Store one Square payment and return it with insertion status."""
     txn = payment_from_api(payment)
@@ -105,9 +144,25 @@ def _ingest_payment_with_status(
             store.thumbnail_dir.resolve() not in path.parents
             or not path.is_file()
         ):
-            if store.requeue_missing_thumbnail(
-                txn["id"], existing["thumbnail_path"]
+            if (
+                expected_merchant_id is None
+                and expected_environment is None
+                and expected_account_revision is None
             ):
+                # Keep the legacy two-argument Store call for embedders and
+                # tests that wrap this method without the optional fence.
+                requeued = store.requeue_missing_thumbnail(
+                    txn["id"], existing["thumbnail_path"]
+                )
+            else:
+                requeued = store.requeue_missing_thumbnail(
+                    txn["id"],
+                    existing["thumbnail_path"],
+                    expected_merchant_id=expected_merchant_id,
+                    expected_environment=expected_environment,
+                    expected_account_revision=expected_account_revision,
+                )
+            if requeued:
                 existing["thumbnail_path"] = None
             else:
                 # Another worker changed the evidence after our read. Base all
@@ -148,9 +203,12 @@ def _ingest_payment_with_status(
             if not txn["device_name"]:
                 txn["device_name"] = existing.get("device_name", "")
 
-    mapping = store.camera_for_location(txn["location_id"], txn["device_id"])
+    mapping, evidence_host, evidence_generation = store.camera_context_for_location(
+        txn["location_id"], txn["device_id"]
+    )
     txn["camera_id"] = mapping["camera_id"] if mapping else None
     txn["thumbnail_path"] = None
+    protect_host = getattr(protect, "host", evidence_host) if protect is not None else None
 
     # A stale out-of-order event is ignored by the versioned upsert, so it must
     # not overwrite the on-disk thumbnail with a wrong-time frame either.
@@ -169,6 +227,7 @@ def _ingest_payment_with_status(
         txn["thumbnail_path"] = existing["thumbnail_path"]
     elif (
         protect is not None
+        and protect_host == evidence_host
         and txn["camera_id"]
         and not stale_event
         and (existing is None or not ts_unchanged or source_changed)
@@ -184,6 +243,7 @@ def _ingest_payment_with_status(
                 txn["camera_id"],
                 txn["ts_ms"],
                 txn["updated_ts_ms"],
+                evidence_generation or evidence_host or "",
             )
             captured_path = store.thumbnail_dir / name
             write_thumbnail(captured_path, image)
@@ -192,7 +252,16 @@ def _ingest_payment_with_status(
             logger.warning("Thumbnail capture failed for %s: %s", txn["id"], exc)
 
     try:
-        is_new = store.upsert_transaction(txn, replace_evidence=source_changed)
+        is_new = store.upsert_transaction(
+            txn,
+            replace_evidence=source_changed,
+            enforce_current_mapping=True,
+            expected_merchant_id=expected_merchant_id,
+            expected_environment=expected_environment,
+            expected_account_revision=expected_account_revision,
+            expected_protect_host=evidence_host,
+            expected_protect_generation=evidence_generation,
+        )
     except Exception:
         if captured_path is not None:
             try:
@@ -221,10 +290,23 @@ def _ingest_payment_with_status(
 
 
 def ingest_payment(
-    store: Store, payment: dict, protect: ProtectClient | None
+    store: Store,
+    payment: dict,
+    protect: ProtectClient | None,
+    *,
+    expected_merchant_id: str | None = None,
+    expected_environment: str | None = None,
+    expected_account_revision: str | None = None,
 ) -> dict:
     """Store one Square payment and return its normalized transaction."""
-    txn, _is_new = _ingest_payment_with_status(store, payment, protect)
+    txn, _is_new = _ingest_payment_with_status(
+        store,
+        payment,
+        protect,
+        expected_merchant_id=expected_merchant_id,
+        expected_environment=expected_environment,
+        expected_account_revision=expected_account_revision,
+    )
     return txn
 
 
@@ -385,6 +467,9 @@ def sync_payments(
     square: SquareClient,
     protect: ProtectClient | None,
     alarm_trigger_id: str | None = None,
+    expected_merchant_id: str | None = None,
+    expected_environment: str | None = None,
+    expected_account_revision: str | None = None,
 ) -> int:
     """Pull recent Square payments and ingest them. Returns count ingested."""
     count = 0
@@ -396,16 +481,23 @@ def sync_payments(
                 logger.warning("Skipping Square location without an id")
                 continue
 
-            # Watermark on Square's updated_at so delayed completions, refunds,
-            # and other state changes to older payments are still reconciled.
-            latest = store.latest_transaction_updated_ts(location_id=location_id)
-            if latest:
+            # Only completed polls advance this cursor. Transaction rows can be
+            # inserted by webhooks and therefore cannot prove that earlier
+            # Square pages were reconciled.
+            poll_boundary_ms = _current_time_ms()
+            watermark = store.get_square_poll_watermark(location_id)
+            if watermark is not None:
+                # The watermark is local wall-clock time while Square evaluates
+                # updated_at against its own clock; the 5-minute overlap absorbs
+                # ordinary NTP-grade skew between the two.
                 begin = datetime.fromtimestamp(
-                    latest / 1000, tz=timezone.utc
+                    watermark / 1000, tz=timezone.utc
                 ) - timedelta(minutes=5)
             else:
-                begin = datetime.now(tz=timezone.utc) - timedelta(hours=BACKFILL_HOURS)
-            payments = square.list_payments(
+                begin = datetime.fromtimestamp(
+                    poll_boundary_ms / 1000, tz=timezone.utc
+                ) - timedelta(hours=BACKFILL_HOURS)
+            for payments in square.iter_payment_pages(
                 updated_at_begin_time=begin.isoformat(timespec="seconds").replace(
                     "+00:00", "Z"
                 ),
@@ -414,20 +506,29 @@ def sync_payments(
                 # ingestion is interrupted partway through the response.
                 sort_order="ASC",
                 location_id=location_id,
-            )
-
-            for payment in payments:
-                payment_id = payment.get("id", "")
-                if payment_id and payment_id in seen_payment_ids:
-                    continue
-                try:
-                    _txn, is_new = _ingest_payment_with_status(store, payment, protect)
-                    if is_new:
-                        count += 1
-                    if payment_id:
-                        seen_payment_ids.add(payment_id)
-                except ValueError as exc:
-                    logger.warning("Skipping malformed payment: %s", exc)
+            ):
+                for payment in payments:
+                    payment_id = payment.get("id", "")
+                    if payment_id and payment_id in seen_payment_ids:
+                        continue
+                    try:
+                        _txn, is_new = _ingest_payment_with_status(
+                            store,
+                            payment,
+                            protect,
+                            expected_merchant_id=expected_merchant_id,
+                            expected_environment=expected_environment,
+                            expected_account_revision=expected_account_revision,
+                        )
+                        if is_new:
+                            count += 1
+                        if payment_id:
+                            seen_payment_ids.add(payment_id)
+                    except ValueError as exc:
+                        logger.warning("Skipping malformed payment: %s", exc)
+            # Set this only after listing every cursor page and processing every
+            # returned payment. Any exception leaves the prior boundary intact.
+            store.advance_square_poll_watermark(location_id, poll_boundary_ms)
     finally:
         # Durable Protect work runs even when Square listing fails, and never
         # contributes to the ingested count: first any pending sale alarms,

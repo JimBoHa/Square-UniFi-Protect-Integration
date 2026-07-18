@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import threading
 from pathlib import Path
@@ -85,6 +86,9 @@ def test_old_failure_retries_after_square_window_advances(tmp_path):
 
         def list_locations(self):
             return [{"id": "LOC1"}]
+
+        def iter_payment_pages(self, **params):
+            yield self.list_payments(**params)
 
         def list_payments(self, **params):
             self.returned.append([new["id"]])
@@ -250,6 +254,7 @@ def test_missing_file_requeue_uses_current_mapping(
 def test_store_startup_requeues_missing_thumbnail_file(tmp_path):
     data_dir = tmp_path / "data"
     store = Store(data_dir)
+    store.set_camera_mapping("LOC1", CAM_A, "Register")
     store.upsert_transaction(
         _stored_txn("LOST", 1000, thumbnail_path="vanished.jpg")
     )
@@ -264,6 +269,47 @@ def test_store_startup_requeues_missing_thumbnail_file(tmp_path):
         reopened.close()
 
 
+@pytest.mark.parametrize(
+    ("mappings", "expected_camera"),
+    [
+        ([("LOC1", "TERM1", "Terminal", CAM_B, "Exact")], CAM_B),
+        ([("LOC1", "", "", CAM_B, "Location")], CAM_B),
+        ([("*", "", "", CAM_B, "Wildcard")], CAM_B),
+        ([], None),
+    ],
+    ids=("exact", "location", "wildcard", "unmapped"),
+)
+def test_store_startup_missing_thumbnail_uses_current_mapping(
+    tmp_path, mappings, expected_camera
+):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    evidence = store.thumbnail_dir / "vanished.jpg"
+    evidence.write_bytes(b"old evidence")
+    txn = _stored_txn("LOST", 1000, thumbnail_path=evidence.name)
+    txn["device_id"] = "TERM1"
+    store.upsert_transaction(txn)
+
+    # Captured evidence keeps its historical camera when mappings change.
+    store.replace_camera_mappings(mappings)
+    assert store.get_transaction("LOST")["camera_id"] == CAM_A
+    store.close()
+    evidence.unlink()
+
+    reopened = Store(data_dir)
+    try:
+        stored = reopened.get_transaction("LOST")
+        jobs = reopened.claim_thumbnail_retries(1, 10, now=0)
+    finally:
+        reopened.close()
+
+    assert stored["thumbnail_path"] is None
+    assert stored["camera_id"] == expected_camera
+    assert [job["camera_id"] for job in jobs] == (
+        [expected_camera] if expected_camera else []
+    )
+
+
 def test_square_failure_still_processes_retry_queue(tmp_path):
     store = Store(tmp_path / "data")
     store.upsert_transaction(_stored_txn("OLD", 1000))
@@ -271,6 +317,9 @@ def test_square_failure_still_processes_retry_queue(tmp_path):
     class Square:
         def list_locations(self):
             return [{"id": "LOC1"}]
+
+        def iter_payment_pages(self, **params):
+            yield self.list_payments(**params)
 
         def list_payments(self, **params):
             raise SquareError("Square unavailable")
@@ -293,6 +342,9 @@ def test_retry_error_does_not_mask_square_failure(tmp_path, monkeypatch, caplog)
     class Square:
         def list_locations(self):
             return [{"id": "LOC1"}]
+
+        def iter_payment_pages(self, **params):
+            yield self.list_payments(**params)
 
         def list_payments(self, **params):
             raise SquareError("original Square failure")
@@ -503,6 +555,99 @@ def test_reingest_missing_evidence_adopts_remapped_camera(tmp_path):
         assert replacement["camera_id"] == CAM_B
         assert replacement["attempts"] == 0
     finally:
+        store.close()
+
+
+def test_mapping_save_wins_over_blocked_initial_snapshot(tmp_path):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC1", CAM_A, "Original camera")
+    payment = _payment("P", "2026-07-16T15:30:00.000Z")
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+    errors: list[Exception] = []
+
+    class BlockingProtect:
+        def get_snapshot(self, camera_id, ts_ms=None):
+            assert camera_id == CAM_A
+            snapshot_started.set()
+            assert release_snapshot.wait(timeout=5)
+            return b"old-camera-frame"
+
+    def ingest() -> None:
+        try:
+            ingest_payment(store, payment, BlockingProtect())
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=ingest)
+    worker.start()
+    try:
+        assert snapshot_started.wait(timeout=5)
+        store.replace_camera_mappings(
+            [("LOC1", "", "", CAM_B, "New camera")]
+        )
+        release_snapshot.set()
+        worker.join(timeout=5)
+
+        saved = store.get_transaction("P")
+        jobs = store.claim_thumbnail_retries(1, 10, now=0)
+        assert not worker.is_alive()
+        assert errors == []
+        assert saved["camera_id"] == CAM_B
+        assert saved["thumbnail_path"] is None
+        assert [job["camera_id"] for job in jobs] == [CAM_B]
+        assert list(store.thumbnail_dir.iterdir()) == []
+    finally:
+        release_snapshot.set()
+        worker.join(timeout=5)
+        store.close()
+
+
+def test_late_duplicate_webhook_ingest_cannot_undo_pending_evidence_remap(
+    tmp_path, monkeypatch
+):
+    store = Store(tmp_path / "data")
+    store.set_camera_mapping("LOC1", CAM_A, "Original camera")
+    payment = _payment("P", "2026-07-16T15:30:00.000Z")
+    ingest_payment(store, payment, None)
+    upsert_started = threading.Event()
+    release_upsert = threading.Event()
+    errors: list[Exception] = []
+    original_upsert = store.upsert_transaction
+
+    def blocked_upsert(txn, **kwargs):
+        upsert_started.set()
+        assert release_upsert.wait(timeout=5)
+        return original_upsert(txn, **kwargs)
+
+    def ingest_duplicate() -> None:
+        try:
+            ingest_payment(store, payment, None)
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(store, "upsert_transaction", blocked_upsert)
+    worker = threading.Thread(target=ingest_duplicate)
+    worker.start()
+    try:
+        assert upsert_started.wait(timeout=5)
+        store.replace_camera_mappings(
+            [("LOC1", "", "", CAM_B, "New camera")]
+        )
+        assert store.get_transaction("P")["camera_id"] == CAM_B
+        release_upsert.set()
+        worker.join(timeout=5)
+
+        saved = store.get_transaction("P")
+        jobs = store.claim_thumbnail_retries(1, 10, now=0)
+        assert not worker.is_alive()
+        assert errors == []
+        assert saved["camera_id"] == CAM_B
+        assert saved["thumbnail_path"] is None
+        assert [job["camera_id"] for job in jobs] == [CAM_B]
+    finally:
+        release_upsert.set()
+        worker.join(timeout=5)
         store.close()
 
 
@@ -747,6 +892,78 @@ def test_retry_io_does_not_hold_database_claim_lock(tmp_path):
         thread.join(2)
         worker_store.close()
         other_store.close()
+
+
+def test_console_switch_invalidates_thumbnail_retry_in_flight(tmp_path):
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+
+    class OldProtect:
+        host = "old-console.local"
+
+        def get_snapshot(self, camera_id, ts_ms=None):
+            snapshot_started.set()
+            assert release_snapshot.wait(timeout=5)
+            return b"old console retry evidence"
+
+    store = Store(tmp_path / "data")
+    initial_settings = {
+        "protect.host": ("old-console.local", False),
+        "protect.username": ("user", False),
+        "protect.password": ("password", True),
+        "protect.verify_ssl": ("0", False),
+    }
+    assert store.update_protect_settings(
+        initial_settings,
+        expected_host=None,
+        expected_generation=None,
+    ) is False
+    store.set_camera_mapping("LOC1", CAM_A, "Register")
+    ingest_payment(
+        store,
+        _payment("P_SWITCH", "2026-07-16T15:30:00.000Z"),
+        protect=None,
+    )
+    generation = store.get_setting("protect.console_generation")
+    switch_token = store.protect_console_switch_token(
+        "new-console.local",
+        None,
+        expected_host="old-console.local",
+        expected_generation=generation,
+        expected_console_id=None,
+    )
+    assert switch_token
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                retry_missing_thumbnails,
+                store,
+                OldProtect(),
+                batch_size=1,
+                now=100,
+            )
+            assert snapshot_started.wait(timeout=3)
+            assert store.update_protect_settings(
+                {
+                    **initial_settings,
+                    "protect.host": ("new-console.local", False),
+                },
+                expected_host="old-console.local",
+                expected_generation=generation,
+                console_switch_token=switch_token,
+            )
+            release_snapshot.set()
+            assert future.result(timeout=5) == 0
+
+        saved = store.get_transaction("P_SWITCH")
+        assert saved["camera_id"] is None
+        assert saved["thumbnail_path"] is None
+        assert store.claim_thumbnail_retries(1, 5, now=100) == []
+        assert list(store.thumbnail_dir.iterdir()) == []
+    finally:
+        release_snapshot.set()
+        store.close()
 
 
 def test_existing_missing_thumbnail_is_backfilled_on_migration(tmp_path):

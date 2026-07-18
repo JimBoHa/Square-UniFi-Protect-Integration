@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import datetime
+import json
 import logging
+import math
 import os
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -11,11 +15,11 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import deeplink, sync
+from . import deeplink, discovery, sync
 from .protect_client import (
     ProtectAuthError,
     ProtectClient,
@@ -27,12 +31,24 @@ from .protect_client import (
 from .security import hash_password, new_session_token, verify_password
 from .square_client import (
     SquareAuthError,
+    oauth_authorize_url,
+    oauth_exchange,
     SquareClient,
     SquareError,
     SquarePermissionError,
     verify_webhook_signature,
 )
-from .store import ALARM_ENABLED_AFTER_SETTING, Store
+from .store import (
+    ALARM_ENABLED_AFTER_SETTING,
+    PROTECT_CONSOLE_ID_SETTING,
+    PROTECT_CONSOLE_GENERATION_SETTING,
+    ProtectConsoleSwitchConfirmationRequired,
+    ProtectSettingsConflict,
+    SquareAccountChanged,
+    SquareAccountSwitchRequired,
+    Store,
+    TransactionSnapshotExpired,
+)
 
 logger = logging.getLogger("spi")
 
@@ -49,8 +65,47 @@ PROTECT_SETTING_KEYS = (
     "protect.verify_ssl",
     "protect.api_key",
     "protect.alarm_trigger_id",
+    PROTECT_CONSOLE_ID_SETTING,
+    PROTECT_CONSOLE_GENERATION_SETTING,
 )
+SQUARE_CLIENT_SETTING_KEYS = (
+    "square.access_token",
+    "square.environment",
+    "square.merchant_id",
+    "square.account_revision",
+)
+SQUARE_ACCOUNT_SWITCH_CODE = "square_account_switch_confirmation_required"
 MAX_CAMERA_MAPPINGS = 500
+PRIVATE_NO_STORE = "private, no-store"
+MIN_POLL_INTERVAL_SECONDS = 1.0
+
+
+def _parse_poll_interval(value: str) -> float:
+    """Return a safe poll interval or fail before starting background work."""
+    try:
+        interval = float(value)
+    except ValueError as exc:
+        raise ValueError(
+            "SPI_POLL_INTERVAL must be a finite number of at least 1 second"
+        ) from exc
+    if not math.isfinite(interval) or interval < MIN_POLL_INTERVAL_SECONDS:
+        raise ValueError(
+            "SPI_POLL_INTERVAL must be a finite number of at least 1 second"
+        )
+    return interval
+
+
+def _read_thumbnail_bytes(path: Path) -> bytes:
+    """Read an already-resolved evidence file without following a final symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    chunks: list[bytes] = []
+    try:
+        while chunk := os.read(fd, 1024 * 1024):
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +126,13 @@ class ProtectSettingsBody(BaseModel):
     api_key: str = Field(default="", max_length=512)
     alarm_trigger_id: str = Field(default="", max_length=256)
     disable_alarm: bool = False
+    console_switch_token: str = Field(default="", max_length=2048)
+
+class ProtectConsoleSwitchTokenBody(BaseModel):
+    host: str
+    username: str
+    password: str
+    verify_ssl: bool = False
 
 class SquareSettingsBody(BaseModel):
     access_token: str
@@ -78,6 +140,8 @@ class SquareSettingsBody(BaseModel):
     webhook_signature_key: str = ""
     webhook_url: str = ""
     clear_webhook: bool = False
+    confirm_account_switch: bool = False
+    account_switch_confirmation_token: str = Field(default="", max_length=4096)
 
 class CameraMappingEntry(BaseModel):
     location_id: str = Field(min_length=1, max_length=64)
@@ -86,8 +150,22 @@ class CameraMappingEntry(BaseModel):
     camera_id: str = Field(min_length=1, max_length=64)
     camera_name: str = Field(default="", max_length=128)
 
+class WebhookRegisterBody(BaseModel):
+    notification_url: str = Field(min_length=12, max_length=512)
+
+class DiscoverProtectBody(BaseModel):
+    host: str = Field(default="", max_length=255)
+
+class SquareOAuthAppBody(BaseModel):
+    client_id: str = Field(min_length=8, max_length=128)
+    client_secret: str = Field(min_length=8, max_length=256)
+    environment: str = "production"
+
 class CameraMappingBody(BaseModel):
     mappings: list[CameraMappingEntry]
+
+class DeepLinkSettingsBody(BaseModel):
+    template: str = Field(default="", max_length=2048)
 
 
 # ---------------------------------------------------------------------------
@@ -100,12 +178,20 @@ def create_app(
     square_transport=None,
     enable_poller: bool | None = None,
 ) -> FastAPI:
+    if enable_poller is None:
+        enable_poller = os.environ.get("SPI_DISABLE_POLLER", "0") != "1"
+    poll_interval = (
+        _parse_poll_interval(os.environ.get("SPI_POLL_INTERVAL", "60"))
+        if enable_poller
+        else None
+    )
     data_dir = Path(data_dir or os.environ.get("SPI_DATA_DIR", "./data"))
     store = Store(data_dir)
     app = FastAPI(title="Square UniFi Protect Integration", docs_url=None, redoc_url=None)
     app.state.store = store
     app.state.login_failures: dict[str, list[float]] = {}
     app.state.login_lock = threading.Lock()
+    square_account_lock = threading.RLock()
     # Single worker draining the durable thumbnail-retry queue: webhooks ack
     # before any Protect I/O and just nudge this drain, which the queue's
     # leases and backoff keep bounded and evidence-safe.
@@ -117,8 +203,16 @@ def create_app(
     app.state.thumbnail_drain_queued = False
 
     cookie_secure = os.environ.get("SPI_COOKIE_SECURE", "0") == "1"
-    if enable_poller is None:
-        enable_poller = os.environ.get("SPI_DISABLE_POLLER", "0") != "1"
+
+    @app.middleware("http")
+    async def apply_api_cache_policy(request: Request, call_next):
+        # Every API response can carry account or evidence data; keep all of it
+        # out of browser and intermediary caches. Routes may still set their
+        # own policy, which wins.
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers.setdefault("Cache-Control", PRIVATE_NO_STORE)
+        return response
 
     # -- client construction from stored settings ---------------------------
 
@@ -138,17 +232,89 @@ def create_app(
             api_key=settings["protect.api_key"],
         )
 
-    def build_square() -> SquareClient | None:
-        token = store.get_setting("square.access_token")
+    def _maybe_refresh_oauth_token() -> None:
+        oauth = store.get_settings(
+            (
+                "square.oauth_client_id",
+                "square.oauth_client_secret",
+                "square.refresh_token",
+                "square.token_expires_at",
+                "square.environment",
+            )
+        )
+        if not (
+            oauth["square.oauth_client_id"]
+            and oauth["square.oauth_client_secret"]
+            and oauth["square.refresh_token"]
+            and oauth["square.token_expires_at"]
+        ):
+            return
+        try:
+            expires = datetime.datetime.fromisoformat(
+                oauth["square.token_expires_at"].replace("Z", "+00:00")
+            )
+        except ValueError:
+            return
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if expires - now > datetime.timedelta(days=3):
+            return
+        try:
+            tokens = oauth_exchange(
+                oauth["square.environment"] or "production",
+                oauth["square.oauth_client_id"],
+                oauth["square.oauth_client_secret"],
+                refresh_token=oauth["square.refresh_token"],
+                transport=square_transport,
+            )
+        except SquareError as exc:
+            logger.warning("Square OAuth token refresh failed: %s", exc)
+            return
+        store.update_settings(
+            {
+                "square.access_token": (tokens["access_token"], True),
+                "square.refresh_token": (
+                    tokens.get("refresh_token")
+                    or oauth["square.refresh_token"],
+                    True,
+                ),
+                "square.token_expires_at": (tokens.get("expires_at", ""), False),
+            }
+        )
+
+    def build_square(
+        settings: dict[str, str | None] | None = None,
+    ) -> SquareClient | None:
+        if settings is None:
+            _maybe_refresh_oauth_token()
+            settings = store.get_settings(SQUARE_CLIENT_SETTING_KEYS)
+        token = settings["square.access_token"]
         if not token:
             return None
         return SquareClient(
             token,
-            environment=store.get_setting("square.environment") or "production",
+            environment=settings["square.environment"] or "production",
             transport=square_transport,
         )
 
-    def drain_protect_work_queue() -> None:
+    class ProtectConsoleIdentityMismatch(ProtectError):
+        """A different NVR answered on the configured Protect host."""
+
+    def verify_protect_console_identity(
+        protect: ProtectClient,
+        settings: dict[str, str | None],
+    ) -> None:
+        """Reject provider work when a previously bound NVR identity changed."""
+        expected_console_id = settings[PROTECT_CONSOLE_ID_SETTING]
+        if expected_console_id is None:
+            return
+        _, observed_console_id = protect.get_cameras_with_console_identity()
+        if observed_console_id != expected_console_id:
+            raise ProtectConsoleIdentityMismatch(
+                "UniFi Protect console identity changed or disappeared; "
+                "reconnect Protect before processing camera evidence or alarms"
+            )
+
+    def _drain_protect_work_queue() -> None:
         with drain_state_lock:
             app.state.thumbnail_drain_queued = False
         protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
@@ -156,6 +322,7 @@ def create_app(
         if protect is None:
             return
         try:
+            verify_protect_console_identity(protect, protect_settings)
             # Sale alarms first: a slow snapshot request must not delay the
             # Alarm Manager automation for a completed sale. The iteration
             # caps are a backstop: no realistic queue needs more than
@@ -190,6 +357,12 @@ def create_app(
             except Exception:
                 logger.exception("Could not close Protect client after queue drain")
 
+    def drain_protect_work_queue() -> None:
+        # A completed account switch cannot be followed by an old merchant's
+        # already-claimed alarm or thumbnail work in this process.
+        with square_account_lock, store.integration_guard():
+            _drain_protect_work_queue()
+
     def nudge_protect_work_queue() -> None:
         """Schedule a queue drain; nudges coalesce to at most one queued drain."""
         with drain_state_lock:
@@ -206,12 +379,6 @@ def create_app(
     @app.on_event("shutdown")
     def _shutdown_thumbnail_executor() -> None:
         thumbnail_executor.shutdown(wait=True, cancel_futures=True)
-
-    def require_protect() -> ProtectClient:
-        client = build_protect()
-        if client is None:
-            raise HTTPException(status_code=409, detail="UniFi Protect is not configured")
-        return client
 
     def require_square() -> SquareClient:
         client = build_square()
@@ -346,21 +513,108 @@ def create_app(
     # -- settings --------------------------------------------------------------
 
     def clear_protect_alarm_settings() -> dict:
-        store.update_settings(
-            {},
-            delete_keys=(
-                "protect.api_key",
-                "protect.alarm_trigger_id",
-                ALARM_ENABLED_AFTER_SETTING,
-            ),
-            suppress_completed_alarms=True,
-        )
+        with store.protect_settings_guard():
+            # Wait for any claimed delivery to finish before reporting the
+            # trigger disabled. New drains take the shared side of the
+            # provider-state guard.
+            with store.integration_guard(exclusive=True):
+                store.update_settings(
+                    {},
+                    delete_keys=(
+                        "protect.api_key",
+                        "protect.alarm_trigger_id",
+                        ALARM_ENABLED_AFTER_SETTING,
+                    ),
+                    suppress_completed_alarms=True,
+                )
         return {"ok": True, "alarm_configured": False}
 
     @app.delete("/api/settings/protect/alarm")
     def delete_protect_alarm(_=authed) -> dict:
         """Disable alarms locally even when the Protect console is offline."""
         return clear_protect_alarm_settings()
+
+    discovery_scan_lock = threading.Lock()
+
+    @app.post("/api/discover/protect")
+    def discover_protect(body: DiscoverProtectBody, _=authed) -> list[dict]:
+        """Scan the LAN for UniFi consoles; optionally probe one address.
+
+        Broadcast/subnet discovery finds consoles on this network; consoles
+        on routed VLANs only answer a direct probe, so the UI passes the
+        typed host here to identify it before connecting. POST because the
+        scan emits network traffic; one scan runs at a time.
+        """
+        extra: tuple[str, ...] = ()
+        if body.host:
+            try:
+                extra = (validate_host(body.host).partition(":")[0],)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+        if not discovery_scan_lock.acquire(blocking=False):
+            raise HTTPException(
+                status_code=409, detail="A network scan is already running"
+            )
+        try:
+            return discovery.discover_consoles(extra_hosts=extra)
+        finally:
+            discovery_scan_lock.release()
+
+    @app.post("/api/settings/protect/console-switch-token")
+    def protect_console_switch_token(
+        body: ProtectConsoleSwitchTokenBody,
+        response: Response,
+        _=authed,
+    ) -> dict:
+        """Verify the target console, then issue short-lived destructive consent."""
+        try:
+            host = validate_host(body.host)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        current_identity = store.get_settings(
+            (
+                "protect.host",
+                PROTECT_CONSOLE_ID_SETTING,
+                PROTECT_CONSOLE_GENERATION_SETTING,
+            )
+        )
+        client = ProtectClient(
+            host,
+            body.username,
+            body.password,
+            verify_ssl=body.verify_ssl,
+            transport=protect_transport,
+        )
+        try:
+            client.login()
+            _, console_id = client.get_cameras_with_console_identity()
+        except ProtectAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except (ProtectError, OSError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not reach UniFi Protect: {exc}",
+            )
+        finally:
+            client.close()
+        try:
+            token = store.protect_console_switch_token(
+                host,
+                console_id,
+                expected_host=current_identity["protect.host"],
+                expected_generation=current_identity[
+                    PROTECT_CONSOLE_GENERATION_SETTING
+                ],
+                expected_console_id=current_identity[PROTECT_CONSOLE_ID_SETTING],
+            )
+        except ProtectSettingsConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{exc}; review the Protect host and try again",
+                headers={"Cache-Control": "private, no-store"},
+            )
+        response.headers["Cache-Control"] = "private, no-store"
+        return {"token": token or ""}
 
     @app.put("/api/settings/protect")
     def set_protect(body: ProtectSettingsBody, _=authed) -> dict:
@@ -369,6 +623,11 @@ def create_app(
                 **clear_protect_alarm_settings(),
                 "cameras": None,
             }
+        with store.protect_settings_guard():
+            return set_protect_locked(body)
+
+    def set_protect_locked(body: ProtectSettingsBody) -> dict:
+        """Validate and commit one serialized Protect settings mutation."""
         try:
             host = validate_host(body.host)
             submitted_trigger_id = (
@@ -379,11 +638,73 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         submitted_api_key = body.api_key.strip()
-        stored_alarm_settings = store.get_settings(
-            ("protect.api_key", "protect.alarm_trigger_id")
+        stored_protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
+        stored_host = stored_protect_settings["protect.host"]
+        stored_generation = stored_protect_settings[PROTECT_CONSOLE_GENERATION_SETTING]
+        stored_console_id = stored_protect_settings[PROTECT_CONSOLE_ID_SETTING]
+        host_changed = bool(stored_host and stored_host != host)
+        if host_changed and not body.console_switch_token:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Protect host changed. Confirm the console switch to clear "
+                    "old camera mappings and Protect evidence, then save again."
+                ),
+            )
+        candidate_api_key = submitted_api_key or (
+            stored_protect_settings["protect.api_key"] if not host_changed else None
         )
-        stored_api_key = stored_alarm_settings["protect.api_key"]
-        stored_trigger_id = stored_alarm_settings["protect.alarm_trigger_id"]
+        client = ProtectClient(
+            host,
+            body.username,
+            body.password,
+            verify_ssl=body.verify_ssl,
+            transport=protect_transport,
+            api_key=candidate_api_key,
+        )
+        try:
+            client.login()
+            cameras, observed_console_id = client.get_cameras_with_console_identity()
+        except ProtectAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except (ProtectError, OSError) as exc:
+            raise HTTPException(status_code=502, detail=f"Could not reach UniFi Protect: {exc}")
+        finally:
+            client.close()
+        identity_changed = bool(
+            stored_host
+            and stored_console_id is not None
+            and stored_console_id != observed_console_id
+        )
+        console_switch_requested = host_changed or identity_changed
+        if console_switch_requested and not store.protect_console_switch_token_valid(
+            body.console_switch_token,
+            host,
+            observed_console_id,
+        ):
+            identity_reason = (
+                "Protect console identity changed or disappeared. "
+                if identity_changed
+                else "Protect host changed. "
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    identity_reason
+                    + "Confirm the console switch to clear old camera mappings "
+                    "and Protect evidence, then save again."
+                ),
+            )
+        # API keys and alarm triggers are console-specific. Blank values retain
+        # them only after the same console identity has been verified.
+        stored_api_key = (
+            None if console_switch_requested else stored_protect_settings["protect.api_key"]
+        )
+        stored_trigger_id = (
+            None
+            if console_switch_requested
+            else stored_protect_settings["protect.alarm_trigger_id"]
+        )
         effective_api_key = submitted_api_key or stored_api_key
         effective_trigger_id = submitted_trigger_id or stored_trigger_id
         if effective_trigger_id and not effective_api_key:
@@ -391,25 +712,26 @@ def create_app(
                 status_code=422,
                 detail="Protect API key is required when an alarm trigger id is set",
             )
-        client = ProtectClient(
-            host,
-            body.username,
-            body.password,
-            verify_ssl=body.verify_ssl,
-            transport=protect_transport,
-            api_key=effective_api_key,
-        )
-        try:
-            client.login()
-            cameras = client.get_cameras()
-            if effective_api_key:
-                client.get_integration_info()
-        except ProtectAuthError as exc:
-            raise HTTPException(status_code=401, detail=str(exc))
-        except (ProtectError, OSError) as exc:
-            raise HTTPException(status_code=502, detail=f"Could not reach UniFi Protect: {exc}")
-        finally:
-            client.close()
+        if effective_api_key:
+            integration_client = ProtectClient(
+                host,
+                body.username,
+                body.password,
+                verify_ssl=body.verify_ssl,
+                transport=protect_transport,
+                api_key=effective_api_key,
+            )
+            try:
+                integration_client.get_integration_info()
+            except ProtectAuthError as exc:
+                raise HTTPException(status_code=401, detail=str(exc))
+            except (ProtectError, OSError) as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Could not reach UniFi Protect: {exc}",
+                )
+            finally:
+                integration_client.close()
         settings_updates = {
             "protect.host": (host, False),
             "protect.username": (body.username, False),
@@ -424,16 +746,49 @@ def create_app(
                 False,
             )
         alarm_is_configured = bool(effective_api_key and effective_trigger_id)
-        store.update_settings(
-            settings_updates,
-            activate_alarm_at_ms=(
-                int(time.time() * 1000) if alarm_is_configured else None
-            ),
+        delete_keys = (
+            (
+                "protect.api_key",
+                "protect.alarm_trigger_id",
+                ALARM_ENABLED_AFTER_SETTING,
+            )
+            if console_switch_requested
+            else ()
         )
+
+        def commit_protect_settings() -> bool:
+            return store.update_protect_settings(
+                settings_updates,
+                expected_host=stored_host,
+                expected_generation=stored_generation,
+                expected_console_id=stored_console_id,
+                observed_console_id=observed_console_id,
+                console_switch_token=body.console_switch_token,
+                delete_keys=delete_keys,
+                activate_alarm_at_ms=(
+                    int(time.time() * 1000) if alarm_is_configured else None
+                ),
+            )
+
+        try:
+            # Keep slow credential probes outside the provider writer so
+            # webhook persistence and reads remain available. The mutation
+            # guard still prevents another PUT/DELETE from changing the
+            # retained settings snapshot before this atomic commit.
+            with store.integration_guard(exclusive=True):
+                console_switched = commit_protect_settings()
+        except ProtectConsoleSwitchConfirmationRequired as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ProtectSettingsConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{exc}; review the Protect host and try again",
+            )
         return {
             "ok": True,
             "cameras": len(cameras),
             "alarm_configured": alarm_is_configured,
+            "console_switched": console_switched,
         }
 
     @app.put("/api/settings/square")
@@ -450,8 +805,14 @@ def create_app(
                 status_code=422,
                 detail="clear_webhook cannot be combined with new webhook credentials",
             )
+        # Interactive save: keep rate-limit retries short so the browser isn't
+        # left waiting behind the poller's more patient defaults.
         client = SquareClient(
-            body.access_token, environment=body.environment, transport=square_transport
+            body.access_token,
+            environment=body.environment,
+            transport=square_transport,
+            rate_limit_max_retries=1,
+            rate_limit_max_delay=2.0,
         )
         try:
             try:
@@ -477,56 +838,343 @@ def create_app(
             raise HTTPException(status_code=502, detail=f"Could not reach Square: {exc}")
         finally:
             client.close()
-        settings_updates = {
-            "square.access_token": (body.access_token, True),
-            "square.environment": (body.environment, False),
-            "square.merchant_id": (merchant_id, False),
-        }
-        delete_keys = ()
-        if body.webhook_signature_key and body.webhook_url:
-            settings_updates.update(
-                {
-                    "square.webhook_signature_key": (
-                        body.webhook_signature_key,
-                        True,
+        try:
+            with square_account_lock:
+                account_configuration = store.configure_square_account(
+                    merchant_id=merchant_id,
+                    access_token=body.access_token,
+                    environment=body.environment,
+                    webhook_signature_key=(
+                        body.webhook_signature_key
+                        if body.webhook_signature_key
+                        else None
                     ),
-                    "square.webhook_url": (body.webhook_url, False),
-                }
+                    webhook_url=body.webhook_url if body.webhook_url else None,
+                    clear_webhook=body.clear_webhook,
+                    confirm_account_switch=body.confirm_account_switch,
+                    account_switch_confirmation_token=(
+                        body.account_switch_confirmation_token
+                    ),
+                )
+                saved_webhook = store.get_settings(
+                    ("square.webhook_signature_key", "square.webhook_url")
+                )
+        except SquareAccountSwitchRequired as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": SQUARE_ACCOUNT_SWITCH_CODE,
+                    "message": (
+                        "These credentials belong to a different Square account. "
+                        "Confirm the account switch to erase the previous account's "
+                        "local transactions, thumbnails, POS devices, camera mappings, "
+                        "sync history, and saved Square webhook credentials."
+                    ),
+                    "confirmation_token": exc.confirmation_token,
+                },
+            ) from exc
+
+        webhook_configured = bool(
+            saved_webhook["square.webhook_signature_key"]
+            and saved_webhook["square.webhook_url"]
+        )
+        # Blank webhook fields retain saved credentials only for the same
+        # merchant. A switch clears them unless a new pair was submitted.
+        return {
+            "ok": True,
+            "locations": locations,
+            "account_switched": account_configuration.switched,
+            "webhook_configured": webhook_configured,
+            "account_revision": account_configuration.account_revision,
+            "evidence_cleanup_pending": (
+                account_configuration.evidence_cleanup_pending
+            ),
+        }
+
+    def deep_link_settings_response() -> dict[str, str]:
+        return {
+            "template": store.get_setting("deep_link_template") or "",
+            "default_template": deeplink.DEFAULT_TEMPLATE,
+        }
+
+    @app.get("/api/settings/deep-link")
+    def get_deep_link_settings(_=authed) -> dict[str, str]:
+        """Return only the non-secret Protect timeline-link configuration."""
+        return deep_link_settings_response()
+
+    @app.put("/api/settings/deep-link")
+    def set_deep_link_settings(body: DeepLinkSettingsBody, _=authed) -> dict:
+        try:
+            template = deeplink.validate_deep_link_template(body.template)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        if not template or template == deeplink.DEFAULT_TEMPLATE:
+            store.delete_setting("deep_link_template")
+        else:
+            store.set_setting("deep_link_template", template)
+        return {"ok": True, **deep_link_settings_response()}
+
+    WEBHOOK_SUBSCRIPTION_NAME = "square-unifi-protect"
+
+    @app.post("/api/settings/square/webhook/register")
+    def register_webhook(body: WebhookRegisterBody, _=authed) -> dict:
+        """Create (or retarget) our Square webhook subscription automatically.
+
+        Uses Square's Webhook Subscriptions API so the operator never has to
+        open the developer dashboard: the subscription is created for
+        payment.updated, its signature key is fetched, and both are stored.
+        """
+        url = body.notification_url.strip()
+        if not url.lower().startswith("https://"):
+            raise HTTPException(
+                status_code=422,
+                detail="Notification URL must be https:// and publicly reachable",
             )
-        elif body.clear_webhook:
-            delete_keys = (
-                "square.webhook_signature_key", "square.webhook_url"
+        client = require_square()
+        try:
+            existing = next(
+                (
+                    sub
+                    for sub in client.list_webhook_subscriptions()
+                    if sub.get("name") == WEBHOOK_SUBSCRIPTION_NAME
+                ),
+                None,
             )
-        store.update_settings(settings_updates, delete_keys=delete_keys)
-        # Blank webhook fields without clear_webhook leave any stored webhook
-        # configuration untouched, so re-saving the access token is safe.
-        return {"ok": True, "locations": locations}
+            if existing:
+                subscription = client.update_webhook_subscription(
+                    str(existing.get("id", "")), url
+                )
+                signature_key = subscription.get("signature_key") or (
+                    client.get_webhook_signature_key(str(existing.get("id", "")))
+                )
+            else:
+                subscription = client.create_webhook_subscription(
+                    WEBHOOK_SUBSCRIPTION_NAME, url, secrets.token_hex(16)
+                )
+                signature_key = subscription.get("signature_key", "")
+            if not signature_key:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Square did not return the webhook signature key",
+                )
+        except SquareAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except SquarePermissionError:
+            raise HTTPException(
+                status_code=403,
+                detail="Square access token cannot manage webhook subscriptions",
+            )
+        except SquareError as exc:
+            raise HTTPException(status_code=502, detail=f"Could not reach Square: {exc}")
+        finally:
+            client.close()
+        store.update_settings(
+            {
+                "square.webhook_signature_key": (signature_key, True),
+                "square.webhook_url": (url, False),
+            }
+        )
+        return {"ok": True, "notification_url": url, "updated": existing is not None}
+
+    @app.put("/api/settings/square/oauth-app")
+    def set_square_oauth_app(body: SquareOAuthAppBody, _=authed) -> dict:
+        """Store the Square application's OAuth client credentials."""
+        if body.environment not in ("production", "sandbox"):
+            raise HTTPException(status_code=422, detail="Invalid environment")
+        store.update_settings(
+            {
+                "square.oauth_client_id": (body.client_id.strip(), False),
+                "square.oauth_client_secret": (body.client_secret.strip(), True),
+                "square.environment": (body.environment, False),
+            }
+        )
+        return {"ok": True}
+
+    @app.get("/oauth/square/start")
+    def square_oauth_start(_=authed) -> RedirectResponse:
+        oauth = store.get_settings(
+            ("square.oauth_client_id", "square.environment")
+        )
+        if not oauth["square.oauth_client_id"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Save the Square application client id/secret first",
+            )
+        state = secrets.token_urlsafe(24)
+        store.set_setting("square.oauth_state", state)
+        return RedirectResponse(
+            oauth_authorize_url(
+                oauth["square.environment"] or "production",
+                oauth["square.oauth_client_id"],
+                state,
+            ),
+            status_code=302,
+        )
+
+    @app.get("/oauth/square/callback")
+    def square_oauth_callback(
+        code: str = "", state: str = "", error: str = "", _=authed
+    ) -> RedirectResponse:
+        if error:
+            # The operator declined consent (or Square reported a problem);
+            # land back in the app instead of on a bare JSON error.
+            store.delete_setting("square.oauth_state")
+            return RedirectResponse("/?square_oauth=denied", status_code=302)
+        expected_state = store.get_setting("square.oauth_state")
+        if (
+            not code
+            or not expected_state
+            or not secrets.compare_digest(state, expected_state)
+        ):
+            raise HTTPException(status_code=400, detail="Invalid OAuth state")
+        store.delete_setting("square.oauth_state")
+        oauth = store.get_settings(
+            (
+                "square.oauth_client_id",
+                "square.oauth_client_secret",
+                "square.environment",
+            )
+        )
+        try:
+            tokens = oauth_exchange(
+                oauth["square.environment"] or "production",
+                oauth["square.oauth_client_id"] or "",
+                oauth["square.oauth_client_secret"] or "",
+                code=code,
+                transport=square_transport,
+            )
+        except SquareAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except SquareError as exc:
+            raise HTTPException(status_code=502, detail=f"Could not reach Square: {exc}")
+        updates = {
+            "square.access_token": (tokens["access_token"], True),
+            "square.token_expires_at": (tokens.get("expires_at", ""), False),
+        }
+        if tokens.get("refresh_token"):
+            updates["square.refresh_token"] = (tokens["refresh_token"], True)
+        if tokens.get("merchant_id"):
+            updates["square.merchant_id"] = (tokens["merchant_id"], False)
+        store.update_settings(updates)
+        return RedirectResponse("/?square_oauth=connected", status_code=302)
 
     # -- cameras & mapping ------------------------------------------------------
 
-    @app.get("/api/cameras")
-    def cameras(_=authed) -> list[dict]:
-        client = require_protect()
+    @app.get("/api/health/protect")
+    def protect_health(_=authed) -> dict:
+        """Live connectivity check so the UI can show a trustworthy indicator."""
+        client = build_protect()
+        if client is None:
+            return {"configured": False, "ok": False, "detail": "Not configured"}
         try:
-            return client.get_cameras()
+            cameras = client.get_cameras()
+        except ProtectAuthError as exc:
+            return {"configured": True, "ok": False, "detail": str(exc)}
+        except ProtectError as exc:
+            return {"configured": True, "ok": False, "detail": str(exc)}
+        finally:
+            client.close()
+        return {
+            "configured": True,
+            "ok": True,
+            "cameras": len(cameras),
+            "detail": f"Connected — {len(cameras)} cameras",
+        }
+
+    @app.get("/api/cameras")
+    def cameras(response: Response, _=authed) -> list[dict]:
+        with store.integration_guard():
+            return _cameras_locked(response)
+
+    def _cameras_locked(response: Response) -> list[dict]:
+        settings = store.get_settings(PROTECT_SETTING_KEYS)
+        client = build_protect(settings)
+        if client is None:
+            raise HTTPException(status_code=409, detail="UniFi Protect is not configured")
+        try:
+            camera_rows, observed_console_id = client.get_cameras_with_console_identity()
         except ProtectError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         finally:
             client.close()
+        current_identity = store.get_settings(
+            (
+                "protect.host",
+                PROTECT_CONSOLE_ID_SETTING,
+                PROTECT_CONSOLE_GENERATION_SETTING,
+            )
+        )
+        if (
+            current_identity["protect.host"] != settings["protect.host"]
+            or current_identity[PROTECT_CONSOLE_GENERATION_SETTING]
+            != settings[PROTECT_CONSOLE_GENERATION_SETTING]
+            or current_identity[PROTECT_CONSOLE_ID_SETTING]
+            != settings[PROTECT_CONSOLE_ID_SETTING]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Protect console changed while cameras were loading; reload settings",
+            )
+        if (
+            settings[PROTECT_CONSOLE_ID_SETTING] is not None
+            and observed_console_id != settings[PROTECT_CONSOLE_ID_SETTING]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Protect console identity changed; reconnect Protect before loading cameras",
+            )
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["X-Protect-Console-Generation"] = (
+            settings[PROTECT_CONSOLE_GENERATION_SETTING] or ""
+        )
+        return camera_rows
 
-    @app.get("/api/locations")
-    def locations(_=authed) -> list[dict]:
-        client = require_square()
+    @app.get("/api/health/square")
+    def square_health(_=authed) -> dict:
+        """Live connectivity check so the UI can show a trustworthy indicator."""
+        client = build_square()
+        if client is None:
+            return {"configured": False, "ok": False, "detail": "Not configured"}
         try:
-            return client.list_locations()
+            locations = client.list_locations()
+        except SquareAuthError as exc:
+            return {"configured": True, "ok": False, "detail": str(exc)}
         except SquareError as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
+            return {"configured": True, "ok": False, "detail": str(exc)}
         finally:
             client.close()
+        return {
+            "configured": True,
+            "ok": True,
+            "locations": len(locations),
+            "detail": f"Connected — {len(locations)} location(s)",
+        }
+
+    @app.get("/api/locations")
+    def locations(response: Response, _=authed) -> list[dict]:
+        with square_account_lock, store.integration_guard():
+            client = require_square()
+            try:
+                result = client.list_locations()
+                # Location IDs and the account revision form one account-bound
+                # mapping snapshot and must never be replayed from a cache.
+                response.headers["Cache-Control"] = "private, no-store"
+                account_revision = store.square_account_revision()
+                if account_revision:
+                    response.headers["X-Square-Account-Revision"] = account_revision
+                return result
+            except SquareError as exc:
+                raise HTTPException(status_code=502, detail=str(exc))
+            finally:
+                client.close()
 
     @app.get("/api/pos-devices")
-    def pos_devices(_=authed) -> list[dict]:
-        return store.get_observed_devices()
+    def pos_devices(_=authed) -> JSONResponse:
+        with store.integration_guard():
+            return JSONResponse(
+                store.get_observed_devices(),
+                headers={"Cache-Control": "private, no-store"},
+            )
 
     @app.get("/api/camera-preview/{camera_id}")
     def camera_preview(camera_id: str, _=authed) -> Response:
@@ -534,21 +1182,62 @@ def create_app(
             camera_id = validate_camera_id(camera_id)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        client = require_protect()
+        with store.integration_guard():
+            return _camera_preview_locked(camera_id)
+
+    def _camera_preview_locked(camera_id: str) -> Response:
+        protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
+        client = build_protect(protect_settings)
+        if client is None:
+            raise HTTPException(status_code=409, detail="UniFi Protect is not configured")
         try:
+            verify_protect_console_identity(client, protect_settings)
             image = client.get_snapshot(camera_id)
         except ProtectError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         finally:
             client.close()
-        return Response(content=image, media_type="image/jpeg")
+        return Response(
+            content=image,
+            media_type="image/jpeg",
+            headers={"Cache-Control": PRIVATE_NO_STORE},
+        )
 
     @app.get("/api/camera-mapping")
-    def get_mapping(_=authed) -> list[dict]:
-        return store.get_camera_mappings()
+    def get_mapping(_=authed) -> JSONResponse:
+        with store.integration_guard():
+            protect_generation = store.get_setting(
+                PROTECT_CONSOLE_GENERATION_SETTING
+            )
+            square_account_revision = store.square_account_revision()
+            return JSONResponse(
+                store.get_camera_mappings(),
+                headers={
+                    "Cache-Control": "private, no-store",
+                    "X-Protect-Console-Generation": protect_generation or "",
+                    "X-Square-Account-Revision": square_account_revision or "",
+                },
+            )
 
     @app.put("/api/camera-mapping")
-    def set_mapping(body: CameraMappingBody, _=authed) -> dict:
+    def set_mapping(request: Request, body: CameraMappingBody, _=authed) -> dict:
+        account_revision = request.headers.get("x-square-account-revision")
+        if not account_revision:
+            raise HTTPException(
+                status_code=409,
+                detail="Reload settings before saving camera mappings",
+            )
+        expected_generation = request.headers.get("x-protect-console-generation")
+        if not expected_generation:
+            if account_revision != store.square_account_revision():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Square account changed; reload settings",
+                )
+            raise HTTPException(
+                status_code=428,
+                detail="Reload cameras before saving camera mappings",
+            )
         if len(body.mappings) > MAX_CAMERA_MAPPINGS:
             raise HTTPException(
                 status_code=422,
@@ -570,18 +1259,25 @@ def create_app(
                 validate_camera_id(entry.camera_id)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc))
-        store.replace_camera_mappings(
-            [
-                (
-                    entry.location_id,
-                    entry.device_id,
-                    entry.device_name,
-                    entry.camera_id,
-                    entry.camera_name,
-                )
-                for entry in body.mappings
-            ]
-        )
+        try:
+            store.replace_camera_mappings(
+                [
+                    (
+                        entry.location_id,
+                        entry.device_id,
+                        entry.device_name,
+                        entry.camera_id,
+                        entry.camera_name,
+                    )
+                    for entry in body.mappings
+                ],
+                expected_account_revision=account_revision,
+                expected_protect_generation=expected_generation,
+            )
+        except SquareAccountChanged as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ProtectSettingsConflict as exc:
+            raise HTTPException(status_code=409, detail=f"{exc}; reload settings")
         nudge_protect_work_queue()
         return {"ok": True, "count": len(body.mappings)}
 
@@ -600,6 +1296,14 @@ def create_app(
                 )
             except ValueError:
                 link = None
+        if txn.get("thumbnail_path"):
+            thumbnail_status = "ready"
+        elif not txn.get("camera_id"):
+            thumbnail_status = "unmapped"
+        elif int(txn.get("thumbnail_retry_attempts", 0)) > 0:
+            thumbnail_status = "retrying"
+        else:
+            thumbnail_status = "queued"
         return {
             "id": txn["id"],
             "created_at": txn["created_at"],
@@ -617,51 +1321,183 @@ def create_app(
             "thumbnail_url": (
                 f"/api/thumbnails/{txn['id']}" if txn.get("thumbnail_path") else None
             ),
+            "thumbnail_status": thumbnail_status,
+            "thumbnail_retry_attempts": int(
+                txn.get("thumbnail_retry_attempts", 0)
+            ),
+        }
+
+    @app.get("/api/dashboard")
+    def dashboard(_=authed) -> dict:
+        """Live status tiles: connections, webhook freshness, queue depths."""
+        protect: dict = {"configured": False, "ok": False, "detail": "Not configured"}
+        client = build_protect()
+        if client is not None:
+            try:
+                cameras = client.get_cameras()
+                protect = {
+                    "configured": True,
+                    "ok": True,
+                    "detail": f"Connected — {len(cameras)} cameras",
+                }
+            except ProtectAuthError as exc:
+                protect = {"configured": True, "ok": False, "detail": str(exc)}
+            except ProtectError as exc:
+                protect = {"configured": True, "ok": False, "detail": str(exc)}
+            finally:
+                client.close()
+
+        square: dict = {"configured": False, "ok": False, "detail": "Not configured"}
+        square_client = build_square()
+        if square_client is not None:
+            try:
+                locations = square_client.list_locations()
+                square = {
+                    "configured": True,
+                    "ok": True,
+                    "detail": f"Connected — {len(locations)} location(s)",
+                }
+            except SquareAuthError as exc:
+                square = {"configured": True, "ok": False, "detail": str(exc)}
+            except SquareError as exc:
+                square = {"configured": True, "ok": False, "detail": str(exc)}
+            finally:
+                square_client.close()
+
+        webhook_settings = store.get_settings(
+            ("square.webhook_signature_key", "webhook.last_event_ms")
+        )
+        last_event_ms = None
+        raw_last = webhook_settings["webhook.last_event_ms"]
+        if raw_last:
+            try:
+                last_event_ms = int(raw_last)
+            except ValueError:
+                last_event_ms = None
+        webhook = {
+            "configured": bool(webhook_settings["square.webhook_signature_key"]),
+            "last_event_ms": last_event_ms,
+        }
+
+        queues = store.queue_depths()
+        if not store.get_setting("protect.alarm_trigger_id"):
+            # Idle alarm states are meaningless while the feature is off.
+            queues["alarms_pending"] = 0
+        return {
+            "protect": protect,
+            "square": square,
+            "webhook": webhook,
+            "queues": queues,
         }
 
     @app.get("/api/transactions")
     def transactions(
-        response: Response,
         limit: int = 50,
         offset: int = 0,
         snapshot: int | None = None,
         _=authed,
-    ) -> list[dict]:
-        rows, snapshot_rowid = store.list_transactions_page(limit, offset, snapshot)
-        # Preserve the existing list response while issuing an optional
-        # snapshot boundary for clients that paginate across live inserts.
-        response.headers["X-Transaction-Snapshot"] = str(snapshot_rowid)
-        return [txn_response(t) for t in rows]
+    ) -> JSONResponse:
+        with store.integration_guard():
+            try:
+                rows, transaction_snapshot = store.list_transactions_page(
+                    limit, offset, snapshot
+                )
+            except TransactionSnapshotExpired as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Transaction page expired; return to the newest page",
+                ) from exc
+            # Render the account-bound payload while the shared guard is held,
+            # so an acknowledged switch cannot bisect the read and encoding.
+            return JSONResponse(
+                [txn_response(t) for t in rows],
+                headers={
+                    "X-Transaction-Snapshot": str(transaction_snapshot),
+                    "Cache-Control": PRIVATE_NO_STORE,
+                },
+            )
 
     @app.get("/api/thumbnails/{txn_id}")
-    def thumbnail(txn_id: str, _=authed) -> FileResponse:
-        txn = store.get_transaction(txn_id)
-        if not txn or not txn.get("thumbnail_path"):
-            raise HTTPException(status_code=404, detail="No thumbnail for this transaction")
-        path = (store.thumbnail_dir / txn["thumbnail_path"]).resolve()
-        if store.thumbnail_dir.resolve() not in path.parents or not path.is_file():
-            if store.requeue_missing_thumbnail(txn_id, txn["thumbnail_path"]):
-                nudge_protect_work_queue()
-            raise HTTPException(status_code=404, detail="Thumbnail not found")
-        return FileResponse(path, media_type="image/jpeg")
+    def thumbnail(txn_id: str, _=authed) -> Response:
+        with store.integration_guard():
+            txn = store.get_transaction(txn_id)
+            if not txn or not txn.get("thumbnail_path"):
+                raise HTTPException(
+                    status_code=404, detail="No thumbnail for this transaction"
+                )
+            path = (store.thumbnail_dir / txn["thumbnail_path"]).resolve()
+
+            def missing_thumbnail() -> None:
+                if store.requeue_missing_thumbnail(txn_id, txn["thumbnail_path"]):
+                    nudge_protect_work_queue()
+                raise HTTPException(status_code=404, detail="Thumbnail not found")
+
+            if (
+                store.thumbnail_dir.resolve() not in path.parents
+                or not path.is_file()
+            ):
+                missing_thumbnail()
+            try:
+                image = _read_thumbnail_bytes(path)
+            except OSError:
+                # The file can disappear or be atomically replaced after
+                # is_file(). Reconcile the durable reference instead of letting
+                # a lazy response fail after headers have been sent.
+                missing_thumbnail()
+            return Response(
+                content=image,
+                media_type="image/jpeg",
+                headers={"Cache-Control": PRIVATE_NO_STORE},
+            )
 
     def run_sync() -> int:
-        square = build_square()
-        if square is None:
-            return 0
-        protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
-        protect = build_protect(protect_settings)
-        try:
-            return sync.sync_payments(
-                store,
-                square,
-                protect,
-                alarm_trigger_id=protect_settings["protect.alarm_trigger_id"],
-            )
-        finally:
-            square.close()
-            if protect:
-                protect.close()
+        with square_account_lock:
+            try:
+                store.retry_orphan_thumbnail_cleanup()
+            except Exception as exc:
+                logger.warning("Could not retry orphan thumbnail cleanup: %s", exc)
+            with store.integration_guard():
+                square_settings = store.get_settings(SQUARE_CLIENT_SETTING_KEYS)
+                square = build_square(square_settings)
+                if square is None:
+                    return 0
+                protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
+                protect = build_protect(protect_settings)
+                try:
+                    if protect:
+                        try:
+                            verify_protect_console_identity(
+                                protect, protect_settings
+                            )
+                        except ProtectConsoleIdentityMismatch:
+                            raise
+                        except (ProtectError, OSError) as exc:
+                            # A Protect outage must not block Square ingestion:
+                            # ingest payment facts now and let the durable
+                            # retry queue capture camera evidence later. Only a
+                            # positively observed identity mismatch hard-fails.
+                            logger.warning(
+                                "Protect unreachable during sync; "
+                                "deferring camera evidence: %s",
+                                exc,
+                            )
+                            protect.close()
+                            protect = None
+                    return sync.sync_payments(
+                        store,
+                        square,
+                        protect,
+                        alarm_trigger_id=protect_settings["protect.alarm_trigger_id"],
+                        expected_merchant_id=square_settings["square.merchant_id"],
+                        expected_environment=square_settings["square.environment"],
+                        expected_account_revision=(
+                            square_settings["square.account_revision"]
+                        ),
+                    )
+                finally:
+                    square.close()
+                    if protect:
+                        protect.close()
 
     @app.post("/api/sync")
     def manual_sync(_=authed) -> dict:
@@ -669,6 +1505,8 @@ def create_app(
             return {"ok": True, "ingested": run_sync()}
         except (SquareError, ProtectError) as exc:
             raise HTTPException(status_code=502, detail=str(exc))
+        except SquareAccountChanged as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
 
     # -- Square webhook (unauthenticated; HMAC-verified) ---------------------------
 
@@ -694,50 +1532,85 @@ def create_app(
             chunks.append(chunk)
         return b"".join(chunks)
 
+    def process_square_webhook(body: bytes, signature: str) -> dict | None:
+        """Verify and ingest against one current account/settings snapshot."""
+        with store.integration_guard():
+            square_settings = store.get_settings(
+                (
+                    "square.webhook_signature_key",
+                    "square.webhook_url",
+                    "square.merchant_id",
+                    "square.environment",
+                    "square.account_revision",
+                )
+            )
+            signature_key = square_settings["square.webhook_signature_key"]
+            webhook_url = square_settings["square.webhook_url"]
+            if not signature_key or not webhook_url:
+                raise HTTPException(status_code=403, detail="Webhook not configured")
+            if not verify_webhook_signature(
+                signature_key, webhook_url, body, signature
+            ):
+                raise HTTPException(status_code=401, detail="Invalid webhook signature")
+            # Every validly signed delivery counts as webhook liveness for the
+            # dashboard tile, including events ignored below.
+            store.set_setting("webhook.last_event_ms", str(int(time.time() * 1000)))
+            try:
+                event = json.loads(body)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422, detail="Invalid JSON payload"
+                ) from exc
+            if (
+                not isinstance(event, dict)
+                or not square_settings["square.merchant_id"]
+                or event.get("merchant_id")
+                != square_settings["square.merchant_id"]
+            ):
+                return None
+            event_data = event.get("data")
+            event_object = (
+                event_data.get("object")
+                if isinstance(event_data, dict)
+                else None
+            )
+            payment = (
+                event_object.get("payment")
+                if isinstance(event_object, dict)
+                else None
+            )
+            if not isinstance(payment, dict) or not payment:
+                return None
+            return sync.ingest_payment(
+                store,
+                payment,
+                None,
+                expected_merchant_id=square_settings["square.merchant_id"],
+                expected_environment=(
+                    square_settings["square.environment"] or "production"
+                ),
+                expected_account_revision=(
+                    square_settings["square.account_revision"]
+                ),
+            )
+
     @app.post("/webhooks/square")
     async def square_webhook(request: Request) -> JSONResponse:
-        square_settings = store.get_settings(
-            (
-                "square.webhook_signature_key",
-                "square.webhook_url",
-                "square.merchant_id",
-            )
-        )
-        signature_key = square_settings["square.webhook_signature_key"]
-        webhook_url = square_settings["square.webhook_url"]
-        if not signature_key or not webhook_url:
-            raise HTTPException(status_code=403, detail="Webhook not configured")
         body = await read_square_webhook_body(request)
         signature = request.headers.get("x-square-hmacsha256-signature", "")
-        if not verify_webhook_signature(signature_key, webhook_url, body, signature):
-            raise HTTPException(status_code=401, detail="Invalid webhook signature")
-        import json as _json
-
         try:
-            event = _json.loads(body)
-        except ValueError:
-            raise HTTPException(status_code=422, detail="Invalid JSON payload")
-        if (
-            not isinstance(event, dict)
-            or not square_settings["square.merchant_id"]
-            or event.get("merchant_id") != square_settings["square.merchant_id"]
-        ):
+            txn = await run_in_threadpool(
+                process_square_webhook, body, signature
+            )
+        except SquareAccountChanged:
+            # A verified event can race an explicitly confirmed account
+            # switch. Treat the stale merchant's event as acknowledged but
+            # never let it repopulate the new account.
             return JSONResponse({"ok": True, "ignored": True})
-        event_data = event.get("data")
-        event_object = (
-            event_data.get("object") if isinstance(event_data, dict) else None
-        )
-        payment = (
-            event_object.get("payment")
-            if isinstance(event_object, dict)
-            else None
-        )
-        if not isinstance(payment, dict) or not payment:
-            return JSONResponse({"ok": True, "ignored": True})
-        try:
-            txn = await run_in_threadpool(sync.ingest_payment, store, payment, None)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
+        if txn is None:
+            return JSONResponse({"ok": True, "ignored": True})
         # Both alarm delivery and thumbnail capture are durable queue work;
         # the drain no-ops cheaply when neither has anything pending.
         nudge_protect_work_queue()
@@ -750,9 +1623,8 @@ def create_app(
 
     # -- background poller ---------------------------------------------------------
 
-    if enable_poller:
-        interval = float(os.environ.get("SPI_POLL_INTERVAL", "60"))
-        poller = sync.Poller(run_sync, interval_seconds=interval)
+    if poll_interval is not None:
+        poller = sync.Poller(run_sync, interval_seconds=poll_interval)
         app.state.poller = poller
 
         @app.on_event("startup")

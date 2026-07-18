@@ -16,6 +16,7 @@ from app.deeplink import (
     build_deep_link,
     validate_deep_link_template,
 )
+from app.main import _parse_poll_interval, create_app
 from app.protect_client import (
     ProtectAuthError,
     ProtectClient,
@@ -220,6 +221,28 @@ def test_deep_link_rejects_bad_values():
 
 
 # -- sync helpers -------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_app_rejects_unsafe_poll_interval_before_initialization(
+    tmp_path, monkeypatch, value
+):
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("SPI_POLL_INTERVAL", value)
+    with pytest.raises(
+        ValueError,
+        match="SPI_POLL_INTERVAL must be a finite number of at least 1 second",
+    ):
+        create_app(data_dir=data_dir, enable_poller=True)
+    assert not data_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1", 1.0), ("1.5", 1.5), ("60", 60.0)],
+)
+def test_poll_interval_accepts_finite_values_at_least_one_second(value, expected):
+    assert _parse_poll_interval(value) == expected
+
 
 def test_parse_ts_ms_known_value():
     assert parse_ts_ms("2021-01-01T00:00:00Z") == 1609459200000

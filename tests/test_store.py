@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from app.store import Store
+from app.store import Store, TransactionSnapshotExpired
 from app.sync import (
     ingest_payment,
     parse_ts_ms,
@@ -738,6 +738,103 @@ def test_superseded_thumbnail_delete_failure_does_not_rollback_update(
         store.close()
 
 
+def test_transaction_snapshots_bound_multiple_timestamp_versions(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("app.store.MAX_TRANSACTION_SNAPSHOTS", 2)
+    monkeypatch.setattr("app.store.MAX_TRANSACTION_ORDER_HISTORY", 1)
+    store = Store(tmp_path / "data")
+
+    def transaction(txn_id: str, ts_ms: int, updated_ts_ms: int) -> dict:
+        return {
+            "id": txn_id,
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "ts_ms": ts_ms,
+            "updated_at": "2026-07-16T15:30:00.000Z",
+            "updated_ts_ms": updated_ts_ms,
+            "amount": 100,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        }
+
+    try:
+        store.upsert_transaction(transaction("A", 300, 1))
+        store.upsert_transaction(transaction("B", 200, 1))
+        first_page, first_snapshot = store.list_transactions_page(limit=2)
+        assert [txn["id"] for txn in first_page] == ["A", "B"]
+
+        store.upsert_transaction(transaction("B", 400, 2))
+        second_page, second_snapshot = store.list_transactions_page(limit=2)
+        assert [txn["id"] for txn in second_page] == ["B", "A"]
+
+        store.upsert_transaction(transaction("B", 100, 3))
+        latest_page, latest_snapshot = store.list_transactions_page(limit=2)
+        assert [txn["id"] for txn in latest_page] == ["A", "B"]
+
+        # The retained generation stays exact across both corrections; the
+        # bounded snapshot/history policy expires the oldest token.
+        retained_page, retained_snapshot = store.list_transactions_page(
+            limit=2, snapshot_id=second_snapshot
+        )
+        assert [txn["id"] for txn in retained_page] == ["B", "A"]
+        assert retained_snapshot == second_snapshot
+        with pytest.raises(TransactionSnapshotExpired):
+            store.list_transactions_page(limit=2, snapshot_id=first_snapshot)
+
+        snapshot_count = store._db.execute(
+            "SELECT COUNT(*) AS count FROM transaction_feed_snapshots"
+        ).fetchone()["count"]
+        history_count = store._db.execute(
+            "SELECT COUNT(*) AS count FROM transaction_feed_order_history"
+        ).fetchone()["count"]
+        assert snapshot_count == 2
+        assert history_count == 1
+        assert latest_snapshot > second_snapshot > first_snapshot
+    finally:
+        store.close()
+
+
+def test_transaction_delete_expires_snapshot_before_rowid_reuse(tmp_path):
+    store = Store(tmp_path / "data")
+
+    def transaction(txn_id: str, ts_ms: int) -> dict:
+        return {
+            "id": txn_id,
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "ts_ms": ts_ms,
+            "amount": 100,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        }
+
+    try:
+        store.upsert_transaction(transaction("OLD_ACCOUNT", 100))
+        _page, old_snapshot = store.list_transactions_page(limit=1)
+        with store._lock:
+            old_rowid = store._db.execute(
+                "SELECT rowid FROM transactions WHERE id = 'OLD_ACCOUNT'"
+            ).fetchone()["rowid"]
+            store._db.execute("DELETE FROM transactions")
+            store._db.commit()
+
+        store.upsert_transaction(transaction("NEW_ACCOUNT", 200))
+        with store._lock:
+            new_rowid = store._db.execute(
+                "SELECT rowid FROM transactions WHERE id = 'NEW_ACCOUNT'"
+            ).fetchone()["rowid"]
+
+        assert new_rowid == old_rowid
+        with pytest.raises(TransactionSnapshotExpired):
+            store.list_transactions_page(limit=1, snapshot_id=old_snapshot)
+        fresh_page, fresh_snapshot = store.list_transactions_page(limit=1)
+        assert [txn["id"] for txn in fresh_page] == ["NEW_ACCOUNT"]
+        assert fresh_snapshot > old_snapshot
+    finally:
+        store.close()
+
+
 def test_store_migrates_legacy_fields_and_scrubs_raw_payment(tmp_path):
     data_dir = tmp_path / "legacy"
     data_dir.mkdir()
@@ -793,8 +890,24 @@ def test_store_migrates_legacy_fields_and_scrubs_raw_payment(tmp_path):
     store = Store(data_dir)
     try:
         stored = store.get_transaction("PAY_LEGACY")
+        page, transaction_snapshot = store.list_transactions_page(limit=1)
+        snapshot_tables = {
+            row["name"]
+            for row in store._db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name LIKE 'transaction_feed_%'"
+            ).fetchall()
+        }
     finally:
         store.close()
+
+    reopened = Store(data_dir)
+    try:
+        durable_page, durable_snapshot = reopened.list_transactions_page(
+            limit=1, snapshot_id=transaction_snapshot
+        )
+    finally:
+        reopened.close()
 
     assert stored == {
         "id": "PAY_LEGACY",
@@ -816,6 +929,14 @@ def test_store_migrates_legacy_fields_and_scrubs_raw_payment(tmp_path):
         "alarm_state": "sent",
         "alarm_claim_token": None,
         "alarm_claimed_at": None,
+    }
+    assert [txn["id"] for txn in page] == ["PAY_LEGACY"]
+    assert [txn["id"] for txn in durable_page] == ["PAY_LEGACY"]
+    assert durable_snapshot == transaction_snapshot
+    assert snapshot_tables == {
+        "transaction_feed_order_history",
+        "transaction_feed_snapshots",
+        "transaction_feed_state",
     }
 
 

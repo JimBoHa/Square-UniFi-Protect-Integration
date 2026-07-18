@@ -442,6 +442,9 @@ def test_transaction_feed_pagination_wiring():
     assert "transactionSnapshot" in js
     assert 'headers.get("x-transaction-snapshot")' in js
     assert "transactionOffset === 0" in js
+    assert "error.status = resp.status" in js
+    assert "err.status === 409" in js
+    assert "transactionPendingOffset = 0" in js
     assert 'id="txn-prev"' in html
     assert 'id="txn-next"' in html
     assert 'id="txn-page-status"' in html

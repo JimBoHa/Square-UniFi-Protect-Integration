@@ -16,6 +16,9 @@ from .security import CredentialCipher, hash_session_token
 logger = logging.getLogger("spi.store")
 
 SESSION_TTL_SECONDS = 12 * 3600
+TRANSACTION_SNAPSHOT_TTL_SECONDS = SESSION_TTL_SECONDS
+MAX_TRANSACTION_SNAPSHOTS = 8
+MAX_TRANSACTION_ORDER_HISTORY = 10_000
 ALARM_IDLE = "idle"
 ALARM_IN_PROGRESS = "in_progress"
 ALARM_SENT = "sent"
@@ -62,6 +65,39 @@ CREATE TABLE IF NOT EXISTS square_poll_watermarks (
     location_id TEXT PRIMARY KEY,
     polled_through_ms INTEGER NOT NULL CHECK (polled_through_ms >= 0)
 );
+CREATE TABLE IF NOT EXISTS transaction_feed_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    order_revision INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO transaction_feed_state (singleton, order_revision)
+VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS transaction_feed_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_revision INTEGER NOT NULL,
+    rowid_boundary INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    last_accessed_at REAL NOT NULL,
+    UNIQUE (order_revision, rowid_boundary)
+);
+CREATE INDEX IF NOT EXISTS idx_transaction_feed_snapshots_access
+    ON transaction_feed_snapshots (last_accessed_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS transaction_feed_order_history (
+    transaction_id TEXT NOT NULL,
+    order_revision INTEGER NOT NULL,
+    ts_ms INTEGER NOT NULL,
+    PRIMARY KEY (transaction_id, order_revision)
+);
+CREATE INDEX IF NOT EXISTS idx_transaction_feed_history_revision
+    ON transaction_feed_order_history (order_revision);
+CREATE TRIGGER IF NOT EXISTS invalidate_transaction_feed_after_delete
+AFTER DELETE ON transactions
+BEGIN
+    DELETE FROM transaction_feed_snapshots;
+    DELETE FROM transaction_feed_order_history;
+    UPDATE transaction_feed_state
+    SET order_revision = order_revision + 1
+    WHERE singleton = 1;
+END;
 CREATE TABLE IF NOT EXISTS thumbnail_retries (
     transaction_id TEXT PRIMARY KEY,
     attempts INTEGER NOT NULL DEFAULT 0,
@@ -78,6 +114,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     expires_at REAL NOT NULL
 );
 """
+
+
+class TransactionSnapshotExpired(Exception):
+    """Requested transaction-feed ordering snapshot is no longer retained."""
 
 
 class Store:
@@ -671,6 +711,34 @@ class Store:
                     "SELECT camera_id, ts_ms, thumbnail_path FROM transactions WHERE id = ?",
                     (txn["id"],),
                 ).fetchone()
+                timestamp_changed = bool(
+                    existing
+                    and current
+                    and applied.rowcount == 1
+                    and int(existing["ts_ms"]) != int(current["ts_ms"])
+                )
+                order_changed = bool(
+                    applied.rowcount == 1
+                    and current
+                    and (existing is None or timestamp_changed)
+                )
+                if order_changed:
+                    self._db.execute(
+                        "UPDATE transaction_feed_state "
+                        "SET order_revision = order_revision + 1 "
+                        "WHERE singleton = 1"
+                    )
+                    if timestamp_changed:
+                        revision = self._db.execute(
+                            "SELECT order_revision FROM transaction_feed_state "
+                            "WHERE singleton = 1"
+                        ).fetchone()["order_revision"]
+                        self._db.execute(
+                            "INSERT INTO transaction_feed_order_history "
+                            "(transaction_id, order_revision, ts_ms) VALUES (?, ?, ?)",
+                            (txn["id"], revision, int(existing["ts_ms"])),
+                        )
+                        self._prune_transaction_snapshots_locked(time.time())
                 if (
                     existing
                     and existing["thumbnail_path"]
@@ -1058,37 +1126,200 @@ class Store:
             ).fetchone()
         return dict(row) if row else None
 
+    def _delete_transaction_snapshots_locked(self, snapshot_ids: list[int]) -> None:
+        if not snapshot_ids:
+            return
+        self._db.executemany(
+            "DELETE FROM transaction_feed_snapshots WHERE id = ?",
+            ((snapshot_id,) for snapshot_id in snapshot_ids),
+        )
+
+    def _trim_transaction_order_history_locked(
+        self, keep_snapshot_id: int | None = None
+    ) -> bool:
+        """Retain only history needed by bounded, active feed snapshots."""
+        keep_retained = True
+        while True:
+            oldest = self._db.execute(
+                "SELECT id, order_revision FROM transaction_feed_snapshots "
+                "ORDER BY order_revision, last_accessed_at, id LIMIT 1"
+            ).fetchone()
+            if oldest is None:
+                self._db.execute("DELETE FROM transaction_feed_order_history")
+                return keep_retained
+
+            self._db.execute(
+                "DELETE FROM transaction_feed_order_history "
+                "WHERE order_revision <= ?",
+                (oldest["order_revision"],),
+            )
+            history_count = self._db.execute(
+                "SELECT COUNT(*) AS count FROM transaction_feed_order_history"
+            ).fetchone()["count"]
+            if history_count <= MAX_TRANSACTION_ORDER_HISTORY:
+                return keep_retained
+
+            # Too many timestamp corrections are still needed by the oldest
+            # snapshot. Expire it, then reclaim versions no remaining token
+            # can observe. This keeps the history table hard bounded.
+            self._delete_transaction_snapshots_locked([oldest["id"]])
+            if oldest["id"] == keep_snapshot_id:
+                keep_retained = False
+
+    def _prune_transaction_snapshots_locked(
+        self,
+        now: float,
+        keep_snapshot_id: int | None = None,
+    ) -> bool:
+        """Expire idle/LRU snapshots and bound retained timestamp history."""
+        rows = self._db.execute(
+            "SELECT id, last_accessed_at FROM transaction_feed_snapshots "
+            "ORDER BY last_accessed_at DESC, id DESC"
+        ).fetchall()
+        cutoff = now - TRANSACTION_SNAPSHOT_TTL_SECONDS
+        eligible = [row for row in rows if row["last_accessed_at"] >= cutoff]
+        retained_ids: list[int] = []
+        if keep_snapshot_id is not None and any(
+            row["id"] == keep_snapshot_id for row in eligible
+        ):
+            retained_ids.append(keep_snapshot_id)
+        for row in eligible:
+            if row["id"] in retained_ids:
+                continue
+            if len(retained_ids) >= MAX_TRANSACTION_SNAPSHOTS:
+                break
+            retained_ids.append(row["id"])
+        retained = set(retained_ids)
+        self._delete_transaction_snapshots_locked(
+            [row["id"] for row in rows if row["id"] not in retained]
+        )
+        keep_retained = (
+            keep_snapshot_id is None or keep_snapshot_id in retained
+        )
+        history_kept = self._trim_transaction_order_history_locked(
+            keep_snapshot_id=keep_snapshot_id
+        )
+        return keep_retained and history_kept
+
     def list_transactions_page(
         self,
         limit: int = 50,
         offset: int = 0,
-        snapshot_rowid: int | None = None,
+        snapshot_id: int | None = None,
     ) -> tuple[list[dict], int]:
-        """List a stable page and the maximum rowid visible to that snapshot."""
+        """List a page in the durable chronological order of one snapshot."""
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
+        expired = False
+        rows: list[sqlite3.Row] = []
         with self._lock:
-            if snapshot_rowid is None:
-                boundary = self._db.execute(
-                    "SELECT COALESCE(MAX(rowid), 0) AS rowid FROM transactions"
-                ).fetchone()
-                snapshot_rowid = int(boundary["rowid"])
-            else:
-                snapshot_rowid = max(
-                    0,
-                    min(int(snapshot_rowid), (1 << 63) - 1),
-                )
-            rows = self._db.execute(
-                "SELECT t.*, COALESCE(r.attempts, 0) AS thumbnail_retry_attempts "
-                "FROM transactions t LEFT JOIN thumbnail_retries r "
-                "ON r.transaction_id = t.id WHERE t.rowid <= ? "
-                "ORDER BY t.ts_ms DESC, t.id DESC LIMIT ? OFFSET ?",
-                (snapshot_rowid, limit, offset),
-            ).fetchall()
-        return [dict(r) for r in rows], snapshot_rowid
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                now = time.time()
+                snapshot = None
+                if snapshot_id is None:
+                    self._prune_transaction_snapshots_locked(now)
+                    state = self._db.execute(
+                        "SELECT order_revision FROM transaction_feed_state "
+                        "WHERE singleton = 1"
+                    ).fetchone()
+                    boundary = self._db.execute(
+                        "SELECT COALESCE(MAX(rowid), 0) AS rowid FROM transactions"
+                    ).fetchone()
+                    revision = int(state["order_revision"])
+                    rowid_boundary = int(boundary["rowid"])
+                    snapshot = self._db.execute(
+                        "SELECT * FROM transaction_feed_snapshots "
+                        "WHERE order_revision = ? AND rowid_boundary = ?",
+                        (revision, rowid_boundary),
+                    ).fetchone()
+                    if snapshot is None:
+                        cursor = self._db.execute(
+                            "INSERT INTO transaction_feed_snapshots "
+                            "(order_revision, rowid_boundary, created_at, "
+                            "last_accessed_at) VALUES (?, ?, ?, ?)",
+                            (revision, rowid_boundary, now, now),
+                        )
+                        snapshot_id = int(cursor.lastrowid)
+                        snapshot = self._db.execute(
+                            "SELECT * FROM transaction_feed_snapshots WHERE id = ?",
+                            (snapshot_id,),
+                        ).fetchone()
+                    else:
+                        snapshot_id = int(snapshot["id"])
+                else:
+                    snapshot_id = max(
+                        0,
+                        min(int(snapshot_id), (1 << 63) - 1),
+                    )
+                    snapshot = self._db.execute(
+                        "SELECT * FROM transaction_feed_snapshots WHERE id = ?",
+                        (snapshot_id,),
+                    ).fetchone()
+                    if (
+                        snapshot is None
+                        or snapshot["last_accessed_at"]
+                        < now - TRANSACTION_SNAPSHOT_TTL_SECONDS
+                    ):
+                        if snapshot is not None:
+                            self._delete_transaction_snapshots_locked([snapshot_id])
+                        self._prune_transaction_snapshots_locked(now)
+                        expired = True
+
+                if not expired:
+                    self._db.execute(
+                        "UPDATE transaction_feed_snapshots "
+                        "SET last_accessed_at = ? WHERE id = ?",
+                        (now, snapshot_id),
+                    )
+                    if not self._prune_transaction_snapshots_locked(
+                        now, keep_snapshot_id=snapshot_id
+                    ):
+                        expired = True
+
+                if not expired:
+                    has_later_timestamp_change = self._db.execute(
+                        "SELECT 1 FROM transaction_feed_order_history "
+                        "WHERE order_revision > ? LIMIT 1",
+                        (snapshot["order_revision"],),
+                    ).fetchone()
+                    if has_later_timestamp_change:
+                        rows = self._db.execute(
+                            "SELECT t.*, COALESCE(r.attempts, 0) AS thumbnail_retry_attempts "
+                            "FROM transactions t LEFT JOIN thumbnail_retries r "
+                            "ON r.transaction_id = t.id "
+                            "WHERE t.rowid <= ? "
+                            "ORDER BY COALESCE((SELECT h.ts_ms "
+                            "FROM transaction_feed_order_history h "
+                            "WHERE h.transaction_id = t.id "
+                            "AND h.order_revision > ? "
+                            "ORDER BY h.order_revision LIMIT 1), t.ts_ms) DESC, "
+                            "t.id DESC LIMIT ? OFFSET ?",
+                            (
+                                snapshot["rowid_boundary"],
+                                snapshot["order_revision"],
+                                limit,
+                                offset,
+                            ),
+                        ).fetchall()
+                    else:
+                        rows = self._db.execute(
+                            "SELECT t.*, COALESCE(r.attempts, 0) AS thumbnail_retry_attempts "
+                            "FROM transactions t LEFT JOIN thumbnail_retries r "
+                            "ON r.transaction_id = t.id WHERE t.rowid <= ? "
+                            "ORDER BY t.ts_ms DESC, t.id DESC LIMIT ? OFFSET ?",
+                            (snapshot["rowid_boundary"], limit, offset),
+                        ).fetchall()
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        if expired:
+            raise TransactionSnapshotExpired("Transaction page snapshot expired")
+        return [dict(r) for r in rows], int(snapshot_id)
 
     def list_transactions(self, limit: int = 50, offset: int = 0) -> list[dict]:
-        rows, _snapshot_rowid = self.list_transactions_page(limit, offset)
+        rows, _snapshot_id = self.list_transactions_page(limit, offset)
         return rows
 
     def get_observed_devices(self) -> list[dict]:

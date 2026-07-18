@@ -828,6 +828,85 @@ def test_transaction_snapshot_keeps_offset_pages_stable_during_inserts(authed):
     )
     assert all(not txn["id"].startswith("PAY_NEW_") for txn in next_page)
 
+
+def test_transaction_snapshot_keeps_timestamp_corrections_in_original_order(authed):
+    store = authed.app.state.store
+
+    def transaction(txn_id: str, ts_ms: int, updated_ts_ms: int) -> dict:
+        return {
+            "id": txn_id,
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "ts_ms": ts_ms,
+            "updated_at": "2026-07-16T15:30:00.000Z",
+            "updated_ts_ms": updated_ts_ms,
+            "amount": 100,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        }
+
+    store.upsert_transaction(transaction("A", 300, 1))
+    store.upsert_transaction(transaction("B", 200, 1))
+    store.upsert_transaction(transaction("C", 100, 1))
+
+    first_response = authed.get("/api/transactions?limit=2&offset=0")
+    snapshot = first_response.headers["x-transaction-snapshot"]
+    assert [txn["id"] for txn in first_response.json()] == ["A", "B"]
+
+    # C moves ahead of both visible rows after page one was issued. Its old
+    # ordering key remains part of that durable snapshot, so OFFSET 2 neither
+    # repeats B nor loses C.
+    store.upsert_transaction(transaction("C", 400, 2))
+    second_response = authed.get(
+        f"/api/transactions?limit=2&offset=2&snapshot={snapshot}"
+    )
+    assert second_response.headers["x-transaction-snapshot"] == snapshot
+    assert [txn["id"] for txn in second_response.json()] == ["C"]
+    assert [txn["id"] for txn in first_response.json() + second_response.json()] == [
+        "A",
+        "B",
+        "C",
+    ]
+
+    refreshed = authed.get("/api/transactions?limit=2&offset=0")
+    assert int(refreshed.headers["x-transaction-snapshot"]) > int(snapshot)
+    assert [txn["id"] for txn in refreshed.json()] == ["C", "A"]
+
+
+def test_expired_transaction_snapshot_returns_conflict(authed):
+    store = authed.app.state.store
+    store.upsert_transaction(
+        {
+            "id": "PAY_EXPIRED_PAGE",
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "ts_ms": 100,
+            "amount": 100,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        }
+    )
+    first_response = authed.get("/api/transactions?limit=1&offset=0")
+    snapshot = int(first_response.headers["x-transaction-snapshot"])
+    with store._lock:
+        store._db.execute(
+            "UPDATE transaction_feed_snapshots SET last_accessed_at = 0 "
+            "WHERE id = ?",
+            (snapshot,),
+        )
+        store._db.commit()
+
+    expired = authed.get(
+        f"/api/transactions?limit=1&offset=1&snapshot={snapshot}"
+    )
+    assert expired.status_code == 409
+    assert "return to the newest page" in expired.json()["detail"]
+
+    refreshed = authed.get("/api/transactions?limit=1&offset=0")
+    assert refreshed.status_code == 200
+    assert int(refreshed.headers["x-transaction-snapshot"]) > snapshot
+
+
 def test_transactions_without_camera_mapping_still_listed(authed):
     authed.put(
         "/api/settings/square",

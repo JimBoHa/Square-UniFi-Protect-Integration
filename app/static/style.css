@@ -78,3 +78,15 @@ button[type="submit"], #save-mapping, #sync-now {
   .pagination .hint { order: -1; flex-basis: 100%; max-width: none; }
   .pagination button { flex: 1 1 0; }
 }
+
+.conn-status {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  font-size: 0.8rem; font-weight: 400; margin-left: 0.75rem; opacity: 0.9;
+}
+.conn-dot {
+  width: 0.6rem; height: 0.6rem; border-radius: 50%;
+  background: #999; flex-shrink: 0;
+}
+.conn-status.ok .conn-dot { background: #2a9d3a; }
+.conn-status.bad .conn-dot { background: #d33; }
+.conn-status.checking .conn-dot { background: #e6a700; }

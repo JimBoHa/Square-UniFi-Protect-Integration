@@ -227,7 +227,33 @@ $("#square-form").addEventListener("submit", async (e) => {
   }
 });
 
+function setConnStatus(id, state, text) {
+  const el = $(id);
+  el.hidden = false;
+  el.className = `conn-status ${state}`;
+  el.querySelector(".conn-text").textContent = text;
+}
+
+async function refreshSquareStatus() {
+  setConnStatus("#square-status", "checking", "Checking…");
+  try {
+    const health = await api("/api/health/square");
+    if (!health.configured) {
+      setConnStatus("#square-status", "", "Not connected");
+    } else if (health.ok) {
+      setConnStatus("#square-status", "ok", health.detail);
+    } else {
+      setConnStatus("#square-status", "bad", health.detail);
+    }
+  } catch (err) {
+    setConnStatus("#square-status", "bad", err.message);
+  }
+}
+
 async function fetchSettingsView() {
+  // Connection indicators refresh alongside every settings load; they render
+  // into their own elements, so they need no stale-load generation guard.
+  void refreshSquareStatus();
   let cameras = [], locations = [], mappings = [], devices = [];
   loadDeepLinkSettings();
   try { cameras = await api("/api/cameras"); } catch { /* Protect not configured yet */ }

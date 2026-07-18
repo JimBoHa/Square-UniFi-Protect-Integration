@@ -1875,3 +1875,42 @@ def test_webhook_ignores_non_payment_events(configured):
     )
     assert resp.status_code == 200
     assert resp.json().get("ignored") is True
+
+
+# -- Square connection health indicator ----------------------------------------------
+
+def test_square_health_unconfigured(authed):
+    health = authed.get("/api/health/square").json()
+    assert health == {"configured": False, "ok": False, "detail": "Not configured"}
+
+def test_square_health_connected(configured):
+    health = configured.get("/api/health/square").json()
+    assert health["configured"] is True
+    assert health["ok"] is True
+    assert health["locations"] == 1
+    assert "Connected" in health["detail"]
+
+def test_square_health_reports_revoked_token(configured, monkeypatch):
+    from app.square_client import SquareAuthError, SquareClient
+
+    def rejected(_self):
+        raise SquareAuthError("Square rejected the access token")
+
+    monkeypatch.setattr(SquareClient, "list_locations", rejected)
+    health = configured.get("/api/health/square").json()
+    assert health["configured"] is True
+    assert health["ok"] is False
+    assert "rejected" in health["detail"]
+
+def test_square_health_requires_auth(client):
+    assert client.get("/api/health/square").status_code == 401
+
+def test_square_status_indicator_ui_wiring():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js = (static_dir / "app.js").read_text()
+    html = (static_dir / "index.html").read_text()
+    assert 'api("/api/health/square")' in js
+    assert "refreshSquareStatus" in js
+    assert 'id="square-status"' in html

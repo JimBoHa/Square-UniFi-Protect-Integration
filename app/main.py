@@ -595,6 +595,27 @@ def create_app(
         finally:
             client.close()
 
+    @app.get("/api/health/square")
+    def square_health(_=authed) -> dict:
+        """Live connectivity check so the UI can show a trustworthy indicator."""
+        client = build_square()
+        if client is None:
+            return {"configured": False, "ok": False, "detail": "Not configured"}
+        try:
+            locations = client.list_locations()
+        except SquareAuthError as exc:
+            return {"configured": True, "ok": False, "detail": str(exc)}
+        except SquareError as exc:
+            return {"configured": True, "ok": False, "detail": str(exc)}
+        finally:
+            client.close()
+        return {
+            "configured": True,
+            "ok": True,
+            "locations": len(locations),
+            "detail": f"Connected — {len(locations)} location(s)",
+        }
+
     @app.get("/api/locations")
     def locations(_=authed) -> list[dict]:
         client = require_square()

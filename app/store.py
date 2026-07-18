@@ -288,6 +288,7 @@ class Store:
         # switches therefore cannot overlap in-flight evidence work or acquire
         # provider-specific locks in opposing orders across processes.
         self._integration_lock_path = self.data_dir / ".provider-state.lock"
+        self._protect_settings_lock_path = self.data_dir / ".protect-settings.lock"
         key_path = self.data_dir / "secret.key"
         if key_path.is_file() and not key_path.is_symlink():
             key_path.chmod(0o600)
@@ -356,10 +357,10 @@ class Store:
                 logger.warning("Could not resume orphan thumbnail cleanup: %s", exc)
 
     @contextmanager
-    def integration_guard(self, *, exclusive: bool = False):
-        """Coordinate provider work across threads, Store objects, and processes."""
+    def _cross_process_guard(self, lock_path: Path, *, exclusive: bool):
+        """Acquire one shared/exclusive file lock on every supported platform."""
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-        fd = os.open(self._integration_lock_path, flags, 0o600)
+        fd = os.open(lock_path, flags, 0o600)
         windows_lock: tuple[tuple[int, ...], bool] | None = None
         posix_locked = False
         try:
@@ -386,6 +387,29 @@ class Store:
                 # Closing is the fail-safe release for every OS lock still
                 # associated with this descriptor if explicit unlock failed.
                 os.close(fd)
+
+    @contextmanager
+    def integration_guard(self, *, exclusive: bool = False):
+        """Coordinate provider work across threads, Store objects, and processes."""
+        with self._cross_process_guard(
+            self._integration_lock_path,
+            exclusive=exclusive,
+        ):
+            yield
+
+    @contextmanager
+    def protect_settings_guard(self):
+        """Serialize Protect settings mutations without blocking provider reads.
+
+        Code needing both locks must acquire this mutation guard first and the
+        integration writer second. Provider work never takes this lock, which
+        keeps the lock order acyclic while network validation is in progress.
+        """
+        with self._cross_process_guard(
+            self._protect_settings_lock_path,
+            exclusive=True,
+        ):
+            yield
 
     def _thumbnail_file_exists(self, name: str) -> bool:
         path = (self.thumbnail_dir / name).resolve()

@@ -2,6 +2,7 @@
 
 import base64
 import concurrent.futures
+from contextlib import contextmanager
 import hashlib
 import hmac
 import json
@@ -1704,6 +1705,37 @@ def _wait_for_protect_jobs(client, timeout: float = 3.0) -> None:
     raise AssertionError("webhook Protect work did not finish")
 
 
+def _observe_exclusive_integration_attempt(store: Store) -> threading.Event:
+    """Signal immediately before this Store instance tries the provider writer."""
+    attempted = threading.Event()
+    original_guard = store.integration_guard
+
+    @contextmanager
+    def observed_guard(*, exclusive: bool = False):
+        if exclusive:
+            attempted.set()
+        with original_guard(exclusive=exclusive):
+            yield
+
+    store.integration_guard = observed_guard
+    return attempted
+
+
+def _observe_protect_settings_attempt(store: Store) -> threading.Event:
+    """Signal immediately before this Store instance tries the settings mutex."""
+    attempted = threading.Event()
+    original_guard = store.protect_settings_guard
+
+    @contextmanager
+    def observed_guard():
+        attempted.set()
+        with original_guard():
+            yield
+
+    store.protect_settings_guard = observed_guard
+    return attempted
+
+
 @pytest.mark.parametrize("event_type", ["payment.created", "payment.updated"])
 def test_webhook_stores_payment_then_enriches_thumbnail(configured, event_type):
     body = make_webhook_event(event_type=event_type)
@@ -1869,10 +1901,243 @@ def test_webhook_ack_does_not_wait_for_alarm_delivery(tmp_path):
                 isolated.app.state.store.get_transaction("PAY_ALARM_BLOCKED")
                 is not None
             )
-            release_alarm.set()
+            exclusive_attempted = _observe_exclusive_integration_attempt(
+                app.state.store
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                disable_future = executor.submit(
+                    isolated.delete, "/api/settings/protect/alarm"
+                )
+                assert exclusive_attempted.wait(timeout=3)
+                with pytest.raises(concurrent.futures.TimeoutError):
+                    disable_future.result(timeout=0.05)
+                assert app.state.store.get_setting("protect.api_key") == PROTECT_API_KEY
+                release_alarm.set()
+                disabled = disable_future.result(timeout=5)
+            assert disabled.status_code == 200
+            assert app.state.store.get_setting("protect.api_key") is None
+            assert app.state.store.get_setting("protect.alarm_trigger_id") is None
             _wait_for_alarm_state(isolated, "PAY_ALARM_BLOCKED", "sent")
     finally:
         release_alarm.set()
+        app.state.store.close()
+
+
+def test_same_host_alarm_rotation_waits_for_inflight_delivery(tmp_path):
+    alarm_started = threading.Event()
+    release_alarm = threading.Event()
+    rotated_api_key = "rotated-protect-api-key"
+    rotated_trigger_id = "rotated-square-sale"
+    alarm_requests: list[tuple[str, str | None]] = []
+
+    def blocking_alarm(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/proxy/protect/integration/v1/meta/info":
+            if request.headers.get("x-api-key") not in {
+                PROTECT_API_KEY,
+                rotated_api_key,
+            }:
+                return httpx.Response(401, json={"error": "Invalid API key"})
+            return httpx.Response(200, json={"applicationVersion": "7.1.87"})
+        if "/alarm-manager/webhook/" in request.url.path:
+            alarm_requests.append(
+                (request.url.path.rsplit("/", 1)[-1], request.headers.get("x-api-key"))
+            )
+            alarm_started.set()
+            if not release_alarm.wait(timeout=10):
+                raise httpx.ReadTimeout("alarm test timed out", request=request)
+            return httpx.Response(204)
+        return protect_handler(request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(blocking_alarm),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/protect",
+                json={
+                    "host": "192.168.1.1",
+                    "username": PROTECT_USER,
+                    "password": PROTECT_PASS,
+                    "api_key": PROTECT_API_KEY,
+                    "alarm_trigger_id": PROTECT_ALARM_TRIGGER_ID,
+                },
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/square",
+                json={
+                    "access_token": SQUARE_TOKEN,
+                    "environment": "production",
+                    "webhook_signature_key": WEBHOOK_KEY,
+                    "webhook_url": WEBHOOK_URL,
+                },
+            ).status_code == 200
+
+            body = make_webhook_event(
+                "PAY_ALARM_ROTATION", created_at="2099-07-16T16:00:00.000Z"
+            )
+            assert isolated.post(
+                "/webhooks/square",
+                content=body,
+                headers={
+                    "x-square-hmacsha256-signature": _webhook_signature(body)
+                },
+            ).status_code == 200
+            assert alarm_started.wait(timeout=3)
+
+            exclusive_attempted = _observe_exclusive_integration_attempt(
+                app.state.store
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                rotation_future = executor.submit(
+                    isolated.put,
+                    "/api/settings/protect",
+                    json={
+                        "host": "192.168.1.1",
+                        "username": PROTECT_USER,
+                        "password": PROTECT_PASS,
+                        "api_key": rotated_api_key,
+                        "alarm_trigger_id": rotated_trigger_id,
+                    },
+                )
+                assert exclusive_attempted.wait(timeout=3)
+                with pytest.raises(concurrent.futures.TimeoutError):
+                    rotation_future.result(timeout=0.05)
+                assert app.state.store.get_setting("protect.api_key") == PROTECT_API_KEY
+                assert (
+                    app.state.store.get_setting("protect.alarm_trigger_id")
+                    == PROTECT_ALARM_TRIGGER_ID
+                )
+                release_alarm.set()
+                rotated = rotation_future.result(timeout=5)
+
+            assert rotated.status_code == 200, rotated.text
+            assert rotated.json()["alarm_configured"] is True
+            assert app.state.store.get_setting("protect.api_key") == rotated_api_key
+            assert (
+                app.state.store.get_setting("protect.alarm_trigger_id")
+                == rotated_trigger_id
+            )
+            assert alarm_requests == [(PROTECT_ALARM_TRIGGER_ID, PROTECT_API_KEY)]
+            _wait_for_alarm_state(isolated, "PAY_ALARM_ROTATION", "sent")
+    finally:
+        release_alarm.set()
+        app.state.store.close()
+
+
+def test_alarm_disable_waits_for_same_host_settings_probe(tmp_path):
+    block_meta_probe = threading.Event()
+    meta_probe_started = threading.Event()
+    release_meta_probe = threading.Event()
+    replacement_trigger_id = "replacement-square-sale"
+
+    def blocking_meta_probe(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/proxy/protect/integration/v1/meta/info":
+            if request.headers.get("x-api-key") != PROTECT_API_KEY:
+                return httpx.Response(401, json={"error": "Invalid API key"})
+            if block_meta_probe.is_set():
+                meta_probe_started.set()
+                if not release_meta_probe.wait(timeout=10):
+                    raise httpx.ReadTimeout("meta probe timed out", request=request)
+            return httpx.Response(200, json={"applicationVersion": "7.1.87"})
+        return protect_handler(request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(blocking_meta_probe),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/protect",
+                json={
+                    "host": "192.168.1.1",
+                    "username": PROTECT_USER,
+                    "password": PROTECT_PASS,
+                    "api_key": PROTECT_API_KEY,
+                    "alarm_trigger_id": PROTECT_ALARM_TRIGGER_ID,
+                },
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/square",
+                json={
+                    "access_token": SQUARE_TOKEN,
+                    "environment": "production",
+                    "webhook_signature_key": WEBHOOK_KEY,
+                    "webhook_url": WEBHOOK_URL,
+                },
+            ).status_code == 200
+
+            block_meta_probe.set()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                refresh_future = executor.submit(
+                    isolated.put,
+                    "/api/settings/protect",
+                    json={
+                        "host": "192.168.1.1",
+                        "username": PROTECT_USER,
+                        "password": PROTECT_PASS,
+                        "alarm_trigger_id": replacement_trigger_id,
+                    },
+                )
+                assert meta_probe_started.wait(timeout=3)
+                body = make_webhook_event(
+                    "PAY_DURING_SETTINGS_PROBE",
+                    created_at="2099-07-16T16:00:00.000Z",
+                )
+                webhook_future = executor.submit(
+                    isolated.post,
+                    "/webhooks/square",
+                    content=body,
+                    headers={
+                        "x-square-hmacsha256-signature": _webhook_signature(body)
+                    },
+                )
+                webhook_response = webhook_future.result(timeout=2)
+                assert webhook_response.status_code == 200
+                assert isolated.get("/api/transactions").status_code == 200
+                settings_attempted = _observe_protect_settings_attempt(
+                    app.state.store
+                )
+                disable_future = executor.submit(
+                    isolated.delete, "/api/settings/protect/alarm"
+                )
+                assert settings_attempted.wait(timeout=3)
+                with pytest.raises(concurrent.futures.TimeoutError):
+                    disable_future.result(timeout=0.05)
+                assert app.state.store.get_setting("protect.api_key") == PROTECT_API_KEY
+                assert (
+                    app.state.store.get_setting("protect.alarm_trigger_id")
+                    == PROTECT_ALARM_TRIGGER_ID
+                )
+                release_meta_probe.set()
+                refreshed = refresh_future.result(timeout=5)
+                disabled = disable_future.result(timeout=5)
+
+            assert refreshed.status_code == 200, refreshed.text
+            assert refreshed.json()["alarm_configured"] is True
+            assert disabled.status_code == 200, disabled.text
+            assert app.state.store.get_setting("protect.api_key") is None
+            assert app.state.store.get_setting("protect.alarm_trigger_id") is None
+    finally:
+        release_meta_probe.set()
         app.state.store.close()
 
 

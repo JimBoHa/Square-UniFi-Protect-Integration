@@ -43,6 +43,7 @@ SQUARE_ACCOUNT_REVISION_SETTING = "square.account_revision"
 SQUARE_OAUTH_APP_SETTING_KEYS = (
     "square.oauth_client_id",
     "square.oauth_client_secret",
+    "square.oauth_environment",
 )
 SQUARE_OAUTH_PENDING_SETTING_KEYS = (
     "square.oauth_pending_access_token",
@@ -57,8 +58,8 @@ SQUARE_INSTALLATION_SETTING_KEYS = (
     *SQUARE_OAUTH_APP_SETTING_KEYS,
     *SQUARE_OAUTH_PENDING_SETTING_KEYS,
     "square.oauth_state",
-    # The current release still shares this default with OAuth application
-    # setup. By itself it is not evidence that a merchant was ever connected.
+    # Legacy releases saved this before a merchant was connected. By itself it
+    # is not evidence that an account owns data on this installation.
     "square.environment",
     SQUARE_ACCOUNT_REVISION_SETTING,
 )
@@ -1294,9 +1295,12 @@ class Store:
                     # OAuth application credentials belong to this installation,
                     # not to one merchant. Keep them so an explicitly confirmed
                     # merchant switch does not disconnect the OAuth application.
+                    oauth_app_placeholders = ", ".join(
+                        "?" for _ in SQUARE_OAUTH_APP_SETTING_KEYS
+                    )
                     self._db.execute(
                         "DELETE FROM settings WHERE key LIKE 'square.%' "
-                        "AND key NOT IN (?, ?)",
+                        f"AND key NOT IN ({oauth_app_placeholders})",
                         SQUARE_OAUTH_APP_SETTING_KEYS,
                     )
                     self._db.execute(

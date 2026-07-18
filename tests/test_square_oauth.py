@@ -26,6 +26,7 @@ def make_oauth_square(state):
         if request.url.path == "/oauth2/token":
             body = json.loads(request.content)
             state["token_requests"].append(body)
+            state["token_hosts"].append(request.url.host)
             if body.get("client_secret") != CLIENT_SECRET:
                 return httpx.Response(401, json={"errors": [{"code": "UNAUTHORIZED"}]})
             suffix = "refreshed" if body.get("grant_type") == "refresh_token" else "initial"
@@ -52,7 +53,11 @@ def make_oauth_square(state):
 
 @pytest.fixture()
 def oauth_client(tmp_path):
-    state = {"token_requests": [], "expires_at": "2027-01-01T00:00:00Z"}
+    state = {
+        "token_requests": [],
+        "token_hosts": [],
+        "expires_at": "2027-01-01T00:00:00Z",
+    }
     app = create_app(
         data_dir=tmp_path / "data",
         protect_transport=httpx.MockTransport(protect_handler),
@@ -113,6 +118,8 @@ def test_full_oauth_flow_stores_tokens_and_merchant(oauth_client):
     assert store.get_setting("square.refresh_token") == "oauth-refresh-token"
     assert store.get_setting("square.merchant_id") == "MERCHANT_OAUTH"
     assert store.square_account_revision()
+    assert store.get_setting("square.environment") == "production"
+    assert store.get_setting("square.oauth_environment") == "production"
     assert state["token_requests"][0]["grant_type"] == "authorization_code"
 
     # Secrets stay encrypted at rest.
@@ -220,6 +227,7 @@ def test_oauth_different_merchant_requires_explicit_confirm_and_isolates_data(
     assert store.get_camera_mappings() == []
     assert store.get_setting("square.oauth_client_id") == CLIENT_ID
     assert store.get_setting("square.oauth_client_secret") == CLIENT_SECRET
+    assert store.get_setting("square.oauth_environment") == "production"
 
 
 def test_pending_oauth_switch_can_be_cancelled(oauth_client):
@@ -242,6 +250,77 @@ def test_pending_oauth_switch_can_be_cancelled(oauth_client):
     assert store.get_setting("square.oauth_pending_access_token") is None
     assert store.get_setting("square.merchant_id") == "MERCHANT_OLD"
     assert client.post("/api/settings/square/oauth-switch/confirm").status_code == 409
+
+
+def test_saving_oauth_app_environment_does_not_mutate_active_account(oauth_client):
+    client, _state, store = oauth_client
+    configured = store.configure_square_account(
+        merchant_id="MERCHANT_ACTIVE",
+        access_token="active-production-token",
+        environment="production",
+    )
+
+    response = client.put(
+        "/api/settings/square/oauth-app",
+        json={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "environment": "sandbox",
+        },
+    )
+    assert response.status_code == 200
+    assert store.get_setting("square.environment") == "production"
+    assert store.get_setting("square.access_token") == "active-production-token"
+    assert store.square_account_revision() == configured.account_revision
+    assert store.get_setting("square.oauth_environment") == "sandbox"
+
+    start = client.get("/oauth/square/start", follow_redirects=False)
+    assert start.status_code == 302
+    assert start.headers["location"].startswith(
+        "https://connect.squareupsandbox.com/oauth2/authorize?"
+    )
+
+
+def test_sandbox_oauth_callback_requires_and_confirms_environment_switch(oauth_client):
+    client, state, store = oauth_client
+    configured = store.configure_square_account(
+        merchant_id="MERCHANT_OAUTH",
+        access_token="active-production-token",
+        environment="production",
+    )
+    assert client.put(
+        "/api/settings/square/oauth-app",
+        json={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "environment": "sandbox",
+        },
+    ).status_code == 200
+
+    start = client.get("/oauth/square/start", follow_redirects=False)
+    oauth_state = start.headers["location"].rsplit("state=", 1)[-1]
+    callback = client.get(
+        f"/oauth/square/callback?code=auth-code-1&state={oauth_state}",
+        follow_redirects=False,
+    )
+
+    assert callback.status_code == 302
+    assert callback.headers["location"] == "/?square_oauth=switch_required"
+    assert state["token_hosts"] == ["connect.squareupsandbox.com"]
+    assert store.get_setting("square.environment") == "production"
+    assert store.get_setting("square.access_token") == "active-production-token"
+    assert store.square_account_revision() == configured.account_revision
+    assert store.get_setting("square.oauth_pending_environment") == "sandbox"
+
+    confirmed = client.post("/api/settings/square/oauth-switch/confirm")
+    assert confirmed.status_code == 200
+    assert confirmed.json()["account_switched"] is True
+    assert confirmed.json()["account_revision"] != configured.account_revision
+    assert store.get_setting("square.environment") == "sandbox"
+    assert store.get_setting("square.access_token") == "oauth-access-initial"
+    assert store.get_setting("square.oauth_environment") == "sandbox"
+    assert store.get_setting("square.oauth_client_id") == CLIENT_ID
+    assert store.get_setting("square.oauth_client_secret") == CLIENT_SECRET
 
 
 def test_callback_rejects_bad_state(oauth_client):

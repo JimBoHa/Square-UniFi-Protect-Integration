@@ -986,7 +986,9 @@ def create_app(
             {
                 "square.oauth_client_id": (body.client_id.strip(), False),
                 "square.oauth_client_secret": (body.client_secret.strip(), True),
-                "square.environment": (body.environment, False),
+                # OAuth application setup must not mutate the environment bound
+                # to an already-connected merchant and its account revision.
+                "square.oauth_environment": (body.environment, False),
             }
         )
         return {"ok": True}
@@ -994,7 +996,11 @@ def create_app(
     @app.get("/oauth/square/start")
     def square_oauth_start(_=authed) -> RedirectResponse:
         oauth = store.get_settings(
-            ("square.oauth_client_id", "square.environment")
+            (
+                "square.oauth_client_id",
+                "square.oauth_environment",
+                "square.environment",
+            )
         )
         if not oauth["square.oauth_client_id"]:
             raise HTTPException(
@@ -1007,7 +1013,9 @@ def create_app(
         store.set_setting("square.oauth_state", state)
         return RedirectResponse(
             oauth_authorize_url(
-                oauth["square.environment"] or "production",
+                oauth["square.oauth_environment"]
+                or oauth["square.environment"]
+                or "production",
                 oauth["square.oauth_client_id"],
                 state,
             ),
@@ -1035,12 +1043,18 @@ def create_app(
             (
                 "square.oauth_client_id",
                 "square.oauth_client_secret",
+                "square.oauth_environment",
                 "square.environment",
             )
         )
+        oauth_environment = (
+            oauth["square.oauth_environment"]
+            or oauth["square.environment"]
+            or "production"
+        )
         try:
             tokens = oauth_exchange(
-                oauth["square.environment"] or "production",
+                oauth_environment,
                 oauth["square.oauth_client_id"] or "",
                 oauth["square.oauth_client_secret"] or "",
                 code=code,
@@ -1062,7 +1076,7 @@ def create_app(
             raise HTTPException(status_code=502, detail="Square returned an invalid refresh token")
         if not isinstance(expires_at, str):
             raise HTTPException(status_code=502, detail="Square returned an invalid token expiry")
-        environment = oauth["square.environment"] or "production"
+        environment = oauth_environment
         try:
             with square_account_lock:
                 store.configure_square_account(

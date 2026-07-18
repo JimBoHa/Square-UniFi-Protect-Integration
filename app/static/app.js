@@ -20,8 +20,11 @@ let squareAccountRevision = "";
 let cameraMappingGeneration = "";
 
 function show(viewId) {
-  for (const sec of document.querySelectorAll("main > section")) sec.hidden = true;
-  $(viewId).hidden = false;
+  activateViewState(
+    document.querySelectorAll("main > section"),
+    $(viewId),
+    document.querySelectorAll("nav button[data-view]"),
+  );
 }
 
 function message(text, kind) {
@@ -147,8 +150,6 @@ $("#logout-btn").addEventListener("click", async () => {
 
 for (const btn of document.querySelectorAll("nav button[data-view]")) {
   btn.addEventListener("click", () => {
-    for (const b of document.querySelectorAll("nav button[data-view]"))
-      b.classList.toggle("active", b === btn);
     show(`#view-${btn.dataset.view}`);
     if (btn.dataset.view === "transactions") loadTransactions();
     if (btn.dataset.view === "settings") loadSettingsView();

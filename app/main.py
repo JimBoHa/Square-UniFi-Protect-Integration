@@ -234,53 +234,71 @@ def create_app(
         )
 
     def _maybe_refresh_oauth_token() -> None:
-        oauth = store.get_settings(
-            (
-                "square.oauth_client_id",
-                "square.oauth_client_secret",
-                "square.refresh_token",
-                "square.token_expires_at",
-                "square.environment",
+        # Serialize exchanges without taking the provider-state writer. A
+        # confirmed account switch may complete while Square is slow; the exact
+        # snapshot fence in update_square_oauth_tokens then discards this result.
+        with store.square_oauth_refresh_guard():
+            oauth = store.get_settings(
+                (
+                    "square.access_token",
+                    "square.oauth_client_id",
+                    "square.oauth_client_secret",
+                    "square.refresh_token",
+                    "square.token_expires_at",
+                    "square.environment",
+                    "square.merchant_id",
+                    "square.account_revision",
+                )
             )
-        )
-        if not (
-            oauth["square.oauth_client_id"]
-            and oauth["square.oauth_client_secret"]
-            and oauth["square.refresh_token"]
-            and oauth["square.token_expires_at"]
-        ):
-            return
-        try:
-            expires = datetime.datetime.fromisoformat(
-                oauth["square.token_expires_at"].replace("Z", "+00:00")
-            )
-        except ValueError:
-            return
-        now = datetime.datetime.now(datetime.timezone.utc)
-        if expires - now > datetime.timedelta(days=3):
-            return
-        try:
-            tokens = oauth_exchange(
-                oauth["square.environment"] or "production",
-                oauth["square.oauth_client_id"],
-                oauth["square.oauth_client_secret"],
-                refresh_token=oauth["square.refresh_token"],
-                transport=square_transport,
-            )
-        except SquareError as exc:
-            logger.warning("Square OAuth token refresh failed: %s", exc)
-            return
-        store.update_settings(
-            {
-                "square.access_token": (tokens["access_token"], True),
-                "square.refresh_token": (
-                    tokens.get("refresh_token")
-                    or oauth["square.refresh_token"],
-                    True,
-                ),
-                "square.token_expires_at": (tokens.get("expires_at", ""), False),
-            }
-        )
+            if not (
+                oauth["square.oauth_client_id"]
+                and oauth["square.oauth_client_secret"]
+                and oauth["square.refresh_token"]
+                and oauth["square.token_expires_at"]
+            ):
+                return
+            try:
+                expires = datetime.datetime.fromisoformat(
+                    oauth["square.token_expires_at"].replace("Z", "+00:00")
+                )
+            except ValueError:
+                return
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if expires - now > datetime.timedelta(days=3):
+                return
+            try:
+                tokens = oauth_exchange(
+                    oauth["square.environment"] or "production",
+                    oauth["square.oauth_client_id"],
+                    oauth["square.oauth_client_secret"],
+                    refresh_token=oauth["square.refresh_token"],
+                    transport=square_transport,
+                )
+            except SquareError as exc:
+                logger.warning("Square OAuth token refresh failed: %s", exc)
+                return
+            try:
+                store.update_square_oauth_tokens(
+                    access_token=tokens["access_token"],
+                    refresh_token=(
+                        tokens.get("refresh_token")
+                        or oauth["square.refresh_token"]
+                    ),
+                    token_expires_at=tokens.get("expires_at", ""),
+                    expected_access_token=oauth["square.access_token"],
+                    expected_refresh_token=oauth["square.refresh_token"],
+                    expected_merchant_id=oauth["square.merchant_id"],
+                    expected_environment=oauth["square.environment"],
+                    expected_account_revision=oauth["square.account_revision"],
+                    expected_oauth_client_id=oauth["square.oauth_client_id"],
+                    expected_oauth_client_secret=(
+                        oauth["square.oauth_client_secret"]
+                    ),
+                )
+            except SquareAccountChanged:
+                logger.info(
+                    "Discarded Square OAuth refresh after account settings changed"
+                )
 
     def build_square(
         settings: dict[str, str | None] | None = None,

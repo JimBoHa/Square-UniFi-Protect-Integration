@@ -1,6 +1,8 @@
 """Connect-with-Square OAuth flow tests (token endpoint mocked)."""
 
+import concurrent.futures
 import json
+import threading
 
 import httpx
 import pytest
@@ -8,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.square_client import oauth_authorize_url
+from app.store import SquareAccountSwitchRequired, Store
 
 from .conftest import (
     ADMIN_PASSWORD,
@@ -344,6 +347,14 @@ def test_expiring_token_is_refreshed_before_use(oauth_client):
         f"/oauth/square/callback?code=auth-code-1&state={oauth_state}",
         follow_redirects=False,
     )
+    assert client.put(
+        "/api/settings/square/oauth-app",
+        json={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "environment": "sandbox",
+        },
+    ).status_code == 200
     # Make the stored token look nearly expired, then trigger any Square use.
     store.set_setting("square.token_expires_at", "2020-01-01T00:00:00Z")
     state["expires_at"] = "2030-01-01T00:00:00Z"
@@ -353,6 +364,147 @@ def test_expiring_token_is_refreshed_before_use(oauth_client):
         r for r in state["token_requests"] if r.get("grant_type") == "refresh_token"
     ]
     assert refresh_calls and refresh_calls[0]["refresh_token"] == "oauth-refresh-token"
+    assert state["token_hosts"][-1] == "connect.squareup.com"
+    assert store.get_setting("square.environment") == "production"
+    assert store.get_setting("square.oauth_environment") == "sandbox"
+
+
+def test_blocked_oauth_refresh_cannot_overwrite_switched_account(tmp_path):
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+    token_a = "oauth-access-account-a"
+    token_b = "manual-access-account-b"
+    refresh_a = "oauth-refresh-account-a"
+
+    def square(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oauth2/token":
+            assert request.url.host == "connect.squareup.com"
+            body = json.loads(request.content)
+            assert body["refresh_token"] == refresh_a
+            refresh_started.set()
+            assert release_refresh.wait(timeout=5)
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "oauth-access-account-a-refreshed",
+                    "refresh_token": "oauth-refresh-account-a-new",
+                    "expires_at": "2030-01-01T00:00:00Z",
+                    "merchant_id": "MERCHANT_A",
+                },
+            )
+        if (
+            request.url.path == "/v2/locations"
+            and request.headers.get("authorization") == f"Bearer {token_b}"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "locations": [
+                        {"id": "LOC_B", "name": "Merchant B", "status": "ACTIVE"}
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    data_dir = tmp_path / "data"
+    app = create_app(
+        data_dir=data_dir,
+        protect_transport=httpx.MockTransport(protect_handler),
+        square_transport=httpx.MockTransport(square),
+        enable_poller=False,
+    )
+    second_store = None
+    try:
+        with TestClient(app) as client:
+            assert client.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert client.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            store = app.state.store
+            store.configure_square_account(
+                merchant_id="MERCHANT_A",
+                access_token=token_a,
+                environment="production",
+            )
+            store.update_settings(
+                {
+                    "square.oauth_client_id": (CLIENT_ID, False),
+                    "square.oauth_client_secret": (CLIENT_SECRET, True),
+                    "square.oauth_environment": ("sandbox", False),
+                    "square.refresh_token": (refresh_a, True),
+                    "square.token_expires_at": ("2020-01-01T00:00:00Z", False),
+                }
+            )
+            second_store = Store(data_dir)
+            with pytest.raises(SquareAccountSwitchRequired) as challenge:
+                second_store.configure_square_account(
+                    merchant_id="MERCHANT_B",
+                    access_token=token_b,
+                    environment="production",
+                )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                health_future = executor.submit(client.get, "/api/health/square")
+                assert refresh_started.wait(timeout=5)
+                switch_future = executor.submit(
+                    second_store.configure_square_account,
+                    merchant_id="MERCHANT_B",
+                    access_token=token_b,
+                    environment="production",
+                    confirm_account_switch=True,
+                    account_switch_confirmation_token=(
+                        challenge.value.confirmation_token
+                    ),
+                )
+                try:
+                    # Refresh network I/O holds no provider-state reader lock;
+                    # the confirmed account switch must finish while it is blocked.
+                    switched = switch_future.result(timeout=2)
+                finally:
+                    release_refresh.set()
+                assert switched.switched
+                health = health_future.result(timeout=5)
+
+            assert health.status_code == 200
+            assert health.json()["ok"] is True
+            assert store.get_setting("square.merchant_id") == "MERCHANT_B"
+            assert store.get_setting("square.access_token") == token_b
+            assert store.get_setting("square.refresh_token") is None
+            assert store.get_setting("square.oauth_client_id") == CLIENT_ID
+            assert store.get_setting("square.oauth_client_secret") == CLIENT_SECRET
+            assert store.get_setting("square.oauth_environment") == "sandbox"
+    finally:
+        release_refresh.set()
+        if second_store is not None:
+            second_store.close()
+        app.state.store.close()
+
+
+def test_oauth_refresh_guard_serializes_store_instances(tmp_path):
+    first = Store(tmp_path / "data")
+    second = Store(tmp_path / "data")
+    attempting = threading.Event()
+    acquired = threading.Event()
+
+    def take_second_guard() -> None:
+        attempting.set()
+        with second.square_oauth_refresh_guard():
+            acquired.set()
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        with first.square_oauth_refresh_guard():
+            future = executor.submit(take_second_guard)
+            assert attempting.wait(timeout=5)
+            assert not acquired.wait(timeout=0.1)
+        assert acquired.wait(timeout=5)
+        future.result(timeout=5)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+        first.close()
+        second.close()
 
 
 def test_oauth_endpoints_require_auth(client):

@@ -312,6 +312,9 @@ class Store:
         # provider-specific locks in opposing orders across processes.
         self._integration_lock_path = self.data_dir / ".provider-state.lock"
         self._protect_settings_lock_path = self.data_dir / ".protect-settings.lock"
+        self._square_oauth_refresh_lock_path = (
+            self.data_dir / ".square-oauth-refresh.lock"
+        )
         key_path = self.data_dir / "secret.key"
         if key_path.is_file() and not key_path.is_symlink():
             key_path.chmod(0o600)
@@ -430,6 +433,20 @@ class Store:
         """
         with self._cross_process_guard(
             self._protect_settings_lock_path,
+            exclusive=True,
+        ):
+            yield
+
+    @contextmanager
+    def square_oauth_refresh_guard(self):
+        """Serialize Square OAuth exchanges across processes.
+
+        Account switches deliberately do not take this lock: a slow token
+        endpoint must not prevent a confirmed switch. The refresh commit uses
+        an exact database snapshot fence after the network request instead.
+        """
+        with self._cross_process_guard(
+            self._square_oauth_refresh_lock_path,
             exclusive=True,
         ):
             yield
@@ -705,6 +722,67 @@ class Store:
                 self._db.rollback()
                 raise
         return alarm_activated
+
+    def update_square_oauth_tokens(
+        self,
+        *,
+        access_token: str,
+        refresh_token: str,
+        token_expires_at: str,
+        expected_access_token: str | None,
+        expected_refresh_token: str | None,
+        expected_merchant_id: str | None,
+        expected_environment: str | None,
+        expected_account_revision: str | None,
+        expected_oauth_client_id: str | None,
+        expected_oauth_client_secret: str | None,
+    ) -> None:
+        """Commit refreshed tokens only while their complete source stays current."""
+        stored_updates = (
+            (
+                "square.access_token",
+                self.cipher.encrypt(access_token),
+                1,
+            ),
+            (
+                "square.refresh_token",
+                self.cipher.encrypt(refresh_token),
+                1,
+            ),
+            ("square.token_expires_at", token_expires_at, 0),
+        )
+        expected_environment = expected_environment or "production"
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                current_environment = (
+                    self._setting_value_locked("square.environment") or "production"
+                )
+                expected_snapshot = {
+                    "square.access_token": expected_access_token,
+                    "square.refresh_token": expected_refresh_token,
+                    "square.merchant_id": expected_merchant_id,
+                    SQUARE_ACCOUNT_REVISION_SETTING: expected_account_revision,
+                    "square.oauth_client_id": expected_oauth_client_id,
+                    "square.oauth_client_secret": expected_oauth_client_secret,
+                }
+                if current_environment != expected_environment or any(
+                    self._setting_value_locked(key) != expected
+                    for key, expected in expected_snapshot.items()
+                ):
+                    raise SquareAccountChanged(
+                        "Square account changed while OAuth tokens were refreshing"
+                    )
+                self._db.executemany(
+                    "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                    "encrypted=excluded.encrypted",
+                    stored_updates,
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
 
     def update_protect_settings(
         self,

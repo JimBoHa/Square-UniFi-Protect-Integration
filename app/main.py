@@ -466,8 +466,14 @@ def create_app(
                 status_code=422,
                 detail="clear_webhook cannot be combined with new webhook credentials",
             )
+        # Interactive save: keep rate-limit retries short so the browser isn't
+        # left waiting behind the poller's more patient defaults.
         client = SquareClient(
-            body.access_token, environment=body.environment, transport=square_transport
+            body.access_token,
+            environment=body.environment,
+            transport=square_transport,
+            rate_limit_max_retries=1,
+            rate_limit_max_delay=2.0,
         )
         try:
             try:

@@ -44,10 +44,14 @@ class SquareClient:
         environment: str = "production",
         transport: httpx.BaseTransport | None = None,
         timeout: float = 15.0,
+        rate_limit_max_retries: int = RATE_LIMIT_MAX_RETRIES,
+        rate_limit_max_delay: float = RATE_LIMIT_MAX_DELAY_SECONDS,
     ):
         if environment not in BASE_URLS:
             raise ValueError("environment must be 'production' or 'sandbox'")
         self.environment = environment
+        self.rate_limit_max_retries = rate_limit_max_retries
+        self.rate_limit_max_delay = rate_limit_max_delay
         self._client = httpx.Client(
             base_url=BASE_URLS[environment],
             headers={
@@ -69,7 +73,7 @@ class SquareClient:
                 resp = self._client.get(path, params=params)
             except httpx.RequestError as exc:
                 raise SquareError("Network error while contacting Square") from exc
-            if resp.status_code != 429 or attempt >= RATE_LIMIT_MAX_RETRIES:
+            if resp.status_code != 429 or attempt >= self.rate_limit_max_retries:
                 break
             delay = self._rate_limit_delay(resp, attempt)
             logger.warning(
@@ -93,8 +97,10 @@ class SquareClient:
             raise SquareError("Square returned an invalid response")
         return data
 
-    @staticmethod
-    def _rate_limit_delay(resp: httpx.Response, attempt: int) -> float:
+    def _rate_limit_delay(self, resp: httpx.Response, attempt: int) -> float:
+        # Retry-After may also arrive as an HTTP-date; that form falls back to
+        # exponential backoff below.
+        max_delay = self.rate_limit_max_delay
         retry_after = resp.headers.get("retry-after")
         if retry_after is not None:
             try:
@@ -102,13 +108,13 @@ class SquareClient:
             except ValueError:
                 requested_delay = -1.0
             if math.isfinite(requested_delay) and requested_delay >= 0:
-                return min(requested_delay, RATE_LIMIT_MAX_DELAY_SECONDS)
+                return min(requested_delay, max_delay)
         backoff = min(
             RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** max(0, attempt)),
-            RATE_LIMIT_MAX_DELAY_SECONDS,
+            max_delay,
         )
         jitter = random.uniform(0, backoff * 0.25)
-        return min(backoff + jitter, RATE_LIMIT_MAX_DELAY_SECONDS)
+        return min(backoff + jitter, max_delay)
 
     @staticmethod
     def _object_list(data: dict, key: str) -> list[dict]:

@@ -8,6 +8,7 @@ import json
 import sqlite3
 import threading
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -768,6 +769,48 @@ def test_sync_persists_transactions_when_thumbnail_write_fails(configured, tmp_p
 
 def test_thumbnail_missing_returns_404(configured):
     assert configured.get("/api/thumbnails/NOPE").status_code == 404
+
+
+def test_thumbnail_disappearance_after_validation_returns_404_and_requeues(
+    configured, monkeypatch
+):
+    assert configured.post("/api/sync").status_code == 200
+    txn = configured.get("/api/transactions").json()[0]
+    store = configured.app.state.store
+    stored_txn = store.get_transaction(txn["id"])
+    original_thumbnail_path = stored_txn["thumbnail_path"]
+    thumbnail_path = (store.thumbnail_dir / original_thumbnail_path).resolve()
+    original_is_file = Path.is_file
+    disappeared = False
+
+    def unlink_after_validation(path):
+        nonlocal disappeared
+        exists = original_is_file(path)
+        if path == thumbnail_path and exists and not disappeared:
+            path.unlink()
+            disappeared = True
+        return exists
+
+    requeue_calls = []
+    original_requeue = store.requeue_missing_thumbnail
+
+    def requeue_without_starting_worker(txn_id, expected_path):
+        requeued = original_requeue(txn_id, expected_path)
+        requeue_calls.append((txn_id, expected_path, requeued))
+        # Keep the durable state deterministic for this assertion instead of
+        # letting the background worker immediately recapture the image.
+        return False
+
+    monkeypatch.setattr(Path, "is_file", unlink_after_validation)
+    monkeypatch.setattr(store, "requeue_missing_thumbnail", requeue_without_starting_worker)
+
+    response = configured.get(txn["thumbnail_url"])
+
+    assert disappeared is True
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Thumbnail not found"
+    assert requeue_calls == [(txn["id"], original_thumbnail_path, True)]
+    assert store.get_transaction(txn["id"])["thumbnail_path"] is None
 
 
 # -- Square webhook ---------------------------------------------------------------------

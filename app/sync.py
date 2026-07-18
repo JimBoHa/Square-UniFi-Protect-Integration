@@ -6,8 +6,10 @@ import hashlib
 import logging
 import os
 import re
+import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 
@@ -41,9 +43,14 @@ def safe_thumbnail_name(payment_id: str) -> str:
 
 
 def write_thumbnail(path, image: bytes) -> None:
-    """Write private camera evidence regardless of the process umask."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags, 0o600)
+    """Atomically replace private camera evidence with a complete image."""
+    target = Path(path)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+    )
+    temp_path = Path(temp_name)
     try:
         os.fchmod(fd, 0o600)
         view = memoryview(image)
@@ -52,8 +59,25 @@ def write_thumbnail(path, image: bytes) -> None:
             if written <= 0:
                 raise OSError("Could not write thumbnail")
             view = view[written:]
-    finally:
+        # os.write is unbuffered; fsync makes the complete temporary image
+        # durable before it can become the path referenced by SQLite.
+        os.fsync(fd)
         os.close(fd)
+        fd = -1
+        os.replace(temp_path, target)
+    except BaseException:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "Could not remove failed thumbnail temp %s: %s", temp_path, exc
+            )
+        raise
 
 
 def versioned_thumbnail_name(

@@ -227,15 +227,21 @@ $("#square-form").addEventListener("submit", async (e) => {
   }
 });
 
-async function loadSettingsView() {
-  const rows = $("#mapping-rows");
-  rows.textContent = "";
+async function fetchSettingsView() {
   let cameras = [], locations = [], mappings = [], devices = [];
   loadDeepLinkSettings();
   try { cameras = await api("/api/cameras"); } catch { /* Protect not configured yet */ }
   try { locations = await api("/api/locations"); } catch { /* Square not configured yet */ }
   try { devices = await api("/api/pos-devices"); } catch { /* No observed devices yet */ }
-  try { mappings = await api("/api/camera-mapping"); } catch { return; }
+  try { mappings = await api("/api/camera-mapping"); } catch { return null; }
+  return { cameras, locations, mappings, devices };
+}
+
+function renderSettingsView(settings) {
+  const rows = $("#mapping-rows");
+  rows.textContent = "";
+  if (settings === null) return;
+  const { cameras, locations, mappings, devices } = settings;
 
   if (!cameras.length || !locations.length) {
     const p = document.createElement("p");
@@ -301,6 +307,11 @@ async function loadSettingsView() {
     }
   }
 }
+
+const loadSettingsView = createLatestSettingsLoader(
+  fetchSettingsView,
+  renderSettingsView,
+);
 
 function previewCamera(cameraId) {
   const wrap = $("#camera-preview-wrap");

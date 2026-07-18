@@ -343,7 +343,9 @@ function transactionRefreshAllowed() {
 function refreshTransactionsIfVisible() {
   // Offset pages would shift when new sales arrive. Keep older pages stable;
   // returning to the newest page resumes the normal live refresh.
-  if (transactionRefreshAllowed()) void loadTransactions({ reset: true });
+  if (transactionRefreshAllowed()) {
+    void loadTransactions({ reset: true, background: true });
+  }
 }
 
 function startTransactionRefresh() {
@@ -451,7 +453,11 @@ function renderTransactions(txns) {
   }
 }
 
-async function loadTransactions({ reset = false, offset = transactionOffset } = {}) {
+async function loadTransactions({
+  reset = false,
+  offset = transactionOffset,
+  background = false,
+} = {}) {
   const requestedOffset = reset ? 0 : Math.max(0, offset);
   if (transactionLoadInFlight) {
     // Coalesce refreshes but retain the latest requested page. In particular,
@@ -481,7 +487,9 @@ async function loadTransactions({ reset = false, offset = transactionOffset } = 
       transactionSnapshot = null;
       transactionPendingOffset = 0;
       message("Transaction page refreshed to the newest results.", "");
-    } else {
+    } else if (!background) {
+      // Timer-driven refreshes stay quiet so a transient fetch error cannot
+      // overwrite an unrelated status message (e.g. a settings save result).
       message(err.message, "error");
     }
   } finally {

@@ -694,6 +694,21 @@ function updateTransactionPagination(loading = false) {
   }
 }
 
+function protectTimelineLink(txn, content) {
+  const link = document.createElement("a");
+  link.className = "thumbnail-link";
+  link.href = txn.deep_link;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.setAttribute(
+    "aria-label",
+    `Open UniFi Protect footage for transaction at ${new Date(txn.ts_ms).toLocaleString()}`,
+  );
+  link.title = "Open UniFi Protect timeline at this moment";
+  link.appendChild(content);
+  return link;
+}
+
 function renderTransactions(txns) {
   const list = $("#txn-list");
   list.textContent = "";
@@ -715,18 +730,7 @@ function renderTransactions(txns) {
       image.src = txn.thumbnail_url;
       image.alt = "POS camera at time of transaction";
       if (txn.deep_link) {
-        const link = document.createElement("a");
-        link.className = "thumbnail-link";
-        link.href = txn.deep_link;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        link.setAttribute(
-          "aria-label",
-          `Open UniFi Protect footage for transaction at ${new Date(txn.ts_ms).toLocaleString()}`,
-        );
-        link.title = "Open UniFi Protect timeline at this moment";
-        link.appendChild(image);
-        thumb = link;
+        thumb = protectTimelineLink(txn, image);
       } else {
         thumb = image;
       }
@@ -739,6 +743,9 @@ function renderTransactions(txns) {
         retrying: "capture retrying",
       };
       thumb.textContent = thumbnailLabels[txn.thumbnail_status] || "no footage";
+      if (txn.deep_link) {
+        thumb = protectTimelineLink(txn, thumb);
+      }
     }
 
     const amount = document.createElement("div");

@@ -36,6 +36,63 @@
       </form>
     </section>
 
+    <!-- First-run wizard -->
+    <section id="view-wizard" hidden>
+      <div class="wizard-progress" aria-hidden="true">
+        <span class="wiz-dot" data-step="1"></span>
+        <span class="wiz-dot" data-step="2"></span>
+        <span class="wiz-dot" data-step="3"></span>
+        <span class="wiz-dot" data-step="4"></span>
+      </div>
+
+      <div class="wiz-step" data-step="1" hidden>
+        <h2>Step 1 of 4 — Connect UniFi Protect</h2>
+        <p class="hint">Enter your console's IP address and a local Protect user.
+          A dedicated view-only account is recommended.</p>
+        <form id="wiz-protect-form">
+          <label>Host / IP <input id="wiz-protect-host" placeholder="192.168.1.1" required></label>
+          <label>Username <input id="wiz-protect-username" autocomplete="off" required></label>
+          <label>Password <input type="password" id="wiz-protect-password" required></label>
+          <button type="submit">Connect Protect</button>
+        </form>
+      </div>
+
+      <div class="wiz-step" data-step="2" hidden>
+        <h2>Step 2 of 4 — Connect Square</h2>
+        <p class="hint">Paste an access token from the Square Developer Dashboard
+          (Credentials page). Use the Sandbox token to try things out safely.</p>
+        <form id="wiz-square-form">
+          <label>Access token <input type="password" id="wiz-square-token" autocomplete="off" required></label>
+          <label>Environment
+            <select id="wiz-square-env">
+              <option value="production">Production</option>
+              <option value="sandbox">Sandbox</option>
+            </select>
+          </label>
+          <button type="submit">Connect Square</button>
+        </form>
+      </div>
+
+      <div class="wiz-step" data-step="3" hidden>
+        <h2>Step 3 of 4 — Choose the POS camera</h2>
+        <p class="hint">Pick which camera watches the register at each location.</p>
+        <div id="wiz-mapping-rows"></div>
+        <button id="wiz-save-mapping">Save camera selection</button>
+      </div>
+
+      <div class="wiz-step" data-step="4" hidden>
+        <h2>You're all set</h2>
+        <p>Transactions will appear in the feed with camera thumbnails.
+          Press <em>Sync now</em> on the Transactions page for an immediate
+          backfill; webhooks and the background poller keep it current.</p>
+        <button id="wiz-finish">Open the transaction feed</button>
+      </div>
+
+      <p class="wiz-nav">
+        <a href="#" id="wiz-skip">Skip setup — I'll use the Settings page instead</a>
+      </p>
+    </section>
+
     <!-- Settings -->
     <section id="view-settings" hidden>
       <h2>UniFi Protect console

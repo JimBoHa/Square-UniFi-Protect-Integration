@@ -512,3 +512,18 @@ def test_frontend_only_treats_session_401_as_logout():
     assert 'data.detail === "Authentication required"' in js
     # The redirect decision must consider the parsed body, not status alone.
     assert 'resp.status === 401 && path !== "/api/login") {' not in js
+
+def test_setup_wizard_ui_wiring():
+    from pathlib import Path
+
+    static_dir = Path(__file__).parent.parent / "app" / "static"
+    js = (static_dir / "app.js").read_text()
+    html = (static_dir / "index.html").read_text()
+    assert 'id="view-wizard"' in html
+    for step in ("1", "2", "3", "4"):
+        assert f'data-step="{step}"' in html
+    assert "maybeStartWizard" in js
+    assert "enterAppOrWizard" in js
+    assert "buildMappingRows" in js  # shared with Settings, not duplicated
+    assert js.count("function buildMappingRows") == 1
+    assert 'id="wiz-skip"' in html

@@ -70,7 +70,7 @@ async function boot() {
   // Probe an authed endpoint to see if we already have a session.
   try {
     await api("/api/camera-mapping");
-    enterApp();
+    await enterAppOrWizard();
   } catch {
     /* api() already routed to login view */
   }
@@ -83,6 +83,15 @@ function enterApp() {
   loadSettingsView();
   startTransactionRefresh();
   startDashboardRefresh();
+}
+
+async function enterAppOrWizard() {
+  if (await maybeStartWizard()) {
+    startTransactionRefresh();
+    void loadTransactions({ reset: true });
+    return;
+  }
+  enterApp();
 }
 
 // ---------------------------------------------------------------- auth
@@ -110,7 +119,7 @@ $("#login-form").addEventListener("submit", async (e) => {
     });
     $("#login-password").value = "";
     message("", "");
-    enterApp();
+    await enterAppOrWizard();
   } catch (err) {
     message(err.message, "error");
   }
@@ -325,6 +334,10 @@ async function fetchSettingsView() {
   // into their own elements, so they need no stale-load generation guard.
   void refreshSquareStatus();
   void refreshProtectStatus();
+  return fetchMappingData();
+}
+
+async function fetchMappingData() {
   let cameras = [], locations = [], mappings = [], devices = [];
   loadDeepLinkSettings();
   try { cameras = await api("/api/cameras"); } catch { /* Protect not configured yet */ }
@@ -334,21 +347,17 @@ async function fetchSettingsView() {
   return { cameras, locations, mappings, devices };
 }
 
-function renderSettingsView(settings) {
-  const rows = $("#mapping-rows");
-  rows.textContent = "";
-  if (settings === null) return;
-  const { cameras, locations, mappings, devices } = settings;
 
+function buildMappingRows(container, data) {
+  const { cameras, locations, mappings, devices } = data;
+  container.textContent = "";
   if (!cameras.length || !locations.length) {
     const p = document.createElement("p");
     p.className = "hint";
     p.textContent = "Connect both UniFi Protect and Square above to choose the POS camera.";
-    rows.appendChild(p);
-    $("#save-mapping").hidden = true;
-    return;
+    container.appendChild(p);
+    return false;
   }
-  $("#save-mapping").hidden = false;
   const mappingKey = (locationId, deviceId = "") =>
     JSON.stringify([locationId, deviceId || ""]);
   const current = new Map(mappings.map((m) => [
@@ -400,9 +409,33 @@ function renderSettingsView(settings) {
       select.addEventListener("change", () => previewCamera(select.value));
       row.appendChild(label);
       row.appendChild(select);
-      rows.appendChild(row);
+      container.appendChild(row);
     }
   }
+  return true;
+}
+
+function collectMappings(container) {
+  const mappings = [];
+  for (const select of container.querySelectorAll("select")) {
+    if (!select.value) continue;
+    mappings.push({
+      location_id: select.dataset.locationId,
+      device_id: select.dataset.deviceId || "",
+      device_name: select.dataset.deviceName || "",
+      camera_id: select.value,
+      camera_name: select.options[select.selectedIndex].textContent,
+    });
+  }
+  return mappings;
+}
+
+function renderSettingsView(settings) {
+  const rows = $("#mapping-rows");
+  rows.textContent = "";
+  if (settings === null) return;
+  const usable = buildMappingRows(rows, settings);
+  $("#save-mapping").hidden = !usable;
 }
 
 const loadSettingsView = createLatestSettingsLoader(
@@ -418,17 +451,7 @@ function previewCamera(cameraId) {
 }
 
 $("#save-mapping").addEventListener("click", async () => {
-  const mappings = [];
-  for (const select of document.querySelectorAll("#mapping-rows select")) {
-    if (!select.value) continue;
-    mappings.push({
-      location_id: select.dataset.locationId,
-      device_id: select.dataset.deviceId || "",
-      device_name: select.dataset.deviceName || "",
-      camera_id: select.value,
-      camera_name: select.options[select.selectedIndex].textContent,
-    });
-  }
+  const mappings = collectMappings($("#mapping-rows"));
   try {
     await api("/api/camera-mapping", { method: "PUT", body: JSON.stringify({ mappings }) });
     message("Camera selection saved.", "ok");
@@ -716,5 +739,119 @@ $("#sync-now").addEventListener("click", async () => {
     message(err.message, "error");
   }
 });
+
+// ---------------------------------------------------------------- setup wizard
+
+const WIZARD_SKIP_KEY = "spi-wizard-skipped";
+
+function showWizardStep(step) {
+  show("#view-wizard");
+  $("#nav").hidden = false;
+  for (const el of document.querySelectorAll(".wiz-step"))
+    el.hidden = el.dataset.step !== String(step);
+  for (const dot of document.querySelectorAll(".wiz-dot")) {
+    const dotStep = Number(dot.dataset.step);
+    dot.className = "wiz-dot" +
+      (dotStep < step ? " done" : dotStep === step ? " active" : "");
+  }
+}
+
+async function maybeStartWizard() {
+  if (localStorage.getItem(WIZARD_SKIP_KEY) === "1") return false;
+  let status;
+  try {
+    status = await api("/api/status");
+  } catch {
+    return false;
+  }
+  if (!status.protect_configured) {
+    showWizardStep(1);
+    return true;
+  }
+  if (!status.square_configured) {
+    showWizardStep(2);
+    return true;
+  }
+  if (!status.cameras_mapped) {
+    const ok = await loadWizardMapping();
+    if (ok) {
+      showWizardStep(3);
+      return true;
+    }
+  }
+  return false;
+}
+
+async function loadWizardMapping() {
+  const data = await fetchMappingData();
+  if (data === null) return false;
+  return buildMappingRows($("#wiz-mapping-rows"), data);
+}
+
+$("#wiz-protect-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    const result = await api("/api/settings/protect", {
+      method: "PUT",
+      body: JSON.stringify({
+        host: $("#wiz-protect-host").value.trim(),
+        username: $("#wiz-protect-username").value.trim(),
+        password: $("#wiz-protect-password").value,
+        verify_ssl: false,
+      }),
+    });
+    $("#wiz-protect-password").value = "";
+    message(`Connected to UniFi Protect (${result.cameras} cameras found).`, "ok");
+    showWizardStep(2);
+  } catch (err) {
+    message(err.message, "error");
+  }
+});
+
+$("#wiz-square-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    await api("/api/settings/square", {
+      method: "PUT",
+      body: JSON.stringify({
+        access_token: $("#wiz-square-token").value.trim(),
+        environment: $("#wiz-square-env").value,
+      }),
+    });
+    $("#wiz-square-token").value = "";
+    message("Connected to Square.", "ok");
+    if (await loadWizardMapping()) {
+      showWizardStep(3);
+    } else {
+      showWizardStep(4);
+    }
+  } catch (err) {
+    message(err.message, "error");
+  }
+});
+
+$("#wiz-save-mapping").addEventListener("click", async () => {
+  const mappings = collectMappings($("#wiz-mapping-rows"));
+  try {
+    await api("/api/camera-mapping", { method: "PUT", body: JSON.stringify({ mappings }) });
+    message("Camera selection saved.", "ok");
+    showWizardStep(4);
+  } catch (err) {
+    message(err.message, "error");
+  }
+});
+
+$("#wiz-finish").addEventListener("click", () => {
+  localStorage.setItem(WIZARD_SKIP_KEY, "1");
+  enterApp();
+});
+
+$("#wiz-skip").addEventListener("click", (e) => {
+  e.preventDefault();
+  localStorage.setItem(WIZARD_SKIP_KEY, "1");
+  enterApp();
+  show("#view-settings");
+});
+
 
 boot();

@@ -46,6 +46,7 @@ from .store import (
     ProtectSettingsConflict,
     SquareAccountChanged,
     SquareAccountSwitchRequired,
+    SQUARE_OAUTH_PENDING_SETTING_KEYS,
     Store,
     TransactionSnapshotExpired,
 )
@@ -1000,6 +1001,8 @@ def create_app(
                 status_code=409,
                 detail="Save the Square application client id/secret first",
             )
+        # Starting over explicitly abandons any older, unconfirmed grant.
+        store.delete_settings(*SQUARE_OAUTH_PENDING_SETTING_KEYS)
         state = secrets.token_urlsafe(24)
         store.set_setting("square.oauth_state", state)
         return RedirectResponse(
@@ -1047,16 +1050,109 @@ def create_app(
             raise HTTPException(status_code=401, detail=str(exc))
         except SquareError as exc:
             raise HTTPException(status_code=502, detail=f"Could not reach Square: {exc}")
-        updates = {
-            "square.access_token": (tokens["access_token"], True),
-            "square.token_expires_at": (tokens.get("expires_at", ""), False),
-        }
-        if tokens.get("refresh_token"):
-            updates["square.refresh_token"] = (tokens["refresh_token"], True)
-        if tokens.get("merchant_id"):
-            updates["square.merchant_id"] = (tokens["merchant_id"], False)
-        store.update_settings(updates)
+        access_token = tokens.get("access_token")
+        merchant_id = tokens.get("merchant_id")
+        refresh_token = tokens.get("refresh_token")
+        expires_at = tokens.get("expires_at", "")
+        if not isinstance(access_token, str) or not access_token:
+            raise HTTPException(status_code=502, detail="Square returned an invalid OAuth token")
+        if not isinstance(merchant_id, str) or not merchant_id:
+            raise HTTPException(status_code=502, detail="Square did not identify the OAuth merchant")
+        if refresh_token is not None and not isinstance(refresh_token, str):
+            raise HTTPException(status_code=502, detail="Square returned an invalid refresh token")
+        if not isinstance(expires_at, str):
+            raise HTTPException(status_code=502, detail="Square returned an invalid token expiry")
+        environment = oauth["square.environment"] or "production"
+        try:
+            with square_account_lock:
+                store.configure_square_account(
+                    merchant_id=merchant_id,
+                    access_token=access_token,
+                    environment=environment,
+                    oauth_refresh_token=refresh_token,
+                    oauth_token_expires_at=expires_at,
+                    clear_oauth_pending=True,
+                )
+        except SquareAccountSwitchRequired as exc:
+            # Keep the active merchant untouched until the operator explicitly
+            # confirms the same destructive switch shown by manual-token setup.
+            store.update_settings(
+                {
+                    "square.oauth_pending_access_token": (access_token, True),
+                    "square.oauth_pending_refresh_token": (refresh_token or "", True),
+                    "square.oauth_pending_expires_at": (expires_at, False),
+                    "square.oauth_pending_merchant_id": (merchant_id, False),
+                    "square.oauth_pending_environment": (environment, False),
+                    "square.oauth_pending_confirmation_token": (
+                        exc.confirmation_token,
+                        True,
+                    ),
+                    "square.oauth_pending_created_at": (str(time.time()), False),
+                }
+            )
+            return RedirectResponse("/?square_oauth=switch_required", status_code=302)
         return RedirectResponse("/?square_oauth=connected", status_code=302)
+
+    @app.post("/api/settings/square/oauth-switch/confirm")
+    def confirm_square_oauth_switch(_=authed) -> dict:
+        """Activate a pending OAuth grant after explicit destructive consent."""
+        with square_account_lock:
+            pending = store.get_settings(SQUARE_OAUTH_PENDING_SETTING_KEYS)
+            try:
+                created_at = float(pending["square.oauth_pending_created_at"] or "")
+            except ValueError:
+                created_at = 0.0
+            now = time.time()
+            required = (
+                pending["square.oauth_pending_access_token"],
+                pending["square.oauth_pending_merchant_id"],
+                pending["square.oauth_pending_environment"],
+                pending["square.oauth_pending_confirmation_token"],
+            )
+            if (
+                not all(required)
+                or created_at > now + 30
+                or now - created_at > 10 * 60
+            ):
+                store.delete_settings(*SQUARE_OAUTH_PENDING_SETTING_KEYS)
+                raise HTTPException(
+                    status_code=409,
+                    detail="The pending Square authorization expired; connect again",
+                )
+            try:
+                configuration = store.configure_square_account(
+                    merchant_id=pending["square.oauth_pending_merchant_id"] or "",
+                    access_token=pending["square.oauth_pending_access_token"] or "",
+                    environment=pending["square.oauth_pending_environment"] or "production",
+                    confirm_account_switch=True,
+                    account_switch_confirmation_token=(
+                        pending["square.oauth_pending_confirmation_token"] or ""
+                    ),
+                    oauth_refresh_token=(
+                        pending["square.oauth_pending_refresh_token"] or None
+                    ),
+                    oauth_token_expires_at=(
+                        pending["square.oauth_pending_expires_at"] or ""
+                    ),
+                    clear_oauth_pending=True,
+                )
+            except SquareAccountSwitchRequired as exc:
+                store.delete_settings(*SQUARE_OAUTH_PENDING_SETTING_KEYS)
+                raise HTTPException(
+                    status_code=409,
+                    detail="The Square account changed; connect again before confirming",
+                ) from exc
+        return {
+            "ok": True,
+            "account_switched": configuration.switched,
+            "account_revision": configuration.account_revision,
+            "evidence_cleanup_pending": configuration.evidence_cleanup_pending,
+        }
+
+    @app.delete("/api/settings/square/oauth-switch")
+    def cancel_square_oauth_switch(_=authed) -> dict:
+        store.delete_settings(*SQUARE_OAUTH_PENDING_SETTING_KEYS)
+        return {"ok": True}
 
     # -- cameras & mapping ------------------------------------------------------
 

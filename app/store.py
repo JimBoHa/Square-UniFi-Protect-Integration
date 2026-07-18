@@ -40,6 +40,28 @@ ALARM_ENABLED_AFTER_SETTING = "protect.alarm_enabled_after_ms"
 SQUARE_POLL_WATERMARK_TABLE = "square_poll_watermarks"
 PROTECT_EVIDENCE_RETIRED_TABLE = "protect_evidence_retired"
 SQUARE_ACCOUNT_REVISION_SETTING = "square.account_revision"
+SQUARE_OAUTH_APP_SETTING_KEYS = (
+    "square.oauth_client_id",
+    "square.oauth_client_secret",
+)
+SQUARE_OAUTH_PENDING_SETTING_KEYS = (
+    "square.oauth_pending_access_token",
+    "square.oauth_pending_refresh_token",
+    "square.oauth_pending_expires_at",
+    "square.oauth_pending_merchant_id",
+    "square.oauth_pending_environment",
+    "square.oauth_pending_confirmation_token",
+    "square.oauth_pending_created_at",
+)
+SQUARE_INSTALLATION_SETTING_KEYS = (
+    *SQUARE_OAUTH_APP_SETTING_KEYS,
+    *SQUARE_OAUTH_PENDING_SETTING_KEYS,
+    "square.oauth_state",
+    # The current release still shares this default with OAuth application
+    # setup. By itself it is not evidence that a merchant was ever connected.
+    "square.environment",
+    SQUARE_ACCOUNT_REVISION_SETTING,
+)
 PROTECT_CONSOLE_GENERATION_SETTING = "protect.console_generation"
 PROTECT_CONSOLE_ID_SETTING = "protect.console_id"
 PROTECT_SWITCH_TOKEN_TTL_SECONDS = 5 * 60
@@ -1006,8 +1028,11 @@ class Store:
 
     def _has_square_account_data_locked(self) -> bool:
         """Detect legacy account data that has no merchant identity setting."""
+        placeholders = ", ".join("?" for _ in SQUARE_INSTALLATION_SETTING_KEYS)
         if self._db.execute(
-            "SELECT 1 FROM settings WHERE key LIKE 'square.%' LIMIT 1"
+            "SELECT 1 FROM settings WHERE key LIKE 'square.%' "
+            f"AND key NOT IN ({placeholders}) LIMIT 1",
+            SQUARE_INSTALLATION_SETTING_KEYS,
         ).fetchone():
             return True
         for table_name in ("transactions", "camera_map"):
@@ -1112,6 +1137,9 @@ class Store:
         clear_webhook: bool = False,
         confirm_account_switch: bool = False,
         account_switch_confirmation_token: str = "",
+        oauth_refresh_token: str | None = None,
+        oauth_token_expires_at: str | None = None,
+        clear_oauth_pending: bool = False,
     ) -> SquareAccountConfiguration:
         """Configure one merchant while excluding cross-process account work."""
         with self.integration_guard(exclusive=True):
@@ -1126,6 +1154,9 @@ class Store:
                 account_switch_confirmation_token=(
                     account_switch_confirmation_token
                 ),
+                oauth_refresh_token=oauth_refresh_token,
+                oauth_token_expires_at=oauth_token_expires_at,
+                clear_oauth_pending=clear_oauth_pending,
             )
             revision = self.square_account_revision()
             if revision is None:
@@ -1149,6 +1180,9 @@ class Store:
         clear_webhook: bool = False,
         confirm_account_switch: bool = False,
         account_switch_confirmation_token: str = "",
+        oauth_refresh_token: str | None = None,
+        oauth_token_expires_at: str | None = None,
+        clear_oauth_pending: bool = False,
     ) -> bool:
         """Save Square credentials and atomically isolate a changed account.
 
@@ -1170,6 +1204,18 @@ class Store:
             ("square.environment", environment, 0),
             ("square.merchant_id", merchant_id, 0),
         ]
+        if oauth_refresh_token is not None:
+            updates.append(
+                (
+                    "square.refresh_token",
+                    self.cipher.encrypt(oauth_refresh_token),
+                    1,
+                )
+            )
+        if oauth_token_expires_at is not None:
+            updates.append(
+                ("square.token_expires_at", oauth_token_expires_at, 0)
+            )
         if webhook_signature_key is not None and webhook_url is not None:
             updates.extend(
                 (
@@ -1245,8 +1291,13 @@ class Store:
                     # Webhook signatures and any future Square-owned state
                     # must never cross merchant boundaries. Submitted webhook
                     # credentials below are inserted for the new account.
+                    # OAuth application credentials belong to this installation,
+                    # not to one merchant. Keep them so an explicitly confirmed
+                    # merchant switch does not disconnect the OAuth application.
                     self._db.execute(
-                        "DELETE FROM settings WHERE key LIKE 'square.%'"
+                        "DELETE FROM settings WHERE key LIKE 'square.%' "
+                        "AND key NOT IN (?, ?)",
+                        SQUARE_OAUTH_APP_SETTING_KEYS,
                     )
                     self._db.execute(
                         "INSERT INTO settings (key, value, encrypted) VALUES (?, '1', 0) "
@@ -1257,6 +1308,12 @@ class Store:
                     self._db.execute(
                         "DELETE FROM settings WHERE key IN (?, ?)",
                         ("square.webhook_signature_key", "square.webhook_url"),
+                    )
+
+                if clear_oauth_pending:
+                    self._db.executemany(
+                        "DELETE FROM settings WHERE key = ?",
+                        ((key,) for key in SQUARE_OAUTH_PENDING_SETTING_KEYS),
                     )
 
                 if switched or self._setting_value_locked(

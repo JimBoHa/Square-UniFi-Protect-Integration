@@ -9,7 +9,13 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.square_client import oauth_authorize_url
 
-from .conftest import ADMIN_PASSWORD, protect_handler, square_handler
+from .conftest import (
+    ADMIN_PASSWORD,
+    PROTECT_PASS,
+    PROTECT_USER,
+    protect_handler,
+    square_handler,
+)
 
 CLIENT_ID = "sq0idp-test-app-id"
 CLIENT_SECRET = "sq0csp-test-app-secret"
@@ -106,6 +112,7 @@ def test_full_oauth_flow_stores_tokens_and_merchant(oauth_client):
     assert store.get_setting("square.access_token") == "oauth-access-initial"
     assert store.get_setting("square.refresh_token") == "oauth-refresh-token"
     assert store.get_setting("square.merchant_id") == "MERCHANT_OAUTH"
+    assert store.square_account_revision()
     assert state["token_requests"][0]["grant_type"] == "authorization_code"
 
     # Secrets stay encrypted at rest.
@@ -113,6 +120,128 @@ def test_full_oauth_flow_stores_tokens_and_merchant(oauth_client):
     assert b"oauth-access-initial" not in db_bytes
     assert b"oauth-refresh-token" not in db_bytes
     assert CLIENT_SECRET.encode() not in db_bytes
+
+
+def test_fresh_oauth_account_can_save_revision_fenced_mapping(oauth_client):
+    client, _state, _store = oauth_client
+    assert client.put(
+        "/api/settings/protect",
+        json={
+            "host": "10.0.0.1",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+            "verify_ssl": False,
+        },
+    ).status_code == 200
+    _save_oauth_app(client)
+    start = client.get("/oauth/square/start", follow_redirects=False)
+    oauth_state = start.headers["location"].rsplit("state=", 1)[-1]
+    assert client.get(
+        f"/oauth/square/callback?code=auth-code-1&state={oauth_state}",
+        follow_redirects=False,
+    ).status_code == 302
+
+    snapshot = client.get("/api/camera-mapping")
+    assert snapshot.headers["x-square-account-revision"]
+    assert snapshot.headers["x-protect-console-generation"]
+    saved = client.put(
+        "/api/camera-mapping",
+        json={"mappings": []},
+        headers={
+            "X-Square-Account-Revision": snapshot.headers[
+                "x-square-account-revision"
+            ],
+            "X-Protect-Console-Generation": snapshot.headers[
+                "x-protect-console-generation"
+            ],
+        },
+    )
+    assert saved.status_code == 200
+
+
+def test_oauth_different_merchant_requires_explicit_confirm_and_isolates_data(
+    oauth_client,
+):
+    client, _state, store = oauth_client
+    store.configure_square_account(
+        merchant_id="MERCHANT_OLD",
+        access_token="old-access-token",
+        environment="production",
+        webhook_signature_key="old-webhook-key",
+        webhook_url="https://old.example/webhooks/square",
+    )
+    old_revision = store.square_account_revision()
+    store.set_camera_mapping("LOC_OLD", "cam-old", "Old camera")
+    store.upsert_transaction(
+        {
+            "id": "PAY_OLD",
+            "created_at": "2026-07-18T12:00:00Z",
+            "ts_ms": 1_752_840_000_000,
+            "updated_at": "2026-07-18T12:00:00Z",
+            "updated_ts_ms": 1_752_840_000_000,
+            "amount": 1250,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC_OLD",
+            "device_id": "",
+            "device_name": "",
+            "card_last4": "4242",
+            "receipt_url": "",
+            "camera_id": "cam-old",
+            "thumbnail_path": None,
+        }
+    )
+    _save_oauth_app(client)
+    start = client.get("/oauth/square/start", follow_redirects=False)
+    oauth_state = start.headers["location"].rsplit("state=", 1)[-1]
+
+    callback = client.get(
+        f"/oauth/square/callback?code=auth-code-1&state={oauth_state}",
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302
+    assert callback.headers["location"] == "/?square_oauth=switch_required"
+    assert store.get_setting("square.merchant_id") == "MERCHANT_OLD"
+    assert store.get_setting("square.access_token") == "old-access-token"
+    assert store.square_account_revision() == old_revision
+    assert [txn["id"] for txn in store.list_transactions()] == ["PAY_OLD"]
+    assert store.get_camera_mappings()
+    assert store.get_setting("square.webhook_signature_key") == "old-webhook-key"
+
+    confirmed = client.post("/api/settings/square/oauth-switch/confirm")
+    assert confirmed.status_code == 200
+    assert confirmed.json()["account_switched"] is True
+    assert confirmed.json()["account_revision"] != old_revision
+    assert store.get_setting("square.merchant_id") == "MERCHANT_OAUTH"
+    assert store.get_setting("square.access_token") == "oauth-access-initial"
+    assert store.get_setting("square.refresh_token") == "oauth-refresh-token"
+    assert store.get_setting("square.webhook_signature_key") is None
+    assert store.list_transactions() == []
+    assert store.get_camera_mappings() == []
+    assert store.get_setting("square.oauth_client_id") == CLIENT_ID
+    assert store.get_setting("square.oauth_client_secret") == CLIENT_SECRET
+
+
+def test_pending_oauth_switch_can_be_cancelled(oauth_client):
+    client, _state, store = oauth_client
+    store.configure_square_account(
+        merchant_id="MERCHANT_OLD",
+        access_token="old-access-token",
+        environment="production",
+    )
+    _save_oauth_app(client)
+    start = client.get("/oauth/square/start", follow_redirects=False)
+    oauth_state = start.headers["location"].rsplit("state=", 1)[-1]
+    client.get(
+        f"/oauth/square/callback?code=auth-code-1&state={oauth_state}",
+        follow_redirects=False,
+    )
+
+    cancelled = client.delete("/api/settings/square/oauth-switch")
+    assert cancelled.status_code == 200
+    assert store.get_setting("square.oauth_pending_access_token") is None
+    assert store.get_setting("square.merchant_id") == "MERCHANT_OLD"
+    assert client.post("/api/settings/square/oauth-switch/confirm").status_code == 409
 
 
 def test_callback_rejects_bad_state(oauth_client):
@@ -164,3 +293,7 @@ def test_oauth_ui_wiring():
     assert 'id="square-oauth-connect"' in html
     assert "/oauth/square/start" in js
     assert "/api/settings/square/oauth-app" in js
+    assert 'id="square-oauth-switch-warning"' in html
+    assert "/api/settings/square/oauth-switch/confirm" in js
+    assert "square_oauth=switch_required" not in js
+    assert 'oauthOutcome === "switch_required"' in js

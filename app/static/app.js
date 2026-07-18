@@ -71,8 +71,16 @@ async function api(path, options = {}) {
 // ---------------------------------------------------------------- boot
 
 async function boot() {
-  if (new URLSearchParams(window.location.search).get("square_oauth") === "connected") {
+  const oauthOutcome = new URLSearchParams(window.location.search).get("square_oauth");
+  if (oauthOutcome === "connected") {
     message("Square account connected via OAuth.", "ok");
+    window.history.replaceState({}, "", "/");
+  } else if (oauthOutcome === "switch_required") {
+    $("#square-oauth-switch-warning").hidden = false;
+    message(
+      "A different Square account authorized. Open Settings to confirm or cancel the switch.",
+      "error",
+    );
     window.history.replaceState({}, "", "/");
   }
   const status = await api("/api/status");
@@ -353,6 +361,38 @@ $("#square-register-webhook").addEventListener("click", async () => {
 
 $("#square-oauth-connect").addEventListener("click", () => {
   window.location.href = "/oauth/square/start";
+});
+
+$("#square-oauth-switch-confirm").addEventListener("click", async () => {
+  try {
+    const result = await api("/api/settings/square/oauth-switch/confirm", {
+      method: "POST",
+    });
+    $("#square-oauth-switch-warning").hidden = true;
+    squareAccountRevision = result.account_revision || "";
+    lastTransactionPayload = null;
+    renderTransactions([]);
+    void loadTransactions({ reset: true });
+    void loadSettingsView();
+    message(
+      result.evidence_cleanup_pending
+        ? "Square account switched. Old evidence cleanup will retry automatically."
+        : "Square account switched; map this account's POS cameras and configure its webhook.",
+      "ok",
+    );
+  } catch (err) {
+    message(err.message, "error");
+  }
+});
+
+$("#square-oauth-switch-cancel").addEventListener("click", async () => {
+  try {
+    await api("/api/settings/square/oauth-switch", { method: "DELETE" });
+    $("#square-oauth-switch-warning").hidden = true;
+    message("Kept the current Square account.", "");
+  } catch (err) {
+    message(err.message, "error");
+  }
 });
 
 $("#square-form").addEventListener("submit", async (e) => {

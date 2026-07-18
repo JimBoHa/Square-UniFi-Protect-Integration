@@ -148,6 +148,12 @@
         <button type="submit">Save application</button>
         <button type="button" id="square-oauth-connect">Connect with Square</button>
       </form>
+      <div id="square-oauth-switch-warning" class="destructive-warning" role="alert" hidden>
+        <strong>Different Square account authorized.</strong>
+        <p>Confirming permanently erases the previous account's local transactions, thumbnails, observed POS devices, camera mappings, sync history, and saved Square webhook credentials.</p>
+        <button type="button" id="square-oauth-switch-confirm">Switch account and erase old data</button>
+        <button type="button" id="square-oauth-switch-cancel">Keep current account</button>
+      </div>
       <p class="hint"><strong>Option B — paste an access token manually:</strong></p>
       <form id="square-form">
         <label>Access token <input type="password" id="square-token" autocomplete="off" required></label>

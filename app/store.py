@@ -551,12 +551,19 @@ class Store:
     # -- transactions ------------------------------------------------------
 
     def upsert_transaction(
-        self, txn: dict, *, replace_evidence: bool = False
+        self,
+        txn: dict,
+        *,
+        replace_evidence: bool = False,
+        enforce_current_mapping: bool = False,
     ) -> bool:
         """Insert or update a transaction. Returns True if it was new.
 
         ``replace_evidence`` lets an authoritative source correction clear
         nullable camera evidence instead of coalescing the prior values.
+        ``enforce_current_mapping`` resolves mutable evidence against the
+        camera map inside this write transaction, so a mapping save cannot be
+        lost to an ingestion that read the old map before doing Protect I/O.
         """
         values = {
             "camera_id": None,
@@ -581,10 +588,40 @@ class Store:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 existing = self._db.execute(
-                    "SELECT id, camera_id, ts_ms, thumbnail_path, status "
+                    "SELECT id, camera_id, ts_ms, updated_ts_ms, device_id, "
+                    "thumbnail_path, status "
                     "FROM transactions WHERE id = ?",
                     (txn["id"],),
                 ).fetchone()
+                if enforce_current_mapping:
+                    accepted_version = bool(
+                        existing is None
+                        or int(values["updated_ts_ms"])
+                        >= int(existing["updated_ts_ms"])
+                    )
+                    evidence_is_mutable = bool(
+                        existing is None
+                        or not existing["thumbnail_path"]
+                        or int(values["ts_ms"]) != int(existing["ts_ms"])
+                        or replace_evidence
+                    )
+                    if accepted_version and evidence_is_mutable:
+                        # Match the upsert's sparse-device semantics when choosing
+                        # the row that owns this evidence. BEGIN IMMEDIATE keeps
+                        # this mapping stable until the transaction commits.
+                        mapped_device_id = values["device_id"]
+                        if not mapped_device_id and existing is not None:
+                            mapped_device_id = existing["device_id"]
+                        mapping = self._camera_for_location_locked(
+                            values["location_id"], mapped_device_id
+                        )
+                        mapped_camera_id = mapping["camera_id"] if mapping else None
+                        if values["camera_id"] != mapped_camera_id:
+                            # The captured path belongs to the mapping observed
+                            # before this transaction began. Leave it unattached;
+                            # the caller removes it after seeing the winning row.
+                            values["thumbnail_path"] = None
+                        values["camera_id"] = mapped_camera_id
                 applied = self._db.execute(
                     "INSERT INTO transactions (id, created_at, ts_ms, updated_at, updated_ts_ms, "
                     "amount, currency, status, location_id, device_id, device_name, card_last4, "

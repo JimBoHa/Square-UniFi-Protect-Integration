@@ -216,7 +216,11 @@ def _ingest_payment_with_status(
             logger.warning("Thumbnail capture failed for %s: %s", txn["id"], exc)
 
     try:
-        is_new = store.upsert_transaction(txn, replace_evidence=source_changed)
+        is_new = store.upsert_transaction(
+            txn,
+            replace_evidence=source_changed,
+            enforce_current_mapping=True,
+        )
     except Exception:
         if captured_path is not None:
             try:

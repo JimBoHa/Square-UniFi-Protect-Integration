@@ -5,15 +5,16 @@
 set -e
 cd "$(dirname "$0")"
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "Python 3 is required but was not found."
-  echo "Install the Apple Command Line Tools by running:  xcode-select --install"
-  echo "or download Python from https://www.python.org/downloads/  then run this again."
-  read -r -p "Press Return to close..." _
-  exit 1
-fi
-
 if [ ! -x .venv/bin/python ]; then
+  # python3 is only needed to create the environment; an already-provisioned
+  # machine can launch without it.
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Python 3 is required but was not found."
+    echo "Install the Apple Command Line Tools by running:  xcode-select --install"
+    echo "or download Python from https://www.python.org/downloads/  then run this again."
+    read -r -p "Press Return to close..." _
+    exit 1
+  fi
   echo "First run: setting up the Python environment (about a minute)..."
   python3 -m venv .venv
 fi
@@ -28,13 +29,14 @@ fi
 [ "${SPI_LAUNCHER_SETUP_ONLY:-0}" = "1" ] && exit 0
 
 PORT="${SPI_PORT:-8000}"
+PORT_CAP=$((PORT + 20))
 # If the preferred port is taken (another copy running, or another app),
 # walk forward to the next free port instead of failing with a traceback.
 while lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; do
   echo "Port $PORT is in use; trying $((PORT + 1))..."
   PORT=$((PORT + 1))
-  if [ "$PORT" -gt 8020 ]; then
-    echo "Could not find a free port between ${SPI_PORT:-8000} and 8020."
+  if [ "$PORT" -gt "$PORT_CAP" ]; then
+    echo "Could not find a free port between ${SPI_PORT:-8000} and $PORT_CAP."
     read -r -p "Press Return to close..." _
     exit 1
   fi

@@ -370,12 +370,6 @@ class Store:
                 # associated with this descriptor if explicit unlock failed.
                 os.close(fd)
 
-    @contextmanager
-    def square_account_guard(self, *, exclusive: bool = False):
-        """Backward-compatible name for the shared provider-state guard."""
-        with self.integration_guard(exclusive=exclusive):
-            yield
-
     def _thumbnail_file_exists(self, name: str) -> bool:
         path = (self.thumbnail_dir / name).resolve()
         return self.thumbnail_dir.resolve() in path.parents and path.is_file()

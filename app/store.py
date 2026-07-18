@@ -58,6 +58,10 @@ CREATE TABLE IF NOT EXISTS transactions (
     alarm_claimed_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_transactions_ts ON transactions (ts_ms DESC);
+CREATE TABLE IF NOT EXISTS square_poll_watermarks (
+    location_id TEXT PRIMARY KEY,
+    polled_through_ms INTEGER NOT NULL CHECK (polled_through_ms >= 0)
+);
 CREATE TABLE IF NOT EXISTS thumbnail_retries (
     transaction_id TEXT PRIMARY KEY,
     attempts INTEGER NOT NULL DEFAULT 0,
@@ -1127,6 +1131,35 @@ class Store:
                     (location_id,),
                 ).fetchone()
         return row["ts"] if row and row["ts"] is not None else None
+
+    # -- Square polling -----------------------------------------------------
+
+    def get_square_poll_watermark(self, location_id: str) -> int | None:
+        """Return the last successfully completed poll boundary for a location."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT polled_through_ms FROM square_poll_watermarks "
+                "WHERE location_id = ?",
+                (location_id,),
+            ).fetchone()
+        return int(row["polled_through_ms"]) if row else None
+
+    def advance_square_poll_watermark(
+        self, location_id: str, polled_through_ms: int
+    ) -> None:
+        """Monotonically advance a location after its poll completes."""
+        polled_through_ms = int(polled_through_ms)
+        if polled_through_ms < 0:
+            raise ValueError("Square poll watermark cannot be negative")
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO square_poll_watermarks "
+                "(location_id, polled_through_ms) VALUES (?, ?) "
+                "ON CONFLICT(location_id) DO UPDATE SET polled_through_ms = "
+                "MAX(square_poll_watermarks.polled_through_ms, "
+                "excluded.polled_through_ms)",
+                (location_id, polled_through_ms),
+            )
 
     def _release_expired_alarm_claims_locked(self) -> None:
         """Release abandoned claims without stealing work from a live process."""

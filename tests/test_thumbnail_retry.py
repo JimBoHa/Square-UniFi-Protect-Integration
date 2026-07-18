@@ -86,6 +86,9 @@ def test_old_failure_retries_after_square_window_advances(tmp_path):
         def list_locations(self):
             return [{"id": "LOC1"}]
 
+        def iter_payment_pages(self, **params):
+            yield self.list_payments(**params)
+
         def list_payments(self, **params):
             self.returned.append([new["id"]])
             return [new]
@@ -314,6 +317,9 @@ def test_square_failure_still_processes_retry_queue(tmp_path):
         def list_locations(self):
             return [{"id": "LOC1"}]
 
+        def iter_payment_pages(self, **params):
+            yield self.list_payments(**params)
+
         def list_payments(self, **params):
             raise SquareError("Square unavailable")
 
@@ -335,6 +341,9 @@ def test_retry_error_does_not_mask_square_failure(tmp_path, monkeypatch, caplog)
     class Square:
         def list_locations(self):
             return [{"id": "LOC1"}]
+
+        def iter_payment_pages(self, **params):
+            yield self.list_payments(**params)
 
         def list_payments(self, **params):
             raise SquareError("original Square failure")

@@ -1221,6 +1221,37 @@ def test_snapshot_accepts_valid_jpeg_content_type_variants(content_type):
     client.close()
 
 
+def test_snapshot_accepts_marker_bytes_inside_metadata_segment():
+    metadata = b"Exif\x00\x00metadata with marker-like \xff\xd9 bytes"
+    app_segment = b"\xff\xe1" + (len(metadata) + 2).to_bytes(2, "big") + metadata
+    image = FAKE_JPEG[:2] + app_segment + FAKE_JPEG[2:]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        return httpx.Response(200, content=image, headers={"content-type": "image/jpeg"})
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    assert client.get_snapshot("cam1") == image
+    client.close()
+
+
+def test_snapshot_does_not_accept_markers_hidden_inside_metadata():
+    metadata = b"not a frame \xff\xc0 fake header \xff\xda fake scan"
+    app_segment = b"\xff\xe1" + (len(metadata) + 2).to_bytes(2, "big") + metadata
+    image = b"\xff\xd8" + app_segment + b"\xff\xd9"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        return httpx.Response(200, content=image, headers={"content-type": "image/jpeg"})
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    with pytest.raises(ProtectError, match="invalid JPEG"):
+        client.get_snapshot("cam1")
+    client.close()
+
+
 def test_integration_api_never_sends_legacy_session_cookie():
     """Verified on Protect 7.1.87: the console accepts the legacy session
     cookie on integration endpoints even when X-API-Key is wrong, so a shared

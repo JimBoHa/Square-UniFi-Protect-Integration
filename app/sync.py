@@ -92,13 +92,15 @@ def versioned_thumbnail_name(
     camera_id: str,
     ts_ms: int,
     updated_ts_ms: int,
+    console_scope: str = "",
 ) -> str:
     """Collision-resistant filename for one Square evidence version."""
     cleaned = _SAFE_ID_RE.sub("", payment_id)[:48]
     if not cleaned:
         raise ValueError("Payment id yields no safe filename")
     evidence = (
-        f"{payment_id}\0{camera_id}\0{int(ts_ms)}\0{int(updated_ts_ms)}".encode()
+        f"{payment_id}\0{camera_id}\0{int(ts_ms)}\0{int(updated_ts_ms)}"
+        f"\0{console_scope}".encode()
     )
     digest = hashlib.sha256(evidence).hexdigest()[:24]
     return f"{cleaned}-{int(ts_ms)}-{digest}.jpg"
@@ -201,9 +203,12 @@ def _ingest_payment_with_status(
             if not txn["device_name"]:
                 txn["device_name"] = existing.get("device_name", "")
 
-    mapping = store.camera_for_location(txn["location_id"], txn["device_id"])
+    mapping, evidence_host, evidence_generation = store.camera_context_for_location(
+        txn["location_id"], txn["device_id"]
+    )
     txn["camera_id"] = mapping["camera_id"] if mapping else None
     txn["thumbnail_path"] = None
+    protect_host = getattr(protect, "host", evidence_host) if protect is not None else None
 
     # A stale out-of-order event is ignored by the versioned upsert, so it must
     # not overwrite the on-disk thumbnail with a wrong-time frame either.
@@ -222,6 +227,7 @@ def _ingest_payment_with_status(
         txn["thumbnail_path"] = existing["thumbnail_path"]
     elif (
         protect is not None
+        and protect_host == evidence_host
         and txn["camera_id"]
         and not stale_event
         and (existing is None or not ts_unchanged or source_changed)
@@ -237,6 +243,7 @@ def _ingest_payment_with_status(
                 txn["camera_id"],
                 txn["ts_ms"],
                 txn["updated_ts_ms"],
+                evidence_generation or evidence_host or "",
             )
             captured_path = store.thumbnail_dir / name
             write_thumbnail(captured_path, image)
@@ -252,6 +259,8 @@ def _ingest_payment_with_status(
             expected_merchant_id=expected_merchant_id,
             expected_environment=expected_environment,
             expected_account_revision=expected_account_revision,
+            expected_protect_host=evidence_host,
+            expected_protect_generation=evidence_generation,
         )
     except Exception:
         if captured_path is not None:

@@ -552,6 +552,59 @@ def test_protect_login_and_cameras():
     assert [c["name"] for c in cameras] == ["Front Counter", "Back Door"]
     client.close()
 
+
+def test_protect_cameras_with_console_identity_uses_one_bootstrap_request():
+    calls = {"bootstrap": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        calls["bootstrap"] += 1
+        return httpx.Response(
+            200,
+            json={
+                "cameras": [{"id": "cam1", "name": "Counter"}],
+                "nvr": {"id": " nvr-console-1 ", "mac": "00:11:22:33:44:55"},
+            },
+        )
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    cameras, console_identity = client.get_cameras_with_console_identity()
+    client.close()
+
+    assert cameras == [{"id": "cam1", "name": "Counter", "state": ""}]
+    assert console_identity == "nvr-console-1"
+    assert calls["bootstrap"] == 1
+
+
+@pytest.mark.parametrize(
+    ("nvr", "expected_identity"),
+    [
+        ({"mac": "00:11:22:33:44:55"}, "00:11:22:33:44:55"),
+        ({"id": "", "mac": "fallback-mac"}, "fallback-mac"),
+        ({"id": 123, "mac": "fallback-mac"}, "fallback-mac"),
+        ({"id": "x" * 257, "mac": "fallback-mac"}, "fallback-mac"),
+        ({"id": "bad\nvalue", "mac": "fallback-mac"}, "fallback-mac"),
+        (None, None),
+        ([], None),
+        ({"id": 123, "mac": {}}, None),
+    ],
+)
+def test_protect_console_identity_is_optional_and_conservative(
+    nvr, expected_identity
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        return httpx.Response(200, json={"cameras": [], "nvr": nvr})
+
+    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    cameras, console_identity = client.get_cameras_with_console_identity()
+    client.close()
+
+    assert cameras == []
+    assert console_identity == expected_identity
+
 def test_protect_bad_credentials():
     client = ProtectClient(
         "unifi.local", PROTECT_USER, "wrong",

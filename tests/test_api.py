@@ -41,6 +41,47 @@ CAM1 = "cam1aaaaaaaaaaaaaaaaaaaaa"
 CAM2 = "cam2bbbbbbbbbbbbbbbbbbbbb"
 
 
+def _refresh_camera_generation(client) -> None:
+    response = client.get("/api/cameras")
+    assert response.status_code == 200, response.text
+    client.headers["X-Protect-Console-Generation"] = response.headers[
+        "x-protect-console-generation"
+    ]
+
+
+def _protect_switch_token(client, host: str) -> str:
+    response = client.post(
+        "/api/settings/protect/console-switch-token",
+        json={
+            "host": host,
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "private, no-store"
+    token = response.json()["token"]
+    assert token
+    return token
+
+
+def _mutable_identity_protect_handler(identity: dict[str, str | None]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/proxy/protect/api/bootstrap":
+            return protect_handler(request)
+        payload = {
+            "cameras": [
+                {"id": CAM1, "name": "Front Counter", "state": "CONNECTED"},
+                {"id": CAM2, "name": "Back Door", "state": "CONNECTED"},
+            ]
+        }
+        if identity["value"] is not None:
+            payload["nvr"] = {"id": identity["value"]}
+        return httpx.Response(200, json=payload)
+
+    return handler
+
+
 # -- setup / login flow ------------------------------------------------------------
 
 def test_status_reports_setup_state(client):
@@ -104,7 +145,495 @@ def test_protect_settings_success(authed):
     )
     assert resp.status_code == 200
     assert resp.json()["cameras"] == 2
+    assert resp.json()["console_switched"] is False
     assert authed.get("/api/status").json()["protect_configured"] is True
+    cameras = authed.get("/api/cameras")
+    assert cameras.headers["cache-control"] == "private, no-store"
+    assert authed.app.state.store.get_setting("protect.console_id") == "nvr-console-1"
+
+def test_protect_host_change_requires_confirmation_without_mutating_state(configured):
+    _enable_alarm(configured)
+    assert configured.post("/api/sync").status_code == 200
+    store = configured.app.state.store
+    before_mappings = store.get_camera_mappings()
+    before_transactions = configured.get("/api/transactions").json()
+    before_files = sorted(path.name for path in store.thumbnail_dir.iterdir())
+
+    resp = configured.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.2",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+        },
+    )
+
+    assert resp.status_code == 409
+    assert "Confirm the console switch" in resp.json()["detail"]
+    assert store.get_setting("protect.host") == "192.168.1.1"
+    assert store.get_setting("protect.api_key") == PROTECT_API_KEY
+    assert store.get_camera_mappings() == before_mappings
+    assert configured.get("/api/transactions").json() == before_transactions
+    assert sorted(path.name for path in store.thumbnail_dir.iterdir()) == before_files
+
+def test_same_protect_host_credential_refresh_retains_evidence(configured):
+    assert configured.post("/api/sync").status_code == 200
+    store = configured.app.state.store
+    before_mappings = store.get_camera_mappings()
+    before_transactions = configured.get("/api/transactions").json()
+    before_files = sorted(path.name for path in store.thumbnail_dir.iterdir())
+    before_generation = store.get_setting("protect.console_generation")
+
+    resp = configured.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.1",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["console_switched"] is False
+    assert store.get_camera_mappings() == before_mappings
+    assert store.get_setting("protect.console_generation") == before_generation
+    assert configured.get("/api/transactions").json() == before_transactions
+    assert sorted(path.name for path in store.thumbnail_dir.iterdir()) == before_files
+
+
+def test_stale_console_switch_token_cannot_confirm_a_later_switch(configured):
+    stale_token = _protect_switch_token(configured, "192.168.1.2")
+    fresh_token = _protect_switch_token(configured, "192.168.1.3")
+
+    switched = configured.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.3",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+            "console_switch_token": fresh_token,
+        },
+    )
+    assert switched.status_code == 200, switched.text
+
+    stale_retry = configured.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.2",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+            "console_switch_token": stale_token,
+        },
+    )
+
+    assert stale_retry.status_code == 409
+    assert configured.app.state.store.get_setting("protect.host") == "192.168.1.3"
+
+
+def test_console_switch_token_rejects_source_change_during_target_probe(tmp_path):
+    target_probe_started = threading.Event()
+    release_target_probe = threading.Event()
+
+    def blocking_target_probe(request: httpx.Request) -> httpx.Response:
+        if (
+            request.url.host == "target.local"
+            and request.url.path == "/proxy/protect/api/bootstrap"
+        ):
+            target_probe_started.set()
+            if not release_target_probe.wait(timeout=10):
+                raise httpx.ReadTimeout("target probe timed out", request=request)
+        return protect_handler(request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(blocking_target_probe),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as client:
+            assert client.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert client.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert client.put(
+                "/api/settings/protect",
+                json={
+                    "host": "source.local",
+                    "username": PROTECT_USER,
+                    "password": PROTECT_PASS,
+                },
+            ).status_code == 200
+            middle_token = _protect_switch_token(client, "middle.local")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                target_future = executor.submit(
+                    client.post,
+                    "/api/settings/protect/console-switch-token",
+                    json={
+                        "host": "target.local",
+                        "username": PROTECT_USER,
+                        "password": PROTECT_PASS,
+                    },
+                )
+                assert target_probe_started.wait(timeout=3)
+                switched = client.put(
+                    "/api/settings/protect",
+                    json={
+                        "host": "middle.local",
+                        "username": PROTECT_USER,
+                        "password": PROTECT_PASS,
+                        "console_switch_token": middle_token,
+                    },
+                )
+                assert switched.status_code == 200, switched.text
+                release_target_probe.set()
+                stale_confirmation = target_future.result(timeout=5)
+
+            assert stale_confirmation.status_code == 409
+            assert stale_confirmation.headers["cache-control"] == "private, no-store"
+            assert app.state.store.get_setting("protect.host") == "middle.local"
+    finally:
+        release_target_probe.set()
+        app.state.store.close()
+
+
+def test_same_host_console_identity_change_requires_target_bound_consent(tmp_path):
+    identity = {"value": "nvr-a"}
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(
+            _mutable_identity_protect_handler(identity)
+        ),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as client:
+            assert client.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert client.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            settings = {
+                "host": "protect.local",
+                "username": PROTECT_USER,
+                "password": PROTECT_PASS,
+            }
+            assert client.put("/api/settings/protect", json=settings).status_code == 200
+            assert client.put(
+                "/api/settings/square",
+                json={"access_token": SQUARE_TOKEN, "environment": "production"},
+            ).status_code == 200
+            app.state.store.set_camera_mapping("LOC1", CAM1, "Old camera")
+
+            identity["value"] = "nvr-b"
+            assert client.get("/api/cameras").status_code == 409
+            assert client.post("/api/sync").status_code == 502
+            assert app.state.store.list_transactions() == []
+            refused = client.put("/api/settings/protect", json=settings)
+            assert refused.status_code == 409
+            assert "identity changed" in refused.json()["detail"]
+            assert app.state.store.get_camera_mappings()
+
+            token_for_b = _protect_switch_token(client, "protect.local")
+            identity["value"] = "nvr-c"
+            stale_target = client.put(
+                "/api/settings/protect",
+                json={**settings, "console_switch_token": token_for_b},
+            )
+            assert stale_target.status_code == 409
+            assert app.state.store.get_setting("protect.console_id") == "nvr-a"
+
+            token_for_c = _protect_switch_token(client, "protect.local")
+            switched = client.put(
+                "/api/settings/protect",
+                json={**settings, "console_switch_token": token_for_c},
+            )
+            assert switched.status_code == 200, switched.text
+            assert switched.json()["console_switched"] is True
+            assert app.state.store.get_setting("protect.console_id") == "nvr-c"
+            assert app.state.store.get_camera_mappings() == []
+    finally:
+        app.state.store.close()
+
+
+def test_missing_previously_bound_console_identity_requires_confirmed_reset(tmp_path):
+    identity = {"value": "nvr-a"}
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(
+            _mutable_identity_protect_handler(identity)
+        ),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as client:
+            assert client.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert client.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            settings = {
+                "host": "protect.local",
+                "username": PROTECT_USER,
+                "password": PROTECT_PASS,
+            }
+            assert client.put("/api/settings/protect", json=settings).status_code == 200
+            app.state.store.set_camera_mapping("LOC1", CAM1, "Old camera")
+
+            identity["value"] = None
+            refused = client.put("/api/settings/protect", json=settings)
+            assert refused.status_code == 409
+            assert app.state.store.get_setting("protect.console_id") == "nvr-a"
+            assert app.state.store.get_camera_mappings()
+
+            token = _protect_switch_token(client, "protect.local")
+            switched = client.put(
+                "/api/settings/protect",
+                json={**settings, "console_switch_token": token},
+            )
+            assert switched.status_code == 200, switched.text
+            assert switched.json()["console_switched"] is True
+            assert app.state.store.get_setting("protect.console_id") is None
+            assert app.state.store.get_camera_mappings() == []
+    finally:
+        app.state.store.close()
+
+def test_confirmed_protect_console_switch_clears_only_console_scoped_state(configured):
+    _enable_alarm(configured)
+    assert configured.post("/api/sync").status_code == 200
+    store = configured.app.state.store
+    custom_deep_link = (
+        "https://{host}/protect/timeline?camera={camera_id}&at={ts_ms}"
+    )
+    store.set_setting("deep_link_template", custom_deep_link)
+    retained_before = store.get_transaction("PAY_001")
+    old_generation = store.get_setting("protect.console_generation")
+    store.upsert_transaction(
+        {
+            "id": "PAY_PENDING_EVIDENCE",
+            "created_at": "2026-07-16T16:00:00.000Z",
+            "ts_ms": 1784217600000,
+            "amount": 321,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+            "camera_id": CAM1,
+        }
+    )
+    assert store.claim_thumbnail_retries(1, 60, now=0)
+    assert any(store.thumbnail_dir.iterdir())
+
+    resp = configured.put(
+        "/api/settings/protect",
+        json={
+            "host": "192.168.1.2",
+            "username": PROTECT_USER,
+            "password": PROTECT_PASS,
+            "console_switch_token": _protect_switch_token(
+                configured, "192.168.1.2"
+            ),
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["console_switched"] is True
+    assert resp.json()["alarm_configured"] is False
+    assert store.get_setting("protect.host") == "192.168.1.2"
+    assert store.get_setting("protect.console_generation") != old_generation
+    assert store.get_setting("protect.api_key") is None
+    assert store.get_setting("protect.alarm_trigger_id") is None
+    assert store.get_setting("protect.alarm_enabled_after_ms") is None
+    assert store.get_setting("deep_link_template") == custom_deep_link
+    assert store.get_camera_mappings() == []
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM protect_evidence_retired"
+    ).fetchone()[0] == 3
+    assert store._db.execute("SELECT COUNT(*) FROM thumbnail_retries").fetchone()[0] == 0
+    assert list(store.thumbnail_dir.iterdir()) == []
+
+    retained_after = store.get_transaction("PAY_001")
+    for field in (
+        "id",
+        "created_at",
+        "ts_ms",
+        "amount",
+        "currency",
+        "status",
+        "location_id",
+        "card_last4",
+        "receipt_url",
+    ):
+        assert retained_after[field] == retained_before[field]
+    for txn in configured.get("/api/transactions").json():
+        assert txn["camera_id"] is None
+        assert txn["thumbnail_url"] is None
+        assert txn["deep_link"] is None
+
+    stale_save = configured.put(
+        "/api/camera-mapping",
+        json={
+            "mappings": [
+                {
+                    "location_id": "LOC1",
+                    "camera_id": CAM1,
+                    "camera_name": "Old Console Camera",
+                }
+            ]
+        },
+    )
+    assert stale_save.status_code == 409
+    assert store.get_camera_mappings() == []
+
+    # Re-selecting cameras must not reinterpret retained transactions as
+    # evidence from the new console.
+    _refresh_camera_generation(configured)
+    assert configured.put(
+        "/api/camera-mapping",
+        json={
+            "mappings": [
+                {
+                    "location_id": "LOC1",
+                    "camera_id": CAM2,
+                    "camera_name": "New Console Camera",
+                }
+            ]
+        },
+    ).status_code == 200
+    assert store._db.execute("SELECT COUNT(*) FROM thumbnail_retries").fetchone()[0] == 0
+    assert all(
+        txn["camera_id"] is None
+        for txn in configured.get("/api/transactions").json()
+    )
+
+    ingest_payment(
+        store,
+        {
+            "id": "PAY_NEW_CONSOLE",
+            "created_at": "2026-07-16T17:00:00.000Z",
+            "amount_money": {"amount": 777, "currency": "USD"},
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        },
+        protect=None,
+    )
+    new_txn = next(
+        txn
+        for txn in configured.get("/api/transactions").json()
+        if txn["id"] == "PAY_NEW_CONSOLE"
+    )
+    assert new_txn["camera_id"] == CAM2
+    assert new_txn["deep_link"] == (
+        f"https://192.168.1.2/protect/timeline?camera={CAM2}&at={new_txn['ts_ms']}"
+    )
+
+
+def test_transaction_listing_cannot_mix_old_evidence_with_new_console_host(
+    configured,
+    monkeypatch,
+):
+    assert configured.post("/api/sync").status_code == 200
+    store = configured.app.state.store
+    token = _protect_switch_token(configured, "192.168.1.2")
+    serialization_started = threading.Event()
+    release_serialization = threading.Event()
+    blocked_once = threading.Event()
+    original_get_setting = store.get_setting
+
+    def blocking_get_setting(key: str):
+        value = original_get_setting(key)
+        if key == "protect.host" and not blocked_once.is_set():
+            blocked_once.set()
+            serialization_started.set()
+            assert release_serialization.wait(timeout=10)
+        return value
+
+    monkeypatch.setattr(store, "get_setting", blocking_get_setting)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        listing_future = executor.submit(configured.get, "/api/transactions")
+        assert serialization_started.wait(timeout=3)
+        switch_future = executor.submit(
+            configured.put,
+            "/api/settings/protect",
+            json={
+                "host": "192.168.1.2",
+                "username": PROTECT_USER,
+                "password": PROTECT_PASS,
+                "console_switch_token": token,
+            },
+        )
+        try:
+            with pytest.raises(concurrent.futures.TimeoutError):
+                switch_future.result(timeout=0.05)
+            assert store.get_setting("protect.host") == "192.168.1.1"
+        finally:
+            release_serialization.set()
+        old_listing = listing_future.result(timeout=5)
+        switched = switch_future.result(timeout=5)
+
+    assert old_listing.status_code == 200
+    assert all(
+        not txn["deep_link"] or "192.168.1.1" in txn["deep_link"]
+        for txn in old_listing.json()
+    )
+    assert switched.status_code == 200, switched.text
+    assert all(
+        txn["camera_id"] is None
+        and txn["thumbnail_url"] is None
+        and txn["deep_link"] is None
+        for txn in configured.get("/api/transactions").json()
+    )
+
+
+def test_camera_mapping_read_completes_before_console_switch(
+    configured,
+    monkeypatch,
+):
+    store = configured.app.state.store
+    token = _protect_switch_token(configured, "192.168.1.2")
+    mapping_read_started = threading.Event()
+    release_mapping_read = threading.Event()
+    original_get_mappings = store.get_camera_mappings
+
+    def blocking_get_mappings():
+        mappings = original_get_mappings()
+        mapping_read_started.set()
+        assert release_mapping_read.wait(timeout=10)
+        return mappings
+
+    monkeypatch.setattr(store, "get_camera_mappings", blocking_get_mappings)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        mapping_future = executor.submit(configured.get, "/api/camera-mapping")
+        assert mapping_read_started.wait(timeout=3)
+        switch_future = executor.submit(
+            configured.put,
+            "/api/settings/protect",
+            json={
+                "host": "192.168.1.2",
+                "username": PROTECT_USER,
+                "password": PROTECT_PASS,
+                "console_switch_token": token,
+            },
+        )
+        try:
+            with pytest.raises(concurrent.futures.TimeoutError):
+                switch_future.result(timeout=0.05)
+        finally:
+            release_mapping_read.set()
+        old_mapping = mapping_future.result(timeout=5)
+        switched = switch_future.result(timeout=5)
+
+    assert old_mapping.status_code == 200
+    assert old_mapping.json()[0]["camera_id"] == CAM1
+    assert switched.status_code == 200, switched.text
+    monkeypatch.setattr(store, "get_camera_mappings", original_get_mappings)
+    assert configured.get("/api/camera-mapping").json() == []
 
 def test_deep_link_settings_default_response_does_not_expose_secrets(configured):
     resp = configured.get("/api/settings/deep-link")
@@ -951,6 +1480,7 @@ def test_snapshot_transport_error_stores_transaction_without_thumbnail(tmp_path)
             isolated.headers["X-Square-Account-Revision"] = square_response.json()[
                 "account_revision"
             ]
+            _refresh_camera_generation(isolated)
             assert isolated.put(
                 "/api/camera-mapping",
                 json={
@@ -1232,6 +1762,7 @@ def test_webhook_ack_and_transaction_listing_do_not_wait_for_snapshot(tmp_path):
             isolated.headers["X-Square-Account-Revision"] = square_response.json()[
                 "account_revision"
             ]
+            _refresh_camera_generation(isolated)
             assert isolated.put(
                 "/api/camera-mapping",
                 json={
@@ -1345,6 +1876,89 @@ def test_webhook_ack_does_not_wait_for_alarm_delivery(tmp_path):
         app.state.store.close()
 
 
+def test_console_switch_waits_for_inflight_old_console_alarm(tmp_path):
+    alarm_started = threading.Event()
+    release_alarm = threading.Event()
+
+    def blocking_alarm(request: httpx.Request) -> httpx.Response:
+        if "/alarm-manager/webhook/" in request.url.path:
+            alarm_started.set()
+            if not release_alarm.wait(timeout=10):
+                raise httpx.ReadTimeout("alarm test timed out", request=request)
+        return protect_handler(request)
+
+    app = create_app(
+        data_dir=tmp_path / "data",
+        protect_transport=httpx.MockTransport(blocking_alarm),
+        square_transport=httpx.MockTransport(square_handler),
+        enable_poller=False,
+    )
+    try:
+        with TestClient(app) as isolated:
+            assert isolated.post(
+                "/api/setup", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/protect",
+                json={
+                    "host": "192.168.1.1",
+                    "username": PROTECT_USER,
+                    "password": PROTECT_PASS,
+                    "api_key": PROTECT_API_KEY,
+                    "alarm_trigger_id": PROTECT_ALARM_TRIGGER_ID,
+                },
+            ).status_code == 200
+            assert isolated.put(
+                "/api/settings/square",
+                json={
+                    "access_token": SQUARE_TOKEN,
+                    "environment": "production",
+                    "webhook_signature_key": WEBHOOK_KEY,
+                    "webhook_url": WEBHOOK_URL,
+                },
+            ).status_code == 200
+            switch_token = _protect_switch_token(isolated, "192.168.1.2")
+
+            body = make_webhook_event(
+                "PAY_ALARM_SWITCH", created_at="2099-07-16T16:00:00.000Z"
+            )
+            assert isolated.post(
+                "/webhooks/square",
+                content=body,
+                headers={
+                    "x-square-hmacsha256-signature": _webhook_signature(body)
+                },
+            ).status_code == 200
+            assert alarm_started.wait(timeout=3)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                switch_future = executor.submit(
+                    isolated.put,
+                    "/api/settings/protect",
+                    json={
+                        "host": "192.168.1.2",
+                        "username": PROTECT_USER,
+                        "password": PROTECT_PASS,
+                        "console_switch_token": switch_token,
+                    },
+                )
+                with pytest.raises(concurrent.futures.TimeoutError):
+                    switch_future.result(timeout=0.05)
+                assert app.state.store.get_setting("protect.host") == "192.168.1.1"
+                release_alarm.set()
+                switched = switch_future.result(timeout=5)
+
+            assert switched.status_code == 200, switched.text
+            assert switched.json()["console_switched"] is True
+            assert app.state.store.get_setting("protect.host") == "192.168.1.2"
+    finally:
+        release_alarm.set()
+        app.state.store.close()
+
+
 def test_thumbnail_retry_recaptures_after_camera_changes_in_flight(tmp_path):
     snapshot_started = threading.Event()
     release_snapshot = threading.Event()
@@ -1437,6 +2051,7 @@ def test_webhook_burst_acks_immediately_and_queue_drains_all(tmp_path):
             isolated.headers["X-Square-Account-Revision"] = square_response.json()[
                 "account_revision"
             ]
+            _refresh_camera_generation(isolated)
             assert isolated.put(
                 "/api/camera-mapping",
                 json={
@@ -1519,6 +2134,7 @@ def test_single_coalesced_webhook_drain_exhausts_due_batches(tmp_path):
             isolated.headers["X-Square-Account-Revision"] = square_response.json()[
                 "account_revision"
             ]
+            _refresh_camera_generation(isolated)
             assert isolated.put(
                 "/api/camera-mapping",
                 json={

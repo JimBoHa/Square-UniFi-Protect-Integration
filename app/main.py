@@ -40,6 +40,10 @@ from .square_client import (
 )
 from .store import (
     ALARM_ENABLED_AFTER_SETTING,
+    PROTECT_CONSOLE_ID_SETTING,
+    PROTECT_CONSOLE_GENERATION_SETTING,
+    ProtectConsoleSwitchConfirmationRequired,
+    ProtectSettingsConflict,
     SquareAccountChanged,
     SquareAccountSwitchRequired,
     Store,
@@ -61,6 +65,8 @@ PROTECT_SETTING_KEYS = (
     "protect.verify_ssl",
     "protect.api_key",
     "protect.alarm_trigger_id",
+    PROTECT_CONSOLE_ID_SETTING,
+    PROTECT_CONSOLE_GENERATION_SETTING,
 )
 SQUARE_CLIENT_SETTING_KEYS = (
     "square.access_token",
@@ -120,6 +126,13 @@ class ProtectSettingsBody(BaseModel):
     api_key: str = Field(default="", max_length=512)
     alarm_trigger_id: str = Field(default="", max_length=256)
     disable_alarm: bool = False
+    console_switch_token: str = Field(default="", max_length=2048)
+
+class ProtectConsoleSwitchTokenBody(BaseModel):
+    host: str
+    username: str
+    password: str
+    verify_ssl: bool = False
 
 class SquareSettingsBody(BaseModel):
     access_token: str
@@ -283,6 +296,21 @@ def create_app(
             transport=square_transport,
         )
 
+    def verify_protect_console_identity(
+        protect: ProtectClient,
+        settings: dict[str, str | None],
+    ) -> None:
+        """Reject provider work when a previously bound NVR identity changed."""
+        expected_console_id = settings[PROTECT_CONSOLE_ID_SETTING]
+        if expected_console_id is None:
+            return
+        _, observed_console_id = protect.get_cameras_with_console_identity()
+        if observed_console_id != expected_console_id:
+            raise ProtectError(
+                "UniFi Protect console identity changed or disappeared; "
+                "reconnect Protect before processing camera evidence or alarms"
+            )
+
     def _drain_protect_work_queue() -> None:
         with drain_state_lock:
             app.state.thumbnail_drain_queued = False
@@ -291,6 +319,7 @@ def create_app(
         if protect is None:
             return
         try:
+            verify_protect_console_identity(protect, protect_settings)
             # Sale alarms first: a slow snapshot request must not delay the
             # Alarm Manager automation for a completed sale. The iteration
             # caps are a backstop: no realistic queue needs more than
@@ -347,12 +376,6 @@ def create_app(
     @app.on_event("shutdown")
     def _shutdown_thumbnail_executor() -> None:
         thumbnail_executor.shutdown(wait=True, cancel_futures=True)
-
-    def require_protect() -> ProtectClient:
-        client = build_protect()
-        if client is None:
-            raise HTTPException(status_code=409, detail="UniFi Protect is not configured")
-        return client
 
     def require_square() -> SquareClient:
         client = build_square()
@@ -529,6 +552,62 @@ def create_app(
         finally:
             discovery_scan_lock.release()
 
+    @app.post("/api/settings/protect/console-switch-token")
+    def protect_console_switch_token(
+        body: ProtectConsoleSwitchTokenBody,
+        response: Response,
+        _=authed,
+    ) -> dict:
+        """Verify the target console, then issue short-lived destructive consent."""
+        try:
+            host = validate_host(body.host)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        current_identity = store.get_settings(
+            (
+                "protect.host",
+                PROTECT_CONSOLE_ID_SETTING,
+                PROTECT_CONSOLE_GENERATION_SETTING,
+            )
+        )
+        client = ProtectClient(
+            host,
+            body.username,
+            body.password,
+            verify_ssl=body.verify_ssl,
+            transport=protect_transport,
+        )
+        try:
+            client.login()
+            _, console_id = client.get_cameras_with_console_identity()
+        except ProtectAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except (ProtectError, OSError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not reach UniFi Protect: {exc}",
+            )
+        finally:
+            client.close()
+        try:
+            token = store.protect_console_switch_token(
+                host,
+                console_id,
+                expected_host=current_identity["protect.host"],
+                expected_generation=current_identity[
+                    PROTECT_CONSOLE_GENERATION_SETTING
+                ],
+                expected_console_id=current_identity[PROTECT_CONSOLE_ID_SETTING],
+            )
+        except ProtectSettingsConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{exc}; review the Protect host and try again",
+                headers={"Cache-Control": "private, no-store"},
+            )
+        response.headers["Cache-Control"] = "private, no-store"
+        return {"token": token or ""}
+
     @app.put("/api/settings/protect")
     def set_protect(body: ProtectSettingsBody, _=authed) -> dict:
         if body.disable_alarm:
@@ -546,11 +625,73 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         submitted_api_key = body.api_key.strip()
-        stored_alarm_settings = store.get_settings(
-            ("protect.api_key", "protect.alarm_trigger_id")
+        stored_protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
+        stored_host = stored_protect_settings["protect.host"]
+        stored_generation = stored_protect_settings[PROTECT_CONSOLE_GENERATION_SETTING]
+        stored_console_id = stored_protect_settings[PROTECT_CONSOLE_ID_SETTING]
+        host_changed = bool(stored_host and stored_host != host)
+        if host_changed and not body.console_switch_token:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Protect host changed. Confirm the console switch to clear "
+                    "old camera mappings and Protect evidence, then save again."
+                ),
+            )
+        candidate_api_key = submitted_api_key or (
+            stored_protect_settings["protect.api_key"] if not host_changed else None
         )
-        stored_api_key = stored_alarm_settings["protect.api_key"]
-        stored_trigger_id = stored_alarm_settings["protect.alarm_trigger_id"]
+        client = ProtectClient(
+            host,
+            body.username,
+            body.password,
+            verify_ssl=body.verify_ssl,
+            transport=protect_transport,
+            api_key=candidate_api_key,
+        )
+        try:
+            client.login()
+            cameras, observed_console_id = client.get_cameras_with_console_identity()
+        except ProtectAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except (ProtectError, OSError) as exc:
+            raise HTTPException(status_code=502, detail=f"Could not reach UniFi Protect: {exc}")
+        finally:
+            client.close()
+        identity_changed = bool(
+            stored_host
+            and stored_console_id is not None
+            and stored_console_id != observed_console_id
+        )
+        console_switch_requested = host_changed or identity_changed
+        if console_switch_requested and not store.protect_console_switch_token_valid(
+            body.console_switch_token,
+            host,
+            observed_console_id,
+        ):
+            identity_reason = (
+                "Protect console identity changed or disappeared. "
+                if identity_changed
+                else "Protect host changed. "
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    identity_reason
+                    + "Confirm the console switch to clear old camera mappings "
+                    "and Protect evidence, then save again."
+                ),
+            )
+        # API keys and alarm triggers are console-specific. Blank values retain
+        # them only after the same console identity has been verified.
+        stored_api_key = (
+            None if console_switch_requested else stored_protect_settings["protect.api_key"]
+        )
+        stored_trigger_id = (
+            None
+            if console_switch_requested
+            else stored_protect_settings["protect.alarm_trigger_id"]
+        )
         effective_api_key = submitted_api_key or stored_api_key
         effective_trigger_id = submitted_trigger_id or stored_trigger_id
         if effective_trigger_id and not effective_api_key:
@@ -558,25 +699,26 @@ def create_app(
                 status_code=422,
                 detail="Protect API key is required when an alarm trigger id is set",
             )
-        client = ProtectClient(
-            host,
-            body.username,
-            body.password,
-            verify_ssl=body.verify_ssl,
-            transport=protect_transport,
-            api_key=effective_api_key,
-        )
-        try:
-            client.login()
-            cameras = client.get_cameras()
-            if effective_api_key:
-                client.get_integration_info()
-        except ProtectAuthError as exc:
-            raise HTTPException(status_code=401, detail=str(exc))
-        except (ProtectError, OSError) as exc:
-            raise HTTPException(status_code=502, detail=f"Could not reach UniFi Protect: {exc}")
-        finally:
-            client.close()
+        if effective_api_key:
+            integration_client = ProtectClient(
+                host,
+                body.username,
+                body.password,
+                verify_ssl=body.verify_ssl,
+                transport=protect_transport,
+                api_key=effective_api_key,
+            )
+            try:
+                integration_client.get_integration_info()
+            except ProtectAuthError as exc:
+                raise HTTPException(status_code=401, detail=str(exc))
+            except (ProtectError, OSError) as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Could not reach UniFi Protect: {exc}",
+                )
+            finally:
+                integration_client.close()
         settings_updates = {
             "protect.host": (host, False),
             "protect.username": (body.username, False),
@@ -591,16 +733,48 @@ def create_app(
                 False,
             )
         alarm_is_configured = bool(effective_api_key and effective_trigger_id)
-        store.update_settings(
-            settings_updates,
-            activate_alarm_at_ms=(
-                int(time.time() * 1000) if alarm_is_configured else None
-            ),
+        delete_keys = (
+            (
+                "protect.api_key",
+                "protect.alarm_trigger_id",
+                ALARM_ENABLED_AFTER_SETTING,
+            )
+            if console_switch_requested
+            else ()
         )
+
+        def commit_protect_settings() -> bool:
+            return store.update_protect_settings(
+                settings_updates,
+                expected_host=stored_host,
+                expected_generation=stored_generation,
+                expected_console_id=stored_console_id,
+                observed_console_id=observed_console_id,
+                console_switch_token=body.console_switch_token,
+                delete_keys=delete_keys,
+                activate_alarm_at_ms=(
+                    int(time.time() * 1000) if alarm_is_configured else None
+                ),
+            )
+
+        try:
+            if console_switch_requested:
+                with store.integration_guard(exclusive=True):
+                    console_switched = commit_protect_settings()
+            else:
+                console_switched = commit_protect_settings()
+        except ProtectConsoleSwitchConfirmationRequired as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ProtectSettingsConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{exc}; review the Protect host and try again",
+            )
         return {
             "ok": True,
             "cameras": len(cameras),
             "alarm_configured": alarm_is_configured,
+            "console_switched": console_switched,
         }
 
     @app.put("/api/settings/square")
@@ -894,14 +1068,52 @@ def create_app(
         }
 
     @app.get("/api/cameras")
-    def cameras(_=authed) -> list[dict]:
-        client = require_protect()
+    def cameras(response: Response, _=authed) -> list[dict]:
+        with store.integration_guard():
+            return _cameras_locked(response)
+
+    def _cameras_locked(response: Response) -> list[dict]:
+        settings = store.get_settings(PROTECT_SETTING_KEYS)
+        client = build_protect(settings)
+        if client is None:
+            raise HTTPException(status_code=409, detail="UniFi Protect is not configured")
         try:
-            return client.get_cameras()
+            camera_rows, observed_console_id = client.get_cameras_with_console_identity()
         except ProtectError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         finally:
             client.close()
+        current_identity = store.get_settings(
+            (
+                "protect.host",
+                PROTECT_CONSOLE_ID_SETTING,
+                PROTECT_CONSOLE_GENERATION_SETTING,
+            )
+        )
+        if (
+            current_identity["protect.host"] != settings["protect.host"]
+            or current_identity[PROTECT_CONSOLE_GENERATION_SETTING]
+            != settings[PROTECT_CONSOLE_GENERATION_SETTING]
+            or current_identity[PROTECT_CONSOLE_ID_SETTING]
+            != settings[PROTECT_CONSOLE_ID_SETTING]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Protect console changed while cameras were loading; reload settings",
+            )
+        if (
+            settings[PROTECT_CONSOLE_ID_SETTING] is not None
+            and observed_console_id != settings[PROTECT_CONSOLE_ID_SETTING]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Protect console identity changed; reconnect Protect before loading cameras",
+            )
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["X-Protect-Console-Generation"] = (
+            settings[PROTECT_CONSOLE_GENERATION_SETTING] or ""
+        )
+        return camera_rows
 
     @app.get("/api/health/square")
     def square_health(_=authed) -> dict:
@@ -956,8 +1168,16 @@ def create_app(
             camera_id = validate_camera_id(camera_id)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        client = require_protect()
+        with store.integration_guard():
+            return _camera_preview_locked(camera_id)
+
+    def _camera_preview_locked(camera_id: str) -> Response:
+        protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
+        client = build_protect(protect_settings)
+        if client is None:
+            raise HTTPException(status_code=409, detail="UniFi Protect is not configured")
         try:
+            verify_protect_console_identity(client, protect_settings)
             image = client.get_snapshot(camera_id)
         except ProtectError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
@@ -978,7 +1198,24 @@ def create_app(
             )
 
     @app.put("/api/camera-mapping")
-    def set_mapping(body: CameraMappingBody, request: Request, _=authed) -> dict:
+    def set_mapping(request: Request, body: CameraMappingBody, _=authed) -> dict:
+        account_revision = request.headers.get("x-square-account-revision")
+        if not account_revision:
+            raise HTTPException(
+                status_code=409,
+                detail="Reload settings before saving camera mappings",
+            )
+        expected_generation = request.headers.get("x-protect-console-generation")
+        if not expected_generation:
+            if account_revision != store.square_account_revision():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Square account changed; reload settings",
+                )
+            raise HTTPException(
+                status_code=428,
+                detail="Reload cameras before saving camera mappings",
+            )
         if len(body.mappings) > MAX_CAMERA_MAPPINGS:
             raise HTTPException(
                 status_code=422,
@@ -1000,12 +1237,6 @@ def create_app(
                 validate_camera_id(entry.camera_id)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc))
-        account_revision = request.headers.get("x-square-account-revision")
-        if not account_revision:
-            raise HTTPException(
-                status_code=409,
-                detail="Reload settings before saving camera mappings",
-            )
         try:
             store.replace_camera_mappings(
                 [
@@ -1019,9 +1250,12 @@ def create_app(
                     for entry in body.mappings
                 ],
                 expected_account_revision=account_revision,
+                expected_protect_generation=expected_generation,
             )
         except SquareAccountChanged as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ProtectSettingsConflict as exc:
+            raise HTTPException(status_code=409, detail=f"{exc}; reload settings")
         nudge_protect_work_queue()
         return {"ok": True, "count": len(body.mappings)}
 
@@ -1208,6 +1442,8 @@ def create_app(
                 protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
                 protect = build_protect(protect_settings)
                 try:
+                    if protect:
+                        verify_protect_console_identity(protect, protect_settings)
                     return sync.sync_payments(
                         store,
                         square,

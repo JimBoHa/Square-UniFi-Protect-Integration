@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import threading
 from pathlib import Path
@@ -891,6 +892,78 @@ def test_retry_io_does_not_hold_database_claim_lock(tmp_path):
         thread.join(2)
         worker_store.close()
         other_store.close()
+
+
+def test_console_switch_invalidates_thumbnail_retry_in_flight(tmp_path):
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+
+    class OldProtect:
+        host = "old-console.local"
+
+        def get_snapshot(self, camera_id, ts_ms=None):
+            snapshot_started.set()
+            assert release_snapshot.wait(timeout=5)
+            return b"old console retry evidence"
+
+    store = Store(tmp_path / "data")
+    initial_settings = {
+        "protect.host": ("old-console.local", False),
+        "protect.username": ("user", False),
+        "protect.password": ("password", True),
+        "protect.verify_ssl": ("0", False),
+    }
+    assert store.update_protect_settings(
+        initial_settings,
+        expected_host=None,
+        expected_generation=None,
+    ) is False
+    store.set_camera_mapping("LOC1", CAM_A, "Register")
+    ingest_payment(
+        store,
+        _payment("P_SWITCH", "2026-07-16T15:30:00.000Z"),
+        protect=None,
+    )
+    generation = store.get_setting("protect.console_generation")
+    switch_token = store.protect_console_switch_token(
+        "new-console.local",
+        None,
+        expected_host="old-console.local",
+        expected_generation=generation,
+        expected_console_id=None,
+    )
+    assert switch_token
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                retry_missing_thumbnails,
+                store,
+                OldProtect(),
+                batch_size=1,
+                now=100,
+            )
+            assert snapshot_started.wait(timeout=3)
+            assert store.update_protect_settings(
+                {
+                    **initial_settings,
+                    "protect.host": ("new-console.local", False),
+                },
+                expected_host="old-console.local",
+                expected_generation=generation,
+                console_switch_token=switch_token,
+            )
+            release_snapshot.set()
+            assert future.result(timeout=5) == 0
+
+        saved = store.get_transaction("P_SWITCH")
+        assert saved["camera_id"] is None
+        assert saved["thumbnail_path"] is None
+        assert store.claim_thumbnail_retries(1, 5, now=100) == []
+        assert list(store.thumbnail_dir.iterdir()) == []
+    finally:
+        release_snapshot.set()
+        store.close()
 
 
 def test_existing_missing_thumbnail_is_backfilled_on_migration(tmp_path):

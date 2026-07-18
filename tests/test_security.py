@@ -33,6 +33,7 @@ PROTECTED_ENDPOINTS = [
     ("PUT", "/api/settings/protect"),
     ("GET", "/api/settings/deep-link"),
     ("PUT", "/api/settings/deep-link"),
+    ("POST", "/api/settings/protect/console-switch-token"),
     ("PUT", "/api/settings/square"),
     ("POST", "/api/logout"),
 ]

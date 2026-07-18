@@ -17,6 +17,13 @@
   </header>
 
   <main>
+    <!-- Startup error recovery -->
+    <section id="view-boot-error" hidden>
+      <h2>Could not load the application</h2>
+      <p id="boot-error-detail" role="alert"></p>
+      <button type="button" id="boot-retry">Try again</button>
+    </section>
+
     <!-- First-run setup -->
     <section id="view-setup" hidden>
       <h2>Create admin password</h2>
@@ -209,6 +216,7 @@
     <p id="message" role="status"></p>
   </main>
 
+  <script src="/boot-recovery.js"></script>
   <script src="/protect-console-switch.js"></script>
   <script src="/format.js"></script>
   <script src="/square-form.js"></script>

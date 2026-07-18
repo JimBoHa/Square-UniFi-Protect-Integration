@@ -330,13 +330,21 @@ def test_square_settings_transport_error_returns_502(tmp_path):
         app.state.store.close()
 
 
-@pytest.mark.parametrize("malformed", ["html", "shape"])
+@pytest.mark.parametrize("malformed", ["html", "shape", "camera-id", "camera-name"])
 def test_protect_settings_malformed_camera_response_returns_502(tmp_path, malformed):
     def malformed_protect(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/auth/login":
             return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
         if malformed == "html":
             return httpx.Response(200, content=b"<html>private console body</html>")
+        if malformed == "camera-id":
+            return httpx.Response(
+                200, json={"cameras": [{"id": {"private": "camera id"}}]}
+            )
+        if malformed == "camera-name":
+            return httpx.Response(
+                200, json={"cameras": [{"id": "cam1", "name": ["private name"]}]}
+            )
         return httpx.Response(200, json={"cameras": ["private camera item"]})
 
     app = create_app(
@@ -368,6 +376,8 @@ def test_protect_settings_malformed_camera_response_returns_502(tmp_path, malfor
         )
         assert "private console body" not in response.text
         assert "private camera item" not in response.text
+        assert "private name" not in response.text
+        assert "camera id" not in response.text
         assert app.state.store.get_setting("protect.host") is None
     finally:
         app.state.store.close()

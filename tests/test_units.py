@@ -360,6 +360,11 @@ def test_protect_camera_html_response_is_normalized():
         [],
         {"cameras": {}},
         {"cameras": ["private camera item"]},
+        {"cameras": [{"id": {"private": "camera id"}}]},
+        {"cameras": [{"id": "../private-camera"}]},
+        {"cameras": [{"id": "cam1", "name": ["private camera name"]}]},
+        {"cameras": [{"id": "cam1", "marketName": {}}]},
+        {"cameras": [{"id": "cam1", "state": []}]},
     ],
 )
 def test_protect_camera_response_shapes_are_normalized(payload):

@@ -78,6 +78,7 @@ function enterApp() {
   loadTransactions({ reset: true });
   loadSettingsView();
   startTransactionRefresh();
+  startDashboardRefresh();
 }
 
 // ---------------------------------------------------------------- auth
@@ -505,6 +506,62 @@ function renderTransactions(txns) {
     row.appendChild(meta);
     list.appendChild(row);
   }
+}
+
+function setTile(name, state, value, hint) {
+  const tile = document.querySelector(`.tile[data-tile="${name}"]`);
+  tile.className = `tile ${state}`;
+  tile.querySelector(".tile-value").textContent = value;
+  tile.querySelector(".tile-hint").textContent = hint || "";
+}
+
+let dashboardTimer = null;
+
+async function refreshDashboard() {
+  let data;
+  try {
+    data = await api("/api/dashboard");
+  } catch {
+    return;
+  }
+  $("#dashboard-tiles").hidden = false;
+
+  const conn = (info, fixHint) => {
+    if (!info.configured) return ["idle", "Not connected", fixHint];
+    if (info.ok) return ["ok", info.detail, ""];
+    return ["bad", "Problem", info.detail];
+  };
+  setTile("protect", ...conn(data.protect, "Connect it in Settings"));
+  setTile("square", ...conn(data.square, "Connect it in Settings"));
+
+  if (!data.webhook.configured) {
+    setTile("webhook", "idle", "Not configured",
+      "Optional: real-time sales via Settings; polling still syncs every minute");
+  } else if (data.webhook.last_event_ms) {
+    const minutes = Math.round((Date.now() - data.webhook.last_event_ms) / 60000);
+    const age = minutes < 1 ? "just now" : `${minutes} min ago`;
+    setTile("webhook", "ok", `Last event ${age}`, "");
+  } else {
+    setTile("webhook", "idle", "Waiting for first event",
+      "Check the Square webhook subscription if sales are not arriving");
+  }
+
+  const pending = data.queues.thumbnails_pending + data.queues.alarms_pending;
+  if (pending === 0) {
+    setTile("queues", "ok", "All caught up", "");
+  } else {
+    setTile("queues", "idle", `${pending} pending`,
+      `${data.queues.thumbnails_pending} thumbnail(s), ${data.queues.alarms_pending} alarm(s) retrying`);
+  }
+}
+
+function startDashboardRefresh() {
+  if (dashboardTimer !== null) return;
+  refreshDashboard();
+  dashboardTimer = window.setInterval(() => {
+    if (document.visibilityState === "visible" && !$("#nav").hidden)
+      refreshDashboard();
+  }, 60000);
 }
 
 async function loadTransactions({

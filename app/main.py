@@ -758,6 +758,69 @@ def create_app(
             ),
         }
 
+    @app.get("/api/dashboard")
+    def dashboard(_=authed) -> dict:
+        """Live status tiles: connections, webhook freshness, queue depths."""
+        protect: dict = {"configured": False, "ok": False, "detail": "Not configured"}
+        client = build_protect()
+        if client is not None:
+            try:
+                cameras = client.get_cameras()
+                protect = {
+                    "configured": True,
+                    "ok": True,
+                    "detail": f"Connected — {len(cameras)} cameras",
+                }
+            except ProtectAuthError as exc:
+                protect = {"configured": True, "ok": False, "detail": str(exc)}
+            except ProtectError as exc:
+                protect = {"configured": True, "ok": False, "detail": str(exc)}
+            finally:
+                client.close()
+
+        square: dict = {"configured": False, "ok": False, "detail": "Not configured"}
+        square_client = build_square()
+        if square_client is not None:
+            try:
+                locations = square_client.list_locations()
+                square = {
+                    "configured": True,
+                    "ok": True,
+                    "detail": f"Connected — {len(locations)} location(s)",
+                }
+            except SquareAuthError as exc:
+                square = {"configured": True, "ok": False, "detail": str(exc)}
+            except SquareError as exc:
+                square = {"configured": True, "ok": False, "detail": str(exc)}
+            finally:
+                square_client.close()
+
+        webhook_settings = store.get_settings(
+            ("square.webhook_signature_key", "webhook.last_event_ms")
+        )
+        last_event_ms = None
+        raw_last = webhook_settings["webhook.last_event_ms"]
+        if raw_last:
+            try:
+                last_event_ms = int(raw_last)
+            except ValueError:
+                last_event_ms = None
+        webhook = {
+            "configured": bool(webhook_settings["square.webhook_signature_key"]),
+            "last_event_ms": last_event_ms,
+        }
+
+        queues = store.queue_depths()
+        if not store.get_setting("protect.alarm_trigger_id"):
+            # Idle alarm states are meaningless while the feature is off.
+            queues["alarms_pending"] = 0
+        return {
+            "protect": protect,
+            "square": square,
+            "webhook": webhook,
+            "queues": queues,
+        }
+
     @app.get("/api/transactions")
     def transactions(
         response: Response,
@@ -874,6 +937,7 @@ def create_app(
         signature = request.headers.get("x-square-hmacsha256-signature", "")
         if not verify_webhook_signature(signature_key, webhook_url, body, signature):
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        store.set_setting("webhook.last_event_ms", str(int(time.time() * 1000)))
         import json as _json
 
         try:

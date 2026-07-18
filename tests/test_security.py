@@ -185,6 +185,17 @@ def test_api_never_returns_stored_secrets(configured):
         assert PROTECT_PASS not in text
 
 
+def test_transaction_data_and_camera_media_are_not_cached(configured):
+    preview = configured.get("/api/camera-preview/cam1aaaaaaaaaaaaaaaaaaaaa")
+    assert configured.post("/api/sync").status_code == 200
+    transactions = configured.get("/api/transactions")
+    thumbnail = configured.get(transactions.json()[0]["thumbnail_url"])
+
+    for response in (preview, transactions, thumbnail):
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "private, no-store"
+
+
 # -- input validation / SSRF ---------------------------------------------------------
 
 @pytest.mark.parametrize(

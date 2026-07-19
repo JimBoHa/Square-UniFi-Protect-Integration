@@ -54,7 +54,7 @@ async function api(path, options = {}) {
   if (sessionExpired) {
     show("#view-login");
     $("#nav").hidden = true;
-    throw new Error("Please log in");
+    throw sessionExpiredError();
   }
   if (!resp.ok) {
     const detail = data.detail;
@@ -75,12 +75,25 @@ async function api(path, options = {}) {
 
 // ---------------------------------------------------------------- boot
 
+function showBootFailure(error) {
+  $("#nav").hidden = true;
+  $("#boot-error-detail").textContent = bootFailureMessage(error);
+  $("#boot-retry").disabled = false;
+  show("#view-boot-error");
+}
+
 async function boot() {
   if (new URLSearchParams(window.location.search).get("square_oauth") === "connected") {
     message("Square account connected via OAuth.", "ok");
     window.history.replaceState({}, "", "/");
   }
-  const status = await api("/api/status");
+  let status;
+  try {
+    status = await api("/api/status");
+  } catch (err) {
+    showBootFailure(err);
+    return;
+  }
   if (!status.setup_complete) {
     show("#view-setup");
     return;
@@ -89,10 +102,17 @@ async function boot() {
   try {
     await api("/api/camera-mapping");
     await enterAppOrWizard();
-  } catch {
-    /* api() already routed to login view */
+  } catch (err) {
+    if (isSessionExpiredError(err)) return;
+    showBootFailure(err);
   }
 }
+
+$("#boot-retry").addEventListener("click", () => {
+  $("#boot-retry").disabled = true;
+  $("#boot-error-detail").textContent = "Retrying…";
+  void boot();
+});
 
 function enterApp() {
   $("#nav").hidden = false;

@@ -64,7 +64,8 @@ def _assert_pair_loads(cert_path, key_path) -> None:
 def test_cert_generated_once_with_private_key_permissions(tmp_path):
     cert_path, key_path = ensure_self_signed_cert(tmp_path)
     assert cert_path.is_file() and key_path.is_file()
-    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+    if os.name == "posix":
+        assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
 
     cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
     san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)

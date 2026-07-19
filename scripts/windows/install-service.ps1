@@ -15,9 +15,9 @@ if ($Uninstall) {
 if (-not (Test-Path "$Repo\.venv\Scripts\python.exe")) {
   Write-Host "Setting up the Python environment..."
   python -m venv "$Repo\.venv"
-  & "$Repo\.venv\Scripts\pip.exe" install --quiet --upgrade pip
-  & "$Repo\.venv\Scripts\pip.exe" install --quiet -e $Repo
 }
+& "$Repo\.venv\Scripts\python.exe" "$Repo\scripts\ensure_dependencies.py" `
+  "$Repo" "$Repo\.venv"
 
 $Action = New-ScheduledTaskAction `
   -Execute "$Repo\.venv\Scripts\pythonw.exe" `

@@ -555,7 +555,10 @@ class Poller:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop future polls and wait for any in-flight sync to finish."""
         self._stop.set()
+        if self._thread is not threading.current_thread() and self._thread.is_alive():
+            self._thread.join()
 
     def _run(self) -> None:
         while not self._stop.wait(self._interval):

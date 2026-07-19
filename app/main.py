@@ -376,10 +376,6 @@ def create_app(
             with drain_state_lock:
                 app.state.thumbnail_drain_queued = False
 
-    @app.on_event("shutdown")
-    def _shutdown_thumbnail_executor() -> None:
-        thumbnail_executor.shutdown(wait=True, cancel_futures=True)
-
     def require_square() -> SquareClient:
         client = build_square()
         if client is None:
@@ -1623,6 +1619,7 @@ def create_app(
 
     # -- background poller ---------------------------------------------------------
 
+    poller: sync.Poller | None = None
     if poll_interval is not None:
         poller = sync.Poller(run_sync, interval_seconds=poll_interval)
         app.state.poller = poller
@@ -1631,9 +1628,14 @@ def create_app(
         def _start_poller() -> None:
             poller.start()
 
-        @app.on_event("shutdown")
-        def _stop_poller() -> None:
+    @app.on_event("shutdown")
+    def _shutdown_background_work() -> None:
+        # FastAPI runs shutdown handlers in registration order. Keep this as
+        # one ordered lifecycle so no worker can touch a closed dependency.
+        if poller is not None:
             poller.stop()
+        thumbnail_executor.shutdown(wait=True, cancel_futures=True)
+        store.close()
 
     return app
 

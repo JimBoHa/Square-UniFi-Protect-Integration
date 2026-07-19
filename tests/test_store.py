@@ -1526,6 +1526,66 @@ def test_store_migrates_unfiltered_snapshot_to_filter_bound_schema(tmp_path):
     assert "legacy_snapshot" not in signatures[1]
 
 
+def test_snapshot_migration_does_not_reuse_expired_ids(tmp_path):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    store.upsert_transaction(
+        {
+            "id": "PAY_SNAPSHOT_SEQUENCE",
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "ts_ms": 100,
+            "amount": 100,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        }
+    )
+    _page, expired_snapshot = store.list_transactions_page(limit=1)
+    store.close()
+
+    # Recreate the previous schema after all retained snapshots expired. Its
+    # AUTOINCREMENT sequence must survive even though the table itself is empty.
+    db = sqlite3.connect(data_dir / "spi.db")
+    db.executescript(
+        """
+        DROP TRIGGER invalidate_transaction_feed_after_delete;
+        DROP INDEX idx_transaction_feed_snapshots_access;
+        ALTER TABLE transaction_feed_snapshots
+            RENAME TO transaction_feed_snapshots_current;
+        CREATE TABLE transaction_feed_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_revision INTEGER NOT NULL,
+            rowid_boundary INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            last_accessed_at REAL NOT NULL,
+            UNIQUE (order_revision, rowid_boundary)
+        );
+        DROP TABLE transaction_feed_snapshots_current;
+        DELETE FROM sqlite_sequence
+        WHERE name = 'transaction_feed_snapshots';
+        INSERT INTO sqlite_sequence (name, seq)
+        VALUES ('transaction_feed_snapshots', 42);
+        """
+    )
+    db.commit()
+    db.close()
+
+    reopened = Store(data_dir)
+    try:
+        page, new_snapshot = reopened.list_transactions_page(limit=1)
+        with pytest.raises(TransactionSnapshotExpired):
+            reopened.list_transactions_page(
+                limit=1,
+                snapshot_id=expired_snapshot,
+            )
+    finally:
+        reopened.close()
+
+    assert expired_snapshot == 1
+    assert new_snapshot == 43
+    assert [row["id"] for row in page] == ["PAY_SNAPSHOT_SEQUENCE"]
+
+
 def test_stale_event_with_old_timestamp_cannot_overwrite_thumbnail_file(tmp_path):
     """A delayed out-of-order event carries the uncorrected sale time. The
     versioned upsert already ignores its row; the on-disk thumbnail must not

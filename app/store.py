@@ -627,6 +627,11 @@ class Store:
         # SQLite cannot extend the existing UNIQUE constraint in place. Keep
         # unfiltered snapshot ids valid while rebuilding the small bounded
         # table with filter_signature included in its identity.
+        sequence = self._db.execute(
+            "SELECT seq FROM sqlite_sequence "
+            "WHERE name = 'transaction_feed_snapshots'"
+        ).fetchone()
+        sequence_high_watermark = int(sequence["seq"]) if sequence else 0
         self._db.execute("DROP TRIGGER IF EXISTS invalidate_transaction_feed_after_delete")
         self._db.execute("DROP INDEX IF EXISTS idx_transaction_feed_snapshots_access")
         self._db.execute(
@@ -656,6 +661,16 @@ class Store:
             FROM transaction_feed_snapshots_legacy
             """
         )
+        updated_sequence = self._db.execute(
+            "UPDATE sqlite_sequence SET seq = MAX(COALESCE(seq, 0), ?) "
+            "WHERE name = 'transaction_feed_snapshots'",
+            (sequence_high_watermark,),
+        )
+        if updated_sequence.rowcount == 0:
+            self._db.execute(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+                ("transaction_feed_snapshots", sequence_high_watermark),
+            )
         self._db.execute("DROP TABLE transaction_feed_snapshots_legacy")
         self._db.execute(
             "CREATE INDEX idx_transaction_feed_snapshots_access "

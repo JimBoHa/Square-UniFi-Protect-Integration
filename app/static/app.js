@@ -565,7 +565,7 @@ function buildMappingRows(container, data) {
     for (const target of targets) {
       const row = document.createElement("div");
       row.className = "mapping-row";
-      const label = document.createElement("span");
+      const label = document.createElement("label");
       label.className = "loc";
       const locationName = loc.name || loc.id;
       if (target.device_id) {
@@ -576,6 +576,12 @@ function buildMappingRows(container, data) {
         label.textContent = locationName;
       }
       const select = document.createElement("select");
+      select.id = cameraMappingSelectId(
+        container.id,
+        loc.id,
+        target.device_id,
+      );
+      label.htmlFor = select.id;
       select.dataset.locationId = loc.id;
       select.dataset.deviceId = target.device_id || "";
       select.dataset.deviceName = target.device_name || "";

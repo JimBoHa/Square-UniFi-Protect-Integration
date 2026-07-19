@@ -6,6 +6,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const {
+  cameraMappingSelectId,
   protectConnectionMessage,
   protectConsoleSwitchTokenRequest,
   publishLatestSettingsLoad,
@@ -55,6 +56,42 @@ test("same-host refresh does not claim that evidence was cleared", () => {
   });
   assert.match(message, /Alarm trigger enabled/);
   assert.doesNotMatch(message, /cleared/);
+});
+
+test("camera mapping controls get stable globally unique ids", () => {
+  const settingsFallback = cameraMappingSelectId("mapping-rows", "LOC1", "");
+  assert.equal(
+    settingsFallback,
+    cameraMappingSelectId("mapping-rows", "LOC1", ""),
+  );
+  assert.notEqual(
+    settingsFallback,
+    cameraMappingSelectId("mapping-rows", "LOC1", "fallback"),
+  );
+  assert.notEqual(
+    settingsFallback,
+    cameraMappingSelectId("wiz-mapping-rows", "LOC1", ""),
+  );
+  assert.notEqual(
+    cameraMappingSelectId("mapping-rows", "LOC-1", "DEVICE-2"),
+    cameraMappingSelectId("mapping-rows", "LOC", "1-DEVICE-2"),
+  );
+  assert.doesNotMatch(settingsFallback, /\s/);
+});
+
+test("generated camera selects use their visible text as a label", () => {
+  const app = fs.readFileSync(
+    path.join(__dirname, "../app/static/app.js"),
+    "utf8",
+  );
+  const buildStart = app.indexOf("function buildMappingRows");
+  const buildEnd = app.indexOf("function collectMappings", buildStart);
+  const build = app.slice(buildStart, buildEnd);
+
+  assert.match(build, /const label = document\.createElement\("label"\)/);
+  assert.match(build, /select\.id = cameraMappingSelectId\(/);
+  assert.match(build, /label\.htmlFor = select\.id/);
+  assert.ok(build.indexOf("label.htmlFor = select.id") < build.indexOf("row.appendChild(label)"));
 });
 
 test("older settings load cannot publish cameras with a newer generation", async () => {

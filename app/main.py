@@ -44,10 +44,12 @@ from .store import (
     ALARM_ENABLED_AFTER_SETTING,
     PROTECT_CONSOLE_ID_SETTING,
     PROTECT_CONSOLE_GENERATION_SETTING,
+    SQUARE_OAUTH_AUTHORIZATION_REVISION_SETTING,
     ProtectConsoleSwitchConfirmationRequired,
     ProtectSettingsConflict,
     SquareAccountChanged,
     SquareAccountSwitchRequired,
+    SQUARE_OAUTH_PENDING_SETTING_KEYS,
     Store,
     TransactionSnapshotExpired,
 )
@@ -267,53 +269,71 @@ def create_app(
         )
 
     def _maybe_refresh_oauth_token() -> None:
-        oauth = store.get_settings(
-            (
-                "square.oauth_client_id",
-                "square.oauth_client_secret",
-                "square.refresh_token",
-                "square.token_expires_at",
-                "square.environment",
+        # Serialize exchanges without taking the provider-state writer. A
+        # confirmed account switch may complete while Square is slow; the exact
+        # snapshot fence in update_square_oauth_tokens then discards this result.
+        with store.square_oauth_refresh_guard():
+            oauth = store.get_settings(
+                (
+                    "square.access_token",
+                    "square.oauth_client_id",
+                    "square.oauth_client_secret",
+                    "square.refresh_token",
+                    "square.token_expires_at",
+                    "square.environment",
+                    "square.merchant_id",
+                    "square.account_revision",
+                )
             )
-        )
-        if not (
-            oauth["square.oauth_client_id"]
-            and oauth["square.oauth_client_secret"]
-            and oauth["square.refresh_token"]
-            and oauth["square.token_expires_at"]
-        ):
-            return
-        try:
-            expires = datetime.datetime.fromisoformat(
-                oauth["square.token_expires_at"].replace("Z", "+00:00")
-            )
-        except ValueError:
-            return
-        now = datetime.datetime.now(datetime.timezone.utc)
-        if expires - now > datetime.timedelta(days=3):
-            return
-        try:
-            tokens = oauth_exchange(
-                oauth["square.environment"] or "production",
-                oauth["square.oauth_client_id"],
-                oauth["square.oauth_client_secret"],
-                refresh_token=oauth["square.refresh_token"],
-                transport=square_transport,
-            )
-        except SquareError as exc:
-            logger.warning("Square OAuth token refresh failed: %s", exc)
-            return
-        store.update_settings(
-            {
-                "square.access_token": (tokens["access_token"], True),
-                "square.refresh_token": (
-                    tokens.get("refresh_token")
-                    or oauth["square.refresh_token"],
-                    True,
-                ),
-                "square.token_expires_at": (tokens.get("expires_at", ""), False),
-            }
-        )
+            if not (
+                oauth["square.oauth_client_id"]
+                and oauth["square.oauth_client_secret"]
+                and oauth["square.refresh_token"]
+                and oauth["square.token_expires_at"]
+            ):
+                return
+            try:
+                expires = datetime.datetime.fromisoformat(
+                    oauth["square.token_expires_at"].replace("Z", "+00:00")
+                )
+            except ValueError:
+                return
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if expires - now > datetime.timedelta(days=3):
+                return
+            try:
+                tokens = oauth_exchange(
+                    oauth["square.environment"] or "production",
+                    oauth["square.oauth_client_id"],
+                    oauth["square.oauth_client_secret"],
+                    refresh_token=oauth["square.refresh_token"],
+                    transport=square_transport,
+                )
+            except SquareError as exc:
+                logger.warning("Square OAuth token refresh failed: %s", exc)
+                return
+            try:
+                store.update_square_oauth_tokens(
+                    access_token=tokens["access_token"],
+                    refresh_token=(
+                        tokens.get("refresh_token")
+                        or oauth["square.refresh_token"]
+                    ),
+                    token_expires_at=tokens.get("expires_at", ""),
+                    expected_access_token=oauth["square.access_token"],
+                    expected_refresh_token=oauth["square.refresh_token"],
+                    expected_merchant_id=oauth["square.merchant_id"],
+                    expected_environment=oauth["square.environment"],
+                    expected_account_revision=oauth["square.account_revision"],
+                    expected_oauth_client_id=oauth["square.oauth_client_id"],
+                    expected_oauth_client_secret=(
+                        oauth["square.oauth_client_secret"]
+                    ),
+                )
+            except SquareAccountChanged:
+                logger.info(
+                    "Discarded Square OAuth refresh after account settings changed"
+                )
 
     def build_square(
         settings: dict[str, str | None] | None = None,
@@ -885,6 +905,10 @@ def create_app(
                     account_switch_confirmation_token=(
                         body.account_switch_confirmation_token
                     ),
+                    # A pasted access token explicitly replaces any prior
+                    # OAuth grant and pending callbacks. Keep the reusable
+                    # OAuth application credentials.
+                    clear_oauth_token_metadata=True,
                 )
                 saved_webhook = store.get_settings(
                     ("square.webhook_signature_key", "square.webhook_url")
@@ -960,7 +984,15 @@ def create_app(
                 status_code=422,
                 detail="Notification URL must be https:// and publicly reachable",
             )
-        client = require_square()
+        _maybe_refresh_oauth_token()
+        # Bind every provider call below to one coherent credential snapshot.
+        # The slow Square requests remain outside the cross-process writer;
+        # the final store operation compares this snapshot before committing.
+        with store.integration_guard():
+            square_settings = store.get_settings(SQUARE_CLIENT_SETTING_KEYS)
+        client = build_square(square_settings)
+        if client is None:
+            raise HTTPException(status_code=409, detail="Square is not configured")
         try:
             existing = next(
                 (
@@ -998,12 +1030,27 @@ def create_app(
             raise HTTPException(status_code=502, detail=f"Could not reach Square: {exc}")
         finally:
             client.close()
-        store.update_settings(
-            {
-                "square.webhook_signature_key": (signature_key, True),
-                "square.webhook_url": (url, False),
-            }
-        )
+        try:
+            store.update_square_webhook_settings(
+                signature_key,
+                url,
+                expected_merchant_id=square_settings["square.merchant_id"],
+                expected_environment=(
+                    square_settings["square.environment"] or "production"
+                ),
+                expected_account_revision=(
+                    square_settings["square.account_revision"]
+                ),
+                expected_access_token=square_settings["square.access_token"] or "",
+            )
+        except SquareAccountChanged as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Square account or credentials changed while the webhook "
+                    "was being registered; try again"
+                ),
+            ) from exc
         return {"ok": True, "notification_url": url, "updated": existing is not None}
 
     @app.put("/api/settings/square/oauth-app")
@@ -1015,7 +1062,9 @@ def create_app(
             {
                 "square.oauth_client_id": (body.client_id.strip(), False),
                 "square.oauth_client_secret": (body.client_secret.strip(), True),
-                "square.environment": (body.environment, False),
+                # OAuth application setup must not mutate the environment bound
+                # to an already-connected merchant and its account revision.
+                "square.oauth_environment": (body.environment, False),
             }
         )
         return {"ok": True}
@@ -1023,18 +1072,26 @@ def create_app(
     @app.get("/oauth/square/start")
     def square_oauth_start(_=authed) -> RedirectResponse:
         oauth = store.get_settings(
-            ("square.oauth_client_id", "square.environment")
+            (
+                "square.oauth_client_id",
+                "square.oauth_environment",
+                "square.environment",
+            )
         )
         if not oauth["square.oauth_client_id"]:
             raise HTTPException(
                 status_code=409,
                 detail="Save the Square application client id/secret first",
             )
+        # Starting over explicitly abandons any older, unconfirmed grant.
+        store.delete_settings(*SQUARE_OAUTH_PENDING_SETTING_KEYS)
         state = secrets.token_urlsafe(24)
-        store.set_setting("square.oauth_state", state)
+        store.create_square_oauth_state(state)
         return RedirectResponse(
             oauth_authorize_url(
-                oauth["square.environment"] or "production",
+                oauth["square.oauth_environment"]
+                or oauth["square.environment"]
+                or "production",
                 oauth["square.oauth_client_id"],
                 state,
             ),
@@ -1045,29 +1102,36 @@ def create_app(
     def square_oauth_callback(
         code: str = "", state: str = "", error: str = "", _=authed
     ) -> RedirectResponse:
+        # Read the manual-authorization fence before consuming the one-time
+        # state. A manual save racing either step will delete the state or
+        # rotate the fence before this callback can persist exchanged tokens.
+        authorization_revision = store.get_setting(
+            SQUARE_OAUTH_AUTHORIZATION_REVISION_SETTING
+        )
+        if not store.consume_square_oauth_state(state):
+            raise HTTPException(status_code=400, detail="Invalid OAuth state")
         if error:
             # The operator declined consent (or Square reported a problem);
             # land back in the app instead of on a bare JSON error.
-            store.delete_setting("square.oauth_state")
             return RedirectResponse("/?square_oauth=denied", status_code=302)
-        expected_state = store.get_setting("square.oauth_state")
-        if (
-            not code
-            or not expected_state
-            or not secrets.compare_digest(state, expected_state)
-        ):
+        if not code:
             raise HTTPException(status_code=400, detail="Invalid OAuth state")
-        store.delete_setting("square.oauth_state")
         oauth = store.get_settings(
             (
                 "square.oauth_client_id",
                 "square.oauth_client_secret",
+                "square.oauth_environment",
                 "square.environment",
             )
         )
+        oauth_environment = (
+            oauth["square.oauth_environment"]
+            or oauth["square.environment"]
+            or "production"
+        )
         try:
             tokens = oauth_exchange(
-                oauth["square.environment"] or "production",
+                oauth_environment,
                 oauth["square.oauth_client_id"] or "",
                 oauth["square.oauth_client_secret"] or "",
                 code=code,
@@ -1077,16 +1141,132 @@ def create_app(
             raise HTTPException(status_code=401, detail=str(exc))
         except SquareError as exc:
             raise HTTPException(status_code=502, detail=f"Could not reach Square: {exc}")
-        updates = {
-            "square.access_token": (tokens["access_token"], True),
-            "square.token_expires_at": (tokens.get("expires_at", ""), False),
-        }
-        if tokens.get("refresh_token"):
-            updates["square.refresh_token"] = (tokens["refresh_token"], True)
-        if tokens.get("merchant_id"):
-            updates["square.merchant_id"] = (tokens["merchant_id"], False)
-        store.update_settings(updates)
+        access_token = tokens.get("access_token")
+        merchant_id = tokens.get("merchant_id")
+        refresh_token = tokens.get("refresh_token")
+        expires_at = tokens.get("expires_at", "")
+        if not isinstance(access_token, str) or not access_token:
+            raise HTTPException(status_code=502, detail="Square returned an invalid OAuth token")
+        if not isinstance(merchant_id, str) or not merchant_id:
+            raise HTTPException(status_code=502, detail="Square did not identify the OAuth merchant")
+        if refresh_token is not None and not isinstance(refresh_token, str):
+            raise HTTPException(status_code=502, detail="Square returned an invalid refresh token")
+        if not isinstance(expires_at, str):
+            raise HTTPException(status_code=502, detail="Square returned an invalid token expiry")
+        environment = oauth_environment
+        try:
+            with square_account_lock:
+                store.configure_square_account(
+                    merchant_id=merchant_id,
+                    access_token=access_token,
+                    environment=environment,
+                    oauth_refresh_token=refresh_token,
+                    oauth_token_expires_at=expires_at,
+                    clear_oauth_pending=True,
+                    expected_oauth_authorization_revision=(
+                        authorization_revision
+                    ),
+                )
+        except SquareAccountSwitchRequired as exc:
+            # Keep the active merchant untouched until the operator explicitly
+            # confirms the same destructive switch shown by manual-token setup.
+            if not store.update_square_oauth_grant(
+                authorization_revision,
+                {
+                    "square.oauth_pending_access_token": (access_token, True),
+                    "square.oauth_pending_refresh_token": (refresh_token or "", True),
+                    "square.oauth_pending_expires_at": (expires_at, False),
+                    "square.oauth_pending_merchant_id": (merchant_id, False),
+                    "square.oauth_pending_environment": (environment, False),
+                    "square.oauth_pending_confirmation_token": (
+                        exc.confirmation_token,
+                        True,
+                    ),
+                    "square.oauth_pending_created_at": (str(time.time()), False),
+                    "square.oauth_pending_authorization_revision": (
+                        authorization_revision or "",
+                        False,
+                    ),
+                },
+            ):
+                raise HTTPException(status_code=400, detail="Invalid OAuth state")
+            return RedirectResponse("/?square_oauth=switch_required", status_code=302)
+        except SquareAccountChanged:
+            raise HTTPException(status_code=400, detail="Invalid OAuth state")
         return RedirectResponse("/?square_oauth=connected", status_code=302)
+
+    @app.post("/api/settings/square/oauth-switch/confirm")
+    def confirm_square_oauth_switch(_=authed) -> dict:
+        """Activate a pending OAuth grant after explicit destructive consent."""
+        with square_account_lock:
+            pending = store.get_settings(SQUARE_OAUTH_PENDING_SETTING_KEYS)
+            try:
+                created_at = float(pending["square.oauth_pending_created_at"] or "")
+            except ValueError:
+                created_at = 0.0
+            now = time.time()
+            required = (
+                pending["square.oauth_pending_access_token"],
+                pending["square.oauth_pending_merchant_id"],
+                pending["square.oauth_pending_environment"],
+                pending["square.oauth_pending_confirmation_token"],
+            )
+            if (
+                not all(required)
+                or created_at > now + 30
+                or now - created_at > 10 * 60
+            ):
+                store.delete_settings(*SQUARE_OAUTH_PENDING_SETTING_KEYS)
+                raise HTTPException(
+                    status_code=409,
+                    detail="The pending Square authorization expired; connect again",
+                )
+            try:
+                configuration = store.configure_square_account(
+                    merchant_id=pending["square.oauth_pending_merchant_id"] or "",
+                    access_token=pending["square.oauth_pending_access_token"] or "",
+                    environment=pending["square.oauth_pending_environment"] or "production",
+                    confirm_account_switch=True,
+                    account_switch_confirmation_token=(
+                        pending["square.oauth_pending_confirmation_token"] or ""
+                    ),
+                    oauth_refresh_token=(
+                        pending["square.oauth_pending_refresh_token"] or None
+                    ),
+                    oauth_token_expires_at=(
+                        pending["square.oauth_pending_expires_at"] or ""
+                    ),
+                    clear_oauth_pending=True,
+                    expected_oauth_authorization_revision=(
+                        pending[
+                            "square.oauth_pending_authorization_revision"
+                        ]
+                        or None
+                    ),
+                )
+            except SquareAccountSwitchRequired as exc:
+                store.delete_settings(*SQUARE_OAUTH_PENDING_SETTING_KEYS)
+                raise HTTPException(
+                    status_code=409,
+                    detail="The Square account changed; connect again before confirming",
+                ) from exc
+            except SquareAccountChanged as exc:
+                store.delete_settings(*SQUARE_OAUTH_PENDING_SETTING_KEYS)
+                raise HTTPException(
+                    status_code=409,
+                    detail="The Square authorization changed; connect again",
+                ) from exc
+        return {
+            "ok": True,
+            "account_switched": configuration.switched,
+            "account_revision": configuration.account_revision,
+            "evidence_cleanup_pending": configuration.evidence_cleanup_pending,
+        }
+
+    @app.delete("/api/settings/square/oauth-switch")
+    def cancel_square_oauth_switch(_=authed) -> dict:
+        store.delete_settings(*SQUARE_OAUTH_PENDING_SETTING_KEYS)
+        return {"ok": True}
 
     # -- cameras & mapping ------------------------------------------------------
 
@@ -1534,6 +1714,11 @@ def create_app(
 
     def run_sync() -> int:
         with square_account_lock:
+            # Sync passes an account-fenced settings snapshot to build_square,
+            # so refresh the OAuth grant before taking that snapshot. Otherwise
+            # unattended/manual sync is the one Square path that never renews
+            # an expiring token.
+            _maybe_refresh_oauth_token()
             try:
                 store.retry_orphan_thumbnail_cleanup()
             except Exception as exc:

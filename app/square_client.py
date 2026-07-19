@@ -16,6 +16,8 @@ import httpx
 logger = logging.getLogger("spi.square")
 
 SQUARE_VERSION = "2025-01-23"
+WEBHOOK_SUBSCRIPTION_PAGE_SIZE = 100
+MAX_WEBHOOK_SUBSCRIPTION_PAGES = 100
 
 BASE_URLS = {
     "production": "https://connect.squareup.com",
@@ -179,13 +181,32 @@ class SquareClient:
         return merchant_id
 
     def list_webhook_subscriptions(self) -> list[dict]:
-        data = self._get("/v2/webhooks/subscriptions")
-        subscriptions = data.get("subscriptions", [])
-        if not isinstance(subscriptions, list) or any(
-            not isinstance(item, dict) for item in subscriptions
-        ):
-            raise SquareError("Square returned an invalid response")
-        return subscriptions
+        """Return all subscription pages within a defensive request bound."""
+        subscriptions: list[dict] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        for page_number in range(MAX_WEBHOOK_SUBSCRIPTION_PAGES):
+            params: dict = {"limit": WEBHOOK_SUBSCRIPTION_PAGE_SIZE}
+            if cursor:
+                params["cursor"] = cursor
+            data = self._get("/v2/webhooks/subscriptions", params=params)
+            subscriptions.extend(self._object_list(data, "subscriptions"))
+            next_cursor = data.get("cursor")
+            if next_cursor is not None and not isinstance(next_cursor, str):
+                raise SquareError("Square returned an invalid response")
+            if not next_cursor:
+                return subscriptions
+            if next_cursor in seen_cursors:
+                raise SquareError("Square returned a repeated pagination cursor")
+            seen_cursors.add(next_cursor)
+            if page_number + 1 >= MAX_WEBHOOK_SUBSCRIPTION_PAGES:
+                raise SquareError(
+                    "Square webhook subscription pagination exceeded safety limit"
+                )
+            cursor = next_cursor
+        raise SquareError(
+            "Square webhook subscription pagination exceeded safety limit"
+        )
 
     def create_webhook_subscription(
         self, name: str, notification_url: str, idempotency_key: str

@@ -1250,6 +1250,98 @@ def test_square_pagination_exhausts_cursor_pages_by_default():
     client.close()
 
 
+def test_square_webhook_subscriptions_exhaust_cursor_pages():
+    pages = {
+        None: {
+            "subscriptions": [{"id": "SUB_FIRST"}],
+            "cursor": "next-page",
+        },
+        "next-page": {"subscriptions": [{"id": "SUB_SECOND"}]},
+    }
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json=pages[request.url.params.get("cursor")],
+        )
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        subscriptions = client.list_webhook_subscriptions()
+    finally:
+        client.close()
+
+    assert [subscription["id"] for subscription in subscriptions] == [
+        "SUB_FIRST",
+        "SUB_SECOND",
+    ]
+    assert requests == [
+        {"limit": "100"},
+        {"limit": "100", "cursor": "next-page"},
+    ]
+
+
+@pytest.mark.parametrize("cursor", [123, [], {}])
+def test_square_webhook_subscriptions_reject_malformed_cursor(cursor):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"subscriptions": [], "cursor": cursor})
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match="invalid response"):
+            client.list_webhook_subscriptions()
+    finally:
+        client.close()
+
+
+def test_square_webhook_subscriptions_reject_cursor_cycle():
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            json={"subscriptions": [], "cursor": "loop"},
+        )
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match="repeated pagination cursor"):
+            client.list_webhook_subscriptions()
+    finally:
+        client.close()
+
+    assert requests == 2
+
+
+def test_square_webhook_subscription_pagination_is_bounded(monkeypatch):
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            json={"subscriptions": [], "cursor": f"page-{requests}"},
+        )
+
+    monkeypatch.setattr(
+        "app.square_client.MAX_WEBHOOK_SUBSCRIPTION_PAGES",
+        2,
+    )
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match="exceeded safety limit"):
+            client.list_webhook_subscriptions()
+    finally:
+        client.close()
+
+    assert requests == 2
+
+
 def test_square_payment_page_iterator_honors_total_limit():
     pages = {
         None: {

@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, python: "3.11"}
+          - {os: ubuntu-latest, python: "3.12"}
+          - {os: ubuntu-latest, python: "3.13"}
+          - {os: ubuntu-latest, python: "3.14"}
+          - {os: macos-latest, python: "3.12"}
+          - {os: macos-latest, python: "3.14"}
+          - {os: windows-latest, python: "3.12"}
+          - {os: windows-latest, python: "3.14"}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pip check
+      - run: python -m pytest -q
+
+  javascript:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node --test tests/*.test.js
+      - run: find app/static -name '*.js' -exec node --check {} \;
+
+  wheel:
+    name: Installed wheel smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: python -m pip install build
+      - run: python -m build --wheel
+      - run: python -m venv "${RUNNER_TEMP}/wheel-env"
+      - run: |
+          "${RUNNER_TEMP}/wheel-env/bin/python" -m pip install dist/*.whl
+      - name: Verify installed entry point and browser assets
+        run: |
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/wheel-env/bin/python" - <<'PY'
+          import importlib.resources
+          import runpy
+
+          static = importlib.resources.files("app") / "static"
+          for name in ("index.html", "app.js", "style.css"):
+              assert (static / name).is_file(), name
+          assert runpy.run_module("app.__main__", run_name="ci_smoke")["main"]
+          PY
+
+  shell:
+    name: Launcher static checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: sudo apt-get update && sudo apt-get install --yes shellcheck
+      - run: bash -n "Start Square Protect.command"
+      - run: shellcheck "Start Square Protect.command"

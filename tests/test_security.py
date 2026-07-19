@@ -7,7 +7,10 @@ import time
 
 import pytest
 
-from app.main import SQUARE_WEBHOOK_MAX_BODY_BYTES
+from app.main import (
+    SQUARE_WEBHOOK_MAX_BODY_BYTES,
+    TRANSACTION_QUERY_MAX_BODY_BYTES,
+)
 from app.store import Store
 from app.sync import ingest_payment
 
@@ -126,6 +129,91 @@ def test_transaction_search_stays_out_of_request_target_even_when_unauthorized(c
     assert response.status_code == 401
     assert search_term not in str(response.request.url)
     assert not response.request.url.query
+
+
+def test_transaction_query_auth_precedes_json_parsing_and_declared_size(client):
+    malformed = client.post(
+        "/api/transactions",
+        content=b"{",
+        headers={"content-type": "application/json"},
+    )
+    oversized = client.post(
+        "/api/transactions",
+        content=b"{}",
+        headers={
+            "content-type": "application/json",
+            "content-length": str(TRANSACTION_QUERY_MAX_BODY_BYTES + 1),
+        },
+    )
+
+    assert malformed.status_code == 401
+    assert oversized.status_code == 401
+
+
+def test_unauthorized_transaction_query_does_not_consume_chunked_body(client):
+    chunks_read = 0
+
+    def query_chunks():
+        nonlocal chunks_read
+        chunks_read += 1
+        yield b'{"q":"'
+        chunks_read += 1
+        yield b"x" * TRANSACTION_QUERY_MAX_BODY_BYTES
+        chunks_read += 1
+        yield b'"}'
+
+    response = client.post(
+        "/api/transactions",
+        content=query_chunks(),
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 401
+    assert chunks_read == 0
+
+
+def test_transaction_query_rejects_oversized_declared_body(authed):
+    response = authed.post(
+        "/api/transactions",
+        content=b"{}",
+        headers={
+            "content-type": "application/json",
+            "content-length": str(TRANSACTION_QUERY_MAX_BODY_BYTES + 1),
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Transaction query payload too large"
+
+
+@pytest.mark.parametrize("headers", [{}, {"content-length": "2"}])
+def test_transaction_query_rejects_oversized_chunked_or_underdeclared_body(
+    authed, headers
+):
+    chunks = iter(
+        [
+            b'{"q":"',
+            b"x" * TRANSACTION_QUERY_MAX_BODY_BYTES,
+            b'"}',
+        ]
+    )
+    response = authed.post(
+        "/api/transactions",
+        content=chunks,
+        headers={"content-type": "application/json", **headers},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Transaction query payload too large"
+
+
+def test_transaction_query_validation_does_not_echo_private_input(authed):
+    private_query = "private-card-4242-" + "x" * 64
+
+    response = authed.post("/api/transactions", json={"q": private_query})
+
+    assert response.status_code == 422
+    assert private_query not in response.text
 
 
 def test_transaction_query_rejects_url_parameters_and_csrf_form_posts(authed):

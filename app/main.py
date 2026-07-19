@@ -16,9 +16,10 @@ from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from . import deeplink, discovery, sync
 from .protect_client import (
@@ -58,6 +59,7 @@ SESSION_COOKIE = "spi_session"
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
 SQUARE_WEBHOOK_MAX_BODY_BYTES = 1024 * 1024
+TRANSACTION_QUERY_MAX_BODY_BYTES = 2 * 1024
 LOGIN_FAILURE_KEY_LIMIT = 10_000
 DRAIN_MAX_BATCHES = 100
 PROTECT_SETTING_KEYS = (
@@ -1462,6 +1464,48 @@ def create_app(
                 detail="Transaction reads require an application/json body",
             )
 
+    async def read_transaction_query_body(request: Request) -> TransactionQueryBody:
+        """Read and validate the small query payload after route dependencies run."""
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid transaction query Content-Length",
+                ) from exc
+            if declared_length < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid transaction query Content-Length",
+                )
+            if declared_length > TRANSACTION_QUERY_MAX_BODY_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Transaction query payload too large",
+                )
+
+        payload = bytearray()
+        async for chunk in request.stream():
+            if len(payload) + len(chunk) > TRANSACTION_QUERY_MAX_BODY_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Transaction query payload too large",
+                )
+            payload.extend(chunk)
+
+        try:
+            return TransactionQueryBody.model_validate_json(bytes(payload))
+        except ValidationError as exc:
+            errors = []
+            for error in exc.errors(include_url=False):
+                body_error = dict(error)
+                body_error["loc"] = ("body", *error.get("loc", ()))
+                body_error.pop("input", None)
+                errors.append(body_error)
+            raise RequestValidationError(errors) from None
+
     @app.get("/api/transactions")
     def legacy_transactions(request: Request, _=authed) -> JSONResponse:
         """Compatibility read without filters or paging parameters."""
@@ -1473,12 +1517,13 @@ def create_app(
         return transaction_listing(TransactionQueryBody())
 
     @app.post("/api/transactions")
-    def transactions(
-        body: TransactionQueryBody,
+    async def transactions(
+        request: Request,
         _=authed,
         __=Depends(require_transaction_query_transport),
     ) -> JSONResponse:
-        return transaction_listing(body)
+        body = await read_transaction_query_body(request)
+        return await run_in_threadpool(transaction_listing, body)
 
     @app.get("/api/thumbnails/{txn_id}")
     def thumbnail(txn_id: str, _=authed) -> Response:

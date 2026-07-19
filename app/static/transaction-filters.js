@@ -9,11 +9,12 @@ function normalizeTransactionFilters(query, status) {
   });
 }
 
-function transactionFilterQuery(filters) {
-  const params = new URLSearchParams();
-  if (filters.query) params.set("q", filters.query);
-  if (filters.status) params.set("status", filters.status);
-  return params.toString();
+function transactionQueryBody(filters, { limit, offset, snapshot = null }) {
+  const body = { limit, offset };
+  if (snapshot !== null) body.snapshot = snapshot;
+  if (filters.query) body.q = filters.query;
+  if (filters.status) body.status = filters.status;
+  return body;
 }
 
 function transactionFiltersActive(filters) {
@@ -24,7 +25,7 @@ if (typeof module !== "undefined") {
   module.exports = {
     TRANSACTION_QUERY_MAX_LENGTH,
     normalizeTransactionFilters,
-    transactionFilterQuery,
+    transactionQueryBody,
     transactionFiltersActive,
   };
 }

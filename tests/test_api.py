@@ -1300,10 +1300,13 @@ def test_transactions_api_supports_page_lookahead_and_offset(authed):
             }
         )
 
-    first_response = authed.get("/api/transactions?limit=101&offset=0")
+    first_response = authed.post(
+        "/api/transactions", json={"limit": 101, "offset": 0}
+    )
     snapshot = first_response.headers["x-transaction-snapshot"]
-    second_response = authed.get(
-        f"/api/transactions?limit=101&offset=100&snapshot={snapshot}"
+    second_response = authed.post(
+        "/api/transactions",
+        json={"limit": 101, "offset": 100, "snapshot": snapshot},
     )
     assert first_response.status_code == 200
     assert second_response.status_code == 200
@@ -1337,10 +1340,13 @@ def test_transaction_snapshot_keeps_offset_pages_stable_during_inserts(authed):
             }
         )
 
-    first_response = authed.get("/api/transactions?limit=101&offset=0")
+    first_response = authed.post(
+        "/api/transactions", json={"limit": 101, "offset": 0}
+    )
     snapshot = first_response.headers["x-transaction-snapshot"]
-    middle_page = authed.get(
-        f"/api/transactions?limit=101&offset=100&snapshot={snapshot}"
+    middle_page = authed.post(
+        "/api/transactions",
+        json={"limit": 101, "offset": 100, "snapshot": snapshot},
     ).json()[:100]
 
     # These rows sort ahead of every row in the snapshot. Without the rowid
@@ -1358,14 +1364,17 @@ def test_transaction_snapshot_keeps_offset_pages_stable_during_inserts(authed):
             }
         )
 
-    refreshed = authed.get("/api/transactions?limit=101&offset=0")
+    refreshed = authed.post(
+        "/api/transactions", json={"limit": 101, "offset": 0}
+    )
     assert int(refreshed.headers["x-transaction-snapshot"]) > int(snapshot)
     assert {txn["id"] for txn in refreshed.json()[:5]} == {
         f"PAY_NEW_{index}" for index in range(5)
     }
 
-    next_response = authed.get(
-        f"/api/transactions?limit=101&offset=200&snapshot={snapshot}"
+    next_response = authed.post(
+        "/api/transactions",
+        json={"limit": 101, "offset": 200, "snapshot": snapshot},
     )
     next_page = next_response.json()[:100]
     assert next_response.headers["x-transaction-snapshot"] == snapshot
@@ -1433,30 +1442,30 @@ def test_transaction_feed_searches_only_normalized_local_fields(authed):
         "loc-west",
         "pending",
     ):
-        response = authed.get("/api/transactions", params={"q": query})
+        response = authed.post("/api/transactions", json={"q": query})
         assert response.status_code == 200, response.text
         assert [transaction["id"] for transaction in response.json()] == [
             "PAY_FIND_ID"
         ]
 
-    filtered = authed.get(
+    filtered = authed.post(
         "/api/transactions",
-        params={"q": "register", "status": "PENDING"},
+        json={"q": "register", "status": "PENDING"},
     )
     assert [transaction["id"] for transaction in filtered.json()] == [
         "PAY_FIND_ID"
     ]
-    assert authed.get(
-        "/api/transactions", params={"status": "APPROVED"}
+    assert authed.post(
+        "/api/transactions", json={"status": "APPROVED"}
     ).json() == []
 
     # LIKE metacharacters stay literal and injection-shaped input remains data.
-    literal = authed.get("/api/transactions", params={"q": "100%_"})
+    literal = authed.post("/api/transactions", json={"q": "100%_"})
     assert [transaction["id"] for transaction in literal.json()] == [
         "PAY_100%_REAL"
     ]
-    injected = authed.get(
-        "/api/transactions", params={"q": "%' OR 1=1 --"}
+    injected = authed.post(
+        "/api/transactions", json={"q": "%' OR 1=1 --"}
     )
     assert injected.status_code == 200
     assert injected.json() == []
@@ -1477,7 +1486,7 @@ def test_transaction_feed_searches_only_normalized_local_fields(authed):
     ),
 )
 def test_transaction_filters_reject_unbounded_or_invalid_queries(authed, params):
-    response = authed.get("/api/transactions", params=params)
+    response = authed.post("/api/transactions", json=params)
 
     assert response.status_code == 422
 
@@ -1502,24 +1511,24 @@ def test_filtered_transaction_snapshot_cannot_mix_queries_or_new_rows(authed):
     for txn_id, ts_ms in (("A", 500), ("B", 400), ("C", 300), ("D", 200)):
         store.upsert_transaction(transaction(txn_id, ts_ms))
 
-    first = authed.get(
+    first = authed.post(
         "/api/transactions",
-        params={"limit": 2, "q": "register", "status": "COMPLETED"},
+        json={"limit": 2, "q": "register", "status": "COMPLETED"},
     )
     snapshot = first.headers["x-transaction-snapshot"]
     assert [row["id"] for row in first.json()] == ["A", "B"]
 
     store.upsert_transaction(transaction("NEW", 600))
-    mismatch = authed.get(
+    mismatch = authed.post(
         "/api/transactions",
-        params={"limit": 2, "offset": 2, "snapshot": snapshot, "q": "warehouse"},
+        json={"limit": 2, "offset": 2, "snapshot": snapshot, "q": "warehouse"},
     )
     assert mismatch.status_code == 409
     assert "filters changed" in mismatch.json()["detail"]
 
-    second = authed.get(
+    second = authed.post(
         "/api/transactions",
-        params={
+        json={
             "limit": 2,
             "offset": 2,
             "snapshot": snapshot,
@@ -1533,9 +1542,9 @@ def test_filtered_transaction_snapshot_cannot_mix_queries_or_new_rows(authed):
         row["id"] for row in second.json()
     )
 
-    refreshed = authed.get(
+    refreshed = authed.post(
         "/api/transactions",
-        params={"limit": 2, "q": "register", "status": "COMPLETED"},
+        json={"limit": 2, "q": "register", "status": "COMPLETED"},
     )
     assert [row["id"] for row in refreshed.json()] == ["NEW", "A"]
 
@@ -1555,8 +1564,8 @@ def test_filtered_snapshot_expires_when_existing_row_changes_membership(authed):
         "device_name": "Front Register",
     }
     store.upsert_transaction(transaction)
-    first = authed.get(
-        "/api/transactions", params={"limit": 1, "status": "PENDING"}
+    first = authed.post(
+        "/api/transactions", json={"limit": 1, "status": "PENDING"}
     )
     snapshot = first.headers["x-transaction-snapshot"]
 
@@ -1567,9 +1576,9 @@ def test_filtered_snapshot_expires_when_existing_row_changes_membership(authed):
             "status": "COMPLETED",
         }
     )
-    stale = authed.get(
+    stale = authed.post(
         "/api/transactions",
-        params={
+        json={
             "limit": 1,
             "offset": 1,
             "snapshot": snapshot,
@@ -1601,7 +1610,9 @@ def test_transaction_snapshot_keeps_timestamp_corrections_in_original_order(auth
     store.upsert_transaction(transaction("B", 200, 1))
     store.upsert_transaction(transaction("C", 100, 1))
 
-    first_response = authed.get("/api/transactions?limit=2&offset=0")
+    first_response = authed.post(
+        "/api/transactions", json={"limit": 2, "offset": 0}
+    )
     snapshot = first_response.headers["x-transaction-snapshot"]
     assert [txn["id"] for txn in first_response.json()] == ["A", "B"]
 
@@ -1609,8 +1620,9 @@ def test_transaction_snapshot_keeps_timestamp_corrections_in_original_order(auth
     # ordering key remains part of that durable snapshot, so OFFSET 2 neither
     # repeats B nor loses C.
     store.upsert_transaction(transaction("C", 400, 2))
-    second_response = authed.get(
-        f"/api/transactions?limit=2&offset=2&snapshot={snapshot}"
+    second_response = authed.post(
+        "/api/transactions",
+        json={"limit": 2, "offset": 2, "snapshot": snapshot},
     )
     assert second_response.headers["x-transaction-snapshot"] == snapshot
     assert [txn["id"] for txn in second_response.json()] == ["C"]
@@ -1620,7 +1632,9 @@ def test_transaction_snapshot_keeps_timestamp_corrections_in_original_order(auth
         "C",
     ]
 
-    refreshed = authed.get("/api/transactions?limit=2&offset=0")
+    refreshed = authed.post(
+        "/api/transactions", json={"limit": 2, "offset": 0}
+    )
     assert int(refreshed.headers["x-transaction-snapshot"]) > int(snapshot)
     assert [txn["id"] for txn in refreshed.json()] == ["C", "A"]
 
@@ -1638,7 +1652,9 @@ def test_expired_transaction_snapshot_returns_conflict(authed):
             "location_id": "LOC1",
         }
     )
-    first_response = authed.get("/api/transactions?limit=1&offset=0")
+    first_response = authed.post(
+        "/api/transactions", json={"limit": 1, "offset": 0}
+    )
     snapshot = int(first_response.headers["x-transaction-snapshot"])
     with store._lock:
         store._db.execute(
@@ -1648,13 +1664,16 @@ def test_expired_transaction_snapshot_returns_conflict(authed):
         )
         store._db.commit()
 
-    expired = authed.get(
-        f"/api/transactions?limit=1&offset=1&snapshot={snapshot}"
+    expired = authed.post(
+        "/api/transactions",
+        json={"limit": 1, "offset": 1, "snapshot": snapshot},
     )
     assert expired.status_code == 409
     assert "return to the newest page" in expired.json()["detail"]
 
-    refreshed = authed.get("/api/transactions?limit=1&offset=0")
+    refreshed = authed.post(
+        "/api/transactions", json={"limit": 1, "offset": 0}
+    )
     assert refreshed.status_code == 200
     assert int(refreshed.headers["x-transaction-snapshot"]) > snapshot
 
@@ -1889,7 +1908,7 @@ def test_slow_webhook_rejects_signature_after_same_account_key_rotation(configur
 def _wait_for_thumbnail(client, payment_id: str, timeout: float = 3.0) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        txns = client.get("/api/transactions?limit=500").json()
+        txns = client.post("/api/transactions", json={"limit": 500}).json()
         txn = next((item for item in txns if item["id"] == payment_id), None)
         if txn and txn["thumbnail_url"]:
             return txn
@@ -2564,7 +2583,9 @@ def test_webhook_burst_acks_immediately_and_queue_drains_all(tmp_path):
                 )
                 assert response.status_code == 200
 
-            listed = isolated.get("/api/transactions?limit=500").json()
+            listed = isolated.post(
+                "/api/transactions", json={"limit": 500}
+            ).json()
             assert len(listed) == 7
 
             release_snapshots.set()

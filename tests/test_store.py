@@ -1,5 +1,6 @@
 """Transaction versioning and database migration tests."""
 
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import errno
 import hashlib
@@ -1532,7 +1533,8 @@ def test_store_migrates_unfiltered_snapshot_to_filter_bound_schema(tmp_path):
 def test_filtered_snapshot_signature_is_keyed_per_installation_and_durable(
     tmp_path, monkeypatch
 ):
-    monkeypatch.delenv("SPI_ENCRYPTION_KEY", raising=False)
+    shared_key = base64.urlsafe_b64encode(bytes(range(32))).decode("ascii")
+    monkeypatch.setenv("SPI_ENCRYPTION_KEY", shared_key)
     canonical_filter = json.dumps(
         ["4242", "COMPLETED"], ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
@@ -1591,7 +1593,64 @@ def test_filtered_snapshot_signature_is_keyed_per_installation_and_durable(
     assert signatures[0] != signatures[1]
 
 
-def test_store_expires_legacy_unkeyed_filtered_snapshots_only(tmp_path):
+def test_filtered_snapshot_signature_survives_equivalent_fernet_key_encoding(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    raw_key = bytes([251, 255]) * 16
+    canonical_key = base64.urlsafe_b64encode(raw_key)
+    (data_dir / "secret.key").write_bytes(canonical_key)
+    monkeypatch.delenv("SPI_ENCRYPTION_KEY", raising=False)
+
+    store = Store(data_dir)
+    try:
+        store.set_setting("proof.secret", "still decrypts", secret=True)
+        _page, snapshot_id = store.list_transactions_page(
+            limit=1,
+            query="4242",
+            status="COMPLETED",
+        )
+        signature = store._db.execute(
+            "SELECT filter_signature FROM transaction_feed_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()["filter_signature"]
+    finally:
+        store.close()
+
+    # Fernet accepts whitespace and the standard Base64 alphabet as an
+    # equivalent encoding of the same raw key material.
+    equivalent_key = " " + base64.b64encode(raw_key).decode("ascii") + "\n"
+    monkeypatch.setenv("SPI_ENCRYPTION_KEY", equivalent_key)
+    reopened = Store(data_dir)
+    try:
+        assert reopened.get_setting("proof.secret") == "still decrypts"
+        _page, reopened_snapshot_id = reopened.list_transactions_page(
+            limit=1,
+            snapshot_id=snapshot_id,
+            query="4242",
+            status="COMPLETED",
+        )
+        reopened_signature = reopened._db.execute(
+            "SELECT filter_signature FROM transaction_feed_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()["filter_signature"]
+    finally:
+        reopened.close()
+
+    assert reopened_snapshot_id == snapshot_id
+    assert reopened_signature == signature
+
+
+@pytest.mark.parametrize(
+    "legacy_signature",
+    [
+        hashlib.sha256(b'["4242",""]').hexdigest(),
+        "hmac-sha256-v1:" + "0" * 64,
+    ],
+    ids=("raw-sha256", "pre-salt-hmac-v1"),
+)
+def test_store_expires_legacy_filtered_snapshots_only(tmp_path, legacy_signature):
     data_dir = tmp_path / "data"
     store = Store(data_dir)
     store.upsert_transaction(
@@ -1610,11 +1669,10 @@ def test_store_expires_legacy_unkeyed_filtered_snapshots_only(tmp_path):
     _page, filtered_snapshot = store.list_transactions_page(limit=1, query="4242")
     store.close()
 
-    raw_digest = hashlib.sha256(b'["4242",""]').hexdigest()
     db = sqlite3.connect(data_dir / "spi.db")
     db.execute(
         "UPDATE transaction_feed_snapshots SET filter_signature = ? WHERE id = ?",
-        (raw_digest, filtered_snapshot),
+        (legacy_signature, filtered_snapshot),
     )
     db.commit()
     db.close()

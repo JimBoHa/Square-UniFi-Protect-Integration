@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import hmac
+import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -1621,6 +1622,115 @@ def test_square_rate_limit_caps_retry_after(monkeypatch):
         client.close()
 
     assert delays == [10.0]
+
+
+def test_square_webhook_create_retries_with_same_idempotency_key(monkeypatch):
+    bodies = []
+    delays = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return httpx.Response(429, headers={"Retry-After": "0.25"})
+        if len(bodies) == 2:
+            raise httpx.ReadTimeout("response lost", request=request)
+        return httpx.Response(200, json={"subscription": {"id": "sub-1"}})
+
+    monkeypatch.setattr("app.square_client.time.sleep", delays.append)
+    monkeypatch.setattr("app.square_client.random.uniform", lambda _low, _high: 0)
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        subscription = client.create_webhook_subscription(
+            "Protect POS", "https://protect.example/webhook", "fixed-key"
+        )
+    finally:
+        client.close()
+
+    assert subscription == {"id": "sub-1"}
+    assert len(bodies) == 3
+    assert bodies[0] == bodies[1] == bodies[2]
+    assert {body["idempotency_key"] for body in bodies} == {"fixed-key"}
+    assert delays == [0.25, 1.0]
+
+
+def test_square_webhook_update_retries_transient_5xx(monkeypatch):
+    bodies = []
+    delays = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PUT"
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return httpx.Response(503, headers={"Retry-After": "0.4"})
+        if len(bodies) == 2:
+            return httpx.Response(502)
+        return httpx.Response(200, json={"subscription": {"id": "sub-1"}})
+
+    monkeypatch.setattr("app.square_client.time.sleep", delays.append)
+    monkeypatch.setattr("app.square_client.random.uniform", lambda _low, _high: 0)
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        subscription = client.update_webhook_subscription(
+            "sub-1", "https://protect.example/webhook"
+        )
+    finally:
+        client.close()
+
+    assert subscription == {"id": "sub-1"}
+    assert len(bodies) == 3
+    assert bodies[0] == bodies[1] == bodies[2]
+    assert delays == [0.4, 1.0]
+
+
+def test_square_webhook_write_retries_are_bounded(monkeypatch):
+    requests = 0
+    delays = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(500)
+
+    monkeypatch.setattr("app.square_client.time.sleep", delays.append)
+    monkeypatch.setattr("app.square_client.random.uniform", lambda _low, _high: 0)
+    client = SquareClient(
+        "tok", transport=httpx.MockTransport(handler), rate_limit_max_retries=2
+    )
+    try:
+        with pytest.raises(SquareError, match=r"HTTP 500"):
+            client.create_webhook_subscription(
+                "Protect POS", "https://protect.example/webhook", "fixed-key"
+            )
+    finally:
+        client.close()
+
+    assert requests == 3
+    assert delays == [0.5, 1.0]
+
+
+def test_square_webhook_write_does_not_retry_nontransient_error(monkeypatch):
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(400)
+
+    monkeypatch.setattr(
+        "app.square_client.time.sleep",
+        lambda _delay: pytest.fail("non-transient response was retried"),
+    )
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match=r"HTTP 400"):
+            client.update_webhook_subscription(
+                "sub-1", "https://protect.example/webhook"
+            )
+    finally:
+        client.close()
+
+    assert requests == 1
 
 
 def test_square_html_response_is_normalized():

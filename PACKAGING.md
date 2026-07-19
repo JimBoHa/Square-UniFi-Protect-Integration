@@ -53,7 +53,11 @@ dmg to a GitHub release. Unsigned builds run via right-click → Open.
 - **macOS:** installs a `launchd` LaunchAgent
   (`~/Library/LaunchAgents/com.squareprotect.app.plist`), starts at login.
 - **Linux (Debian/Ubuntu/Raspberry Pi OS):** installs a `systemd` unit
-  (`/etc/systemd/system/square-protect.service`), starts at boot.
+  (`/etc/systemd/system/square-protect.service`), starts at boot. The service
+  listens on the network with the app's built-in TLS; open
+  `https://<host>:8000`, accept the self-signed certificate warning, and run
+  `sudo journalctl -u square-protect -b --no-pager` to find the generated
+  one-time setup secret. No plaintext secret is stored in the unit.
 
 Both use the repo checkout + its venv; `--uninstall` reverses everything.
 

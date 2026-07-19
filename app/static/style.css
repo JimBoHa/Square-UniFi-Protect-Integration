@@ -81,6 +81,38 @@ button[type="submit"], #save-mapping, #sync-now {
   margin: 0; text-align: center;
 }
 @media (max-width: 520px) {
+  header {
+    align-items: stretch; flex-direction: column; gap: 0.75rem;
+    padding: 0.75rem 1rem;
+  }
+  nav {
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.35rem; width: 100%;
+  }
+  nav[hidden] { display: none; }
+  nav button { margin-left: 0; min-width: 0; padding-inline: 0.4rem; }
+  main { padding: 1rem; }
+  form, label, input, select, button { min-width: 0; max-width: 100%; }
+  label.check {
+    grid-auto-flow: initial; grid-template-columns: auto minmax(0, 1fr);
+    width: 100%;
+  }
+  code { overflow-wrap: anywhere; }
+  .toolbar { flex-wrap: wrap; gap: 0.75rem; }
+  .mapping-row {
+    align-items: stretch; flex-direction: column; gap: 0.25rem;
+  }
+  .mapping-row .loc { min-width: 0; width: 100%; }
+  .mapping-row select { width: 100%; }
+  .txn {
+    display: grid; grid-template-columns: minmax(0, 1fr); align-items: stretch;
+  }
+  .txn .thumbnail-link { width: 100%; }
+  .txn .thumb { width: 100%; height: auto; aspect-ratio: 16 / 9; }
+  .txn .amount { min-width: 0; }
+  .txn .meta { min-width: 0; overflow-wrap: anywhere; }
+  .conn-status { margin-left: 0; max-width: 100%; }
+  .conn-text { min-width: 0; overflow-wrap: anywhere; }
   .pagination .hint { order: -1; flex-basis: 100%; max-width: none; }
   .pagination button { flex: 1 1 0; }
 }

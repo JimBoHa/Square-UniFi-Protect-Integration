@@ -21,6 +21,7 @@ from .store import Store
 logger = logging.getLogger("spi.sync")
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_\-]")
+_fchmod = getattr(os, "fchmod", None)
 BACKFILL_HOURS = 24
 THUMBNAIL_RETRY_BATCH_SIZE = 10
 THUMBNAIL_RETRY_LEASE_SECONDS = 5 * 60
@@ -59,7 +60,12 @@ def write_thumbnail(path, image: bytes) -> None:
     )
     temp_path = Path(temp_name)
     try:
-        os.fchmod(fd, 0o600)
+        if _fchmod is not None:
+            _fchmod(fd, 0o600)
+        else:
+            # Windows has no fchmod. mkstemp creates a private file; chmod
+            # keeps the path writable while preserving that ACL.
+            os.chmod(temp_path, 0o600)
         view = memoryview(image)
         while view:
             written = os.write(fd, view)

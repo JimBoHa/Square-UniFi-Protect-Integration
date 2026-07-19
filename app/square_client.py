@@ -26,6 +26,7 @@ BASE_URLS = {
 RATE_LIMIT_MAX_RETRIES = 3
 RATE_LIMIT_BASE_DELAY_SECONDS = 0.5
 RATE_LIMIT_MAX_DELAY_SECONDS = 10.0
+SQLITE_INTEGER_MAX = (1 << 63) - 1
 IDEMPOTENT_RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 
@@ -440,6 +441,38 @@ def payment_from_api(payment: dict) -> dict:
         display_currency = "USD"
     if not isinstance(display_currency, str):
         raise ValueError("Payment currency must be a string")
+    refunded_amount = 0
+    if payment.get("refunded_money") is not None:
+        refunded_money = object_field(payment, "refunded_money")
+        if "amount" not in refunded_money:
+            raise ValueError("Payment refunded_money.amount is required")
+        if "currency" not in refunded_money:
+            raise ValueError("Payment refunded_money.currency is required")
+        refunded_amount = refunded_money["amount"]
+        refund_currency = refunded_money["currency"]
+        if (
+            isinstance(refunded_amount, bool)
+            or not isinstance(refunded_amount, int)
+            or not 0 <= refunded_amount <= SQLITE_INTEGER_MAX
+        ):
+            raise ValueError(
+                "Payment refunded_money.amount must be a non-negative integer"
+            )
+        if (
+            not isinstance(refund_currency, str)
+            or len(refund_currency) != 3
+            or not refund_currency.isascii()
+            or not refund_currency.isalpha()
+            or refund_currency != refund_currency.upper()
+        ):
+            raise ValueError(
+                "Payment refunded_money.currency must be an uppercase ISO currency code"
+            )
+        if refund_currency != display_currency:
+            # Never label a refund against a sale amount denominated in a
+            # different currency. Reject the update so an accepted version is
+            # not replaced by facts that cannot be compared safely.
+            raise ValueError("Payment refunded_money currency does not match payment")
     card_details = object_field(payment, "card_details")
     card = object_field(card_details, "card", "card_details.card")
     device = object_field(payment, "device_details")
@@ -461,6 +494,7 @@ def payment_from_api(payment: dict) -> dict:
         "updated_at": updated_at,
         "amount": display_amount,
         "currency": display_currency,
+        "refunded_amount": refunded_amount,
         "status": text_field(payment, "status"),
         "location_id": text_field(payment, "location_id"),
         "device_id": text_field(device, "device_id", "device_details.device_id"),

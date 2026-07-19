@@ -26,8 +26,10 @@ timeline near that timestamp.
   at-least-once with durable state; sales completed before the feature is
   enabled are never replayed.
 - **Transaction feed** — payments appear in the companion app with timestamp,
-  tip-inclusive amount, card last-4, status, and a camera thumbnail; the feed
-  auto-refreshes while visible.
+  tip-inclusive amount, partial or full refund totals, card last-4, status, and
+  a camera thumbnail; the feed auto-refreshes while visible. Refund totals come
+  from each Payment object's `refunded_money`, so no extra Square permission or
+  refund API request is needed.
 - **Click through to footage** — clicking a thumbnail uses the configured URL
   template to open the Protect timeline near the transaction timestamp.
 - **Real-time + backfill** — a Square webhook receiver acknowledges deliveries

@@ -148,6 +148,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     updated_ts_ms INTEGER NOT NULL,
     amount INTEGER NOT NULL,
     currency TEXT NOT NULL,
+    refunded_amount INTEGER NOT NULL DEFAULT 0 CHECK (refunded_amount >= 0),
     status TEXT NOT NULL,
     location_id TEXT NOT NULL DEFAULT '',
     device_id TEXT NOT NULL DEFAULT '',
@@ -669,6 +670,28 @@ class Store:
                 "INTEGER NOT NULL DEFAULT 0"
             )
             self._db.execute("UPDATE transactions SET updated_ts_ms = ts_ms")
+        if "refunded_amount" not in columns:
+            # Existing rows predate refund visibility. Zero is the only safe
+            # backward-compatible fact until Square supplies a Payment again.
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN refunded_amount "
+                "INTEGER NOT NULL DEFAULT 0 CHECK (refunded_amount >= 0)"
+            )
+            # Force one durable reconciliation of every retained location,
+            # including history older than the normal initial backfill. MIN
+            # preserves an already-earlier cursor and makes this idempotent if
+            # migration code is retried before its surrounding transaction
+            # commits. Later startups skip this block because the column exists.
+            self._db.execute(
+                "INSERT INTO square_poll_watermarks "
+                "(location_id, polled_through_ms) "
+                "SELECT location_id, MIN(updated_ts_ms) FROM transactions "
+                "WHERE location_id != '' AND updated_ts_ms >= 0 "
+                "GROUP BY location_id "
+                "ON CONFLICT(location_id) DO UPDATE SET polled_through_ms = "
+                "MIN(square_poll_watermarks.polled_through_ms, "
+                "excluded.polled_through_ms)"
+            )
 
     def close(self) -> None:
         self._db.close()
@@ -1885,6 +1908,7 @@ class Store:
             "device_name": "",
             "card_last4": "",
             "receipt_url": "",
+            "refunded_amount": 0,
             # Normalized columns contain everything used at runtime. Never
             # persist the original Square Payment, which can include buyer
             # contact, address, note, wallet, and risk metadata.
@@ -1966,15 +1990,20 @@ class Store:
                         values["camera_id"] = mapped_camera_id
                 applied = self._db.execute(
                     "INSERT INTO transactions (id, created_at, ts_ms, updated_at, updated_ts_ms, "
-                    "amount, currency, status, location_id, device_id, device_name, card_last4, "
+                    "amount, currency, refunded_amount, status, location_id, device_id, "
+                    "device_name, card_last4, "
                     "receipt_url, camera_id, thumbnail_path, raw) "
                     "VALUES (:id, :created_at, :ts_ms, :updated_at, "
-                    ":updated_ts_ms, :amount, :currency, :status, :location_id, :device_id, "
+                    ":updated_ts_ms, :amount, :currency, :refunded_amount, :status, "
+                    ":location_id, :device_id, "
                     ":device_name, :card_last4, :receipt_url, :camera_id, :thumbnail_path, :raw) "
                     "ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at, "
                     "ts_ms=excluded.ts_ms, updated_at=excluded.updated_at, "
                     "updated_ts_ms=excluded.updated_ts_ms, amount=excluded.amount, "
-                    "currency=excluded.currency, status=excluded.status, "
+                    "currency=excluded.currency, "
+                    "refunded_amount=MAX(transactions.refunded_amount, "
+                    "excluded.refunded_amount), "
+                    "status=excluded.status, "
                     "location_id=excluded.location_id, "
                     "device_id=COALESCE(NULLIF(excluded.device_id, ''), transactions.device_id), "
                     "device_name=CASE WHEN NULLIF(excluded.device_id, '') IS NOT NULL "

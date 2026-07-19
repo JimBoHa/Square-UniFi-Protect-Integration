@@ -1609,6 +1609,11 @@ def create_app(
 
     def run_sync() -> int:
         with square_account_lock:
+            # Sync passes an account-fenced settings snapshot to build_square,
+            # so refresh the OAuth grant before taking that snapshot. Otherwise
+            # unattended/manual sync is the one Square path that never renews
+            # an expiring token.
+            _maybe_refresh_oauth_token()
             try:
                 store.retry_orphan_thumbnail_cleanup()
             except Exception as exc:

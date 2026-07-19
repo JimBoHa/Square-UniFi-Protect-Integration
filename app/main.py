@@ -954,7 +954,15 @@ def create_app(
                 status_code=422,
                 detail="Notification URL must be https:// and publicly reachable",
             )
-        client = require_square()
+        _maybe_refresh_oauth_token()
+        # Bind every provider call below to one coherent credential snapshot.
+        # The slow Square requests remain outside the cross-process writer;
+        # the final store operation compares this snapshot before committing.
+        with store.integration_guard():
+            square_settings = store.get_settings(SQUARE_CLIENT_SETTING_KEYS)
+        client = build_square(square_settings)
+        if client is None:
+            raise HTTPException(status_code=409, detail="Square is not configured")
         try:
             existing = next(
                 (
@@ -992,12 +1000,27 @@ def create_app(
             raise HTTPException(status_code=502, detail=f"Could not reach Square: {exc}")
         finally:
             client.close()
-        store.update_settings(
-            {
-                "square.webhook_signature_key": (signature_key, True),
-                "square.webhook_url": (url, False),
-            }
-        )
+        try:
+            store.update_square_webhook_settings(
+                signature_key,
+                url,
+                expected_merchant_id=square_settings["square.merchant_id"],
+                expected_environment=(
+                    square_settings["square.environment"] or "production"
+                ),
+                expected_account_revision=(
+                    square_settings["square.account_revision"]
+                ),
+                expected_access_token=square_settings["square.access_token"] or "",
+            )
+        except SquareAccountChanged as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Square account or credentials changed while the webhook "
+                    "was being registered; try again"
+                ),
+            ) from exc
         return {"ok": True, "notification_url": url, "updated": existing is not None}
 
     @app.put("/api/settings/square/oauth-app")

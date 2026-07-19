@@ -1631,6 +1631,58 @@ class Store:
     def square_account_revision(self) -> str | None:
         return self.get_setting(SQUARE_ACCOUNT_REVISION_SETTING)
 
+    def update_square_webhook_settings(
+        self,
+        signature_key: str,
+        notification_url: str,
+        *,
+        expected_merchant_id: str | None,
+        expected_environment: str,
+        expected_account_revision: str | None,
+        expected_access_token: str,
+    ) -> None:
+        """Save a webhook only if its Square credential snapshot is current."""
+        stored_signature_key = self.cipher.encrypt(signature_key)
+        with self.integration_guard(exclusive=True):
+            with self._lock:
+                try:
+                    self._db.execute("BEGIN IMMEDIATE")
+                    current_environment = self._setting_value_locked(
+                        "square.environment"
+                    ) or "production"
+                    if (
+                        self._setting_value_locked("square.merchant_id")
+                        != expected_merchant_id
+                        or current_environment != expected_environment
+                        or self._setting_value_locked(
+                            SQUARE_ACCOUNT_REVISION_SETTING
+                        )
+                        != expected_account_revision
+                        or self._setting_value_locked("square.access_token")
+                        != expected_access_token
+                    ):
+                        raise SquareAccountChanged(
+                            "Square account or credentials changed while work "
+                            "was in progress"
+                        )
+                    self._db.executemany(
+                        "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                        "encrypted=excluded.encrypted",
+                        (
+                            (
+                                "square.webhook_signature_key",
+                                stored_signature_key,
+                                1,
+                            ),
+                            ("square.webhook_url", notification_url, 0),
+                        ),
+                    )
+                    self._db.commit()
+                except Exception:
+                    self._db.rollback()
+                    raise
+
     # -- camera mapping ----------------------------------------------------
 
     def set_camera_mapping(

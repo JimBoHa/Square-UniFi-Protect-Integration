@@ -2960,8 +2960,8 @@ def test_dashboard_connected_with_webhook_freshness(configured):
     assert isinstance(data["webhook"]["last_event_ms"], int)
     assert data["queues"]["thumbnails_pending"] == 0
 
-def test_dashboard_counts_pending_queue_work(configured):
-    store = configured.app.state.store
+def test_dashboard_counts_pending_queue_work(authed):
+    store = authed.app.state.store
     store.upsert_transaction(
         {
             "id": "PAY_QUEUED_TILE",
@@ -2975,7 +2975,7 @@ def test_dashboard_counts_pending_queue_work(configured):
             "thumbnail_path": None,
         }
     )
-    data = configured.get("/api/dashboard").json()
+    data = authed.get("/api/dashboard").json()
     assert data["queues"]["thumbnails_pending"] == 1
 
 def test_dashboard_tiles_ui_wiring():

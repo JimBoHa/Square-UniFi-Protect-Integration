@@ -5,8 +5,9 @@ COPY app ./app
 RUN pip install --no-cache-dir .
 ENV SPI_DATA_DIR=/data \
     SPI_HOST=0.0.0.0 \
-    SPI_PORT=8000
+    SPI_PORT=8000 \
+    SPI_TLS=1
 VOLUME /data
 EXPOSE 8000
-HEALTHCHECK --interval=60s --timeout=5s CMD ["python", "-c", "import urllib.request,os;urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"SPI_PORT\",\"8000\")}/api/status')"]
+HEALTHCHECK --interval=60s --timeout=5s CMD ["python", "-m", "app.healthcheck"]
 CMD ["python", "-m", "app"]

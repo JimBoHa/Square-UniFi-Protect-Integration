@@ -20,8 +20,17 @@ server process is installed, started, and kept running.
 persistent `./data` volume:
 
 ```bash
-docker compose up -d       # dashboard on http://<host>:8000
+docker compose up -d
+docker compose logs square-protect
 ```
+
+Open `https://<host>:8000`, accept the one-time self-signed certificate
+warning, and enter the generated setup secret printed in the startup output.
+The container enables the app's built-in TLS by default because its wildcard
+bind is reachable from other devices. It deliberately does not retain a
+plaintext setup secret in Compose or container metadata. The generated secret
+is invalidated as soon as first-run setup succeeds; restarting before setup
+rotates it.
 
 CI (`.github/workflows/docker.yml`) builds the image on every push to main
 so releases can publish it to GHCR (`ghcr.io/jimboha/square-unifi-protect`)

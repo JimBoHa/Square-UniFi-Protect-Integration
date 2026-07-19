@@ -71,11 +71,16 @@ def test_transaction_data_and_camera_evidence_are_private_with_open_umask(tmp_pa
     assert store is not None
     try:
         txn = store.get_transaction("PRIVATE")
-        assert _mode(store.data_dir) == 0o700
-        assert _mode(store.thumbnail_dir) == 0o700
-        assert _mode(store.data_dir / "spi.db") == 0o600
-        assert _mode(store.data_dir / "secret.key") == 0o600
-        assert _mode(store.thumbnail_dir / txn["thumbnail_path"]) == 0o600
+        thumbnail_path = store.thumbnail_dir / txn["thumbnail_path"]
+        assert (store.data_dir / "spi.db").is_file()
+        assert (store.data_dir / "secret.key").is_file()
+        assert thumbnail_path.read_bytes() == b"private camera evidence"
+        if os.name == "posix":
+            assert _mode(store.data_dir) == 0o700
+            assert _mode(store.thumbnail_dir) == 0o700
+            assert _mode(store.data_dir / "spi.db") == 0o600
+            assert _mode(store.data_dir / "secret.key") == 0o600
+            assert _mode(thumbnail_path) == 0o600
     finally:
         store.close()
 
@@ -92,10 +97,13 @@ def test_store_hardens_existing_data_permissions(tmp_path):
 
     store = Store(data_dir)
     try:
-        assert _mode(data_dir) == 0o700
-        assert _mode(thumbnail_dir) == 0o700
-        assert _mode(image_path) == 0o600
-        assert _mode(data_dir / "spi.db") == 0o600
+        assert image_path.read_bytes() == b"old evidence"
+        assert (data_dir / "spi.db").is_file()
+        if os.name == "posix":
+            assert _mode(data_dir) == 0o700
+            assert _mode(thumbnail_dir) == 0o700
+            assert _mode(image_path) == 0o600
+            assert _mode(data_dir / "spi.db") == 0o600
     finally:
         store.close()
 

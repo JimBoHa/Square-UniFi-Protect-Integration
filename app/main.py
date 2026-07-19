@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import deeplink, discovery, sync
+from .body_limit import RequestBodyLimitMiddleware
 from .protect_client import (
     ProtectAuthError,
     ProtectClient,
@@ -55,7 +56,17 @@ logger = logging.getLogger("spi")
 SESSION_COOKIE = "spi_session"
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
-SQUARE_WEBHOOK_MAX_BODY_BYTES = 1024 * 1024
+# One bounded request can hold the maximum 500-entry camera mapping plus ample
+# JSON overhead. Square webhooks retain their existing 1 MiB contract.
+REQUEST_MAX_BODY_BYTES = 1024 * 1024
+SQUARE_WEBHOOK_MAX_BODY_BYTES = REQUEST_MAX_BODY_BYTES
+REQUEST_BODY_LIMIT_EXEMPT_ROUTES = (
+    # Dedicated reader keeps webhook bytes unchanged for HMAC verification.
+    ("POST", "/webhooks/square"),
+    # Transaction search owns a tighter auth-first streaming bound when that
+    # optional endpoint is installed; main currently has no POST route here.
+    ("POST", "/api/transactions"),
+)
 LOGIN_FAILURE_KEY_LIMIT = 10_000
 DRAIN_MAX_BATCHES = 100
 PROTECT_SETTING_KEYS = (
@@ -213,6 +224,14 @@ def create_app(
         if request.url.path.startswith("/api/"):
             response.headers.setdefault("Cache-Control", PRIVATE_NO_STORE)
         return response
+
+    # Register after the cache policy so this pure ASGI gate runs first. It
+    # bounds body buffering before FastAPI parses models or evaluates auth.
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_body_bytes=REQUEST_MAX_BODY_BYTES,
+        excluded_routes=REQUEST_BODY_LIMIT_EXEMPT_ROUTES,
+    )
 
     # -- client construction from stored settings ---------------------------
 
@@ -1517,20 +1536,36 @@ def create_app(
             try:
                 declared_length = int(content_length)
             except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid Content-Length")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid Content-Length",
+                    headers={"Cache-Control": PRIVATE_NO_STORE},
+                )
             if declared_length < 0:
-                raise HTTPException(status_code=400, detail="Invalid Content-Length")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid Content-Length",
+                    headers={"Cache-Control": PRIVATE_NO_STORE},
+                )
             if declared_length > SQUARE_WEBHOOK_MAX_BODY_BYTES:
-                raise HTTPException(status_code=413, detail="Webhook payload too large")
+                raise HTTPException(
+                    status_code=413,
+                    detail="Webhook payload too large",
+                    headers={"Cache-Control": PRIVATE_NO_STORE},
+                )
 
-        chunks: list[bytes] = []
+        body = bytearray()
         received = 0
         async for chunk in request.stream():
+            if len(chunk) > SQUARE_WEBHOOK_MAX_BODY_BYTES - received:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Webhook payload too large",
+                    headers={"Cache-Control": PRIVATE_NO_STORE},
+                )
+            body.extend(chunk)
             received += len(chunk)
-            if received > SQUARE_WEBHOOK_MAX_BODY_BYTES:
-                raise HTTPException(status_code=413, detail="Webhook payload too large")
-            chunks.append(chunk)
-        return b"".join(chunks)
+        return bytes(body)
 
     def process_square_webhook(body: bytes, signature: str) -> dict | None:
         """Verify and ingest against one current account/settings snapshot."""

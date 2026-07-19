@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import os
@@ -34,10 +35,12 @@ class CredentialCipher:
     def __init__(self, data_dir: Path):
         key = self._load_or_create_key(data_dir)
         self._fernet = Fernet(key)
+        raw_key = base64.urlsafe_b64decode(key)
         # Derive a distinct MAC key instead of reusing Fernet's key material
-        # directly in another protocol.
+        # directly in another protocol. Derive from the decoded key so every
+        # equivalent Fernet encoding produces the same durable MAC key.
         self._keyed_hmac_key = hmac.new(
-            key,
+            raw_key,
             _KEYED_HMAC_DERIVATION_DOMAIN,
             hashlib.sha256,
         ).digest()

@@ -1,5 +1,6 @@
 """Transaction versioning and database migration tests."""
 
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import errno
 import hashlib
@@ -1589,6 +1590,55 @@ def test_filtered_snapshot_signature_is_keyed_per_installation_and_durable(
         signatures.append(signature)
 
     assert signatures[0] != signatures[1]
+
+
+def test_filtered_snapshot_signature_survives_equivalent_fernet_key_encoding(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    raw_key = bytes([251, 255]) * 16
+    canonical_key = base64.urlsafe_b64encode(raw_key)
+    (data_dir / "secret.key").write_bytes(canonical_key)
+    monkeypatch.delenv("SPI_ENCRYPTION_KEY", raising=False)
+
+    store = Store(data_dir)
+    try:
+        store.set_setting("proof.secret", "still decrypts", secret=True)
+        _page, snapshot_id = store.list_transactions_page(
+            limit=1,
+            query="4242",
+            status="COMPLETED",
+        )
+        signature = store._db.execute(
+            "SELECT filter_signature FROM transaction_feed_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()["filter_signature"]
+    finally:
+        store.close()
+
+    # Fernet accepts whitespace and the standard Base64 alphabet as an
+    # equivalent encoding of the same raw key material.
+    equivalent_key = " " + base64.b64encode(raw_key).decode("ascii") + "\n"
+    monkeypatch.setenv("SPI_ENCRYPTION_KEY", equivalent_key)
+    reopened = Store(data_dir)
+    try:
+        assert reopened.get_setting("proof.secret") == "still decrypts"
+        _page, reopened_snapshot_id = reopened.list_transactions_page(
+            limit=1,
+            snapshot_id=snapshot_id,
+            query="4242",
+            status="COMPLETED",
+        )
+        reopened_signature = reopened._db.execute(
+            "SELECT filter_signature FROM transaction_feed_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()["filter_signature"]
+    finally:
+        reopened.close()
+
+    assert reopened_snapshot_id == snapshot_id
+    assert reopened_signature == signature
 
 
 def test_store_expires_legacy_unkeyed_filtered_snapshots_only(tmp_path):

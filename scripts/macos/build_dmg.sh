@@ -3,8 +3,8 @@
 # Output: dist/SquareProtect.dmg
 #
 # Release signing (on the machine holding Apple credentials):
-#   codesign --deep --force --options runtime \
-#     --sign "Developer ID Application: <TEAM>" "dist/Square Protect.app"
+#   MACOS_SIGNING_IDENTITY="Developer ID Application: <TEAM>" \
+#     scripts/macos/build_dmg.sh
 #   xcrun notarytool submit dist/SquareProtect.dmg --keychain-profile <profile> --wait
 #   xcrun stapler staple dist/SquareProtect.dmg
 set -euo pipefail
@@ -28,6 +28,16 @@ rm -rf build "dist/Square Protect.app" dist/SquareProtect.dmg
 PLIST="dist/Square Protect.app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PLIST" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Set :LSUIElement true" "$PLIST"
+
+if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
+  codesign --deep --force --options runtime \
+    --sign "$MACOS_SIGNING_IDENTITY" "dist/Square Protect.app"
+else
+  # PlistBuddy invalidates PyInstaller's ad-hoc bundle signature. Restore a
+  # valid local signature even when no release identity is configured.
+  codesign --deep --force --sign - "dist/Square Protect.app"
+fi
+codesign --verify --deep --strict "dist/Square Protect.app"
 
 STAGE=$(mktemp -d)
 cp -R "dist/Square Protect.app" "$STAGE/"

@@ -42,9 +42,11 @@ scripts/macos/build_dmg.sh          # → dist/SquareProtect.dmg
 
 The script bundles with PyInstaller (`LSUIElement` set so there is no Dock
 icon), verifies the app boots and serves the dashboard, then wraps it in a
-drag-to-Applications dmg. **Release checklist:** codesign with a Developer ID
-certificate, notarize (`xcrun notarytool submit`), staple, then attach the
-dmg to a GitHub release. Unsigned builds run via right-click → Open.
+drag-to-Applications dmg. For a signed release, set `MACOS_SIGNING_IDENTITY`
+to the Developer ID Application identity when running the build script; the
+app is signed before it enters the dmg. Then notarize with
+`xcrun notarytool submit`, staple, and attach the dmg to a GitHub release.
+Unsigned builds run via right-click → Open.
 
 ## 3. Install as a service (auto-start at boot)
 

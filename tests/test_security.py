@@ -401,7 +401,7 @@ def test_frontend_never_uses_innerhtml():
     js_files = sorted(static_dir.glob("*.js"))
     assert js_files, "expected frontend scripts in app/static"
     for js_file in js_files:
-        js = js_file.read_text()
+        js = js_file.read_text(encoding="utf-8")
         assert "innerHTML" not in js, js_file.name
         assert "document.write" not in js, js_file.name
 
@@ -409,8 +409,8 @@ def test_transaction_feed_refresh_is_visibility_aware_and_non_overlapping():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert "TRANSACTION_REFRESH_MS" in js
     assert 'document.visibilityState === "visible"' in js
     # The 15-second refresh must keep running while the Settings section is
@@ -427,8 +427,8 @@ def test_transaction_amount_formatter_uses_currency_minor_units():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    formatter = (static_dir / "format.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    formatter = (static_dir / "format.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert "resolvedOptions().maximumFractionDigits" in formatter
     assert "10 ** fractionDigits" in formatter
     assert html.index('/format.js') < html.index('/app.js')
@@ -438,9 +438,9 @@ def test_transaction_feed_pagination_wiring():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
-    css = (static_dir / "style.css").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    css = (static_dir / "style.css").read_text(encoding="utf-8")
     assert "TRANSACTION_PAGE_SIZE + 1" in js
     assert "&offset=${requestedOffset}" in js
     assert "page.slice(0, TRANSACTION_PAGE_SIZE)" in js
@@ -463,7 +463,7 @@ def test_transaction_feed_describes_missing_thumbnail_state():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
     assert 'unmapped: "camera not mapped"' in js
     assert 'queued: "footage queued"' in js
     assert 'retrying: "capture retrying"' in js
@@ -473,8 +473,8 @@ def test_transaction_thumbnails_use_accessible_timeline_links():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    css = (static_dir / "style.css").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    css = (static_dir / "style.css").read_text(encoding="utf-8")
     assert 'const link = document.createElement("a")' in js
     assert "link.href = txn.deep_link" in js
     assert 'link.target = "_blank"' in js
@@ -488,8 +488,8 @@ def test_pos_device_mapping_ui_wiring():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert 'api("/api/pos-devices")' in js
     assert "select.dataset.deviceId" in js
     assert "select.dataset.deviceName" in js
@@ -509,7 +509,9 @@ def test_frontend_only_treats_session_401_as_logout():
     operator to the login view; only the app session's own 401 may."""
     from pathlib import Path
 
-    js = (Path(__file__).parent.parent / "app" / "static" / "app.js").read_text()
+    js = (
+        Path(__file__).parent.parent / "app" / "static" / "app.js"
+    ).read_text(encoding="utf-8")
     assert 'data.detail === "Authentication required"' in js
     # The redirect decision must consider the parsed body, not status alone.
     assert 'resp.status === 401 && path !== "/api/login") {' not in js
@@ -518,8 +520,8 @@ def test_setup_wizard_ui_wiring():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert 'id="view-wizard"' in html
     for step in ("1", "2", "3", "4"):
         assert f'data-step="{step}"' in html

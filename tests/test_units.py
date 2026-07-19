@@ -66,6 +66,16 @@ def test_credential_cipher_key_file_permissions(tmp_path):
     assert mode == 0o600
 
 
+def test_credential_cipher_key_creation_without_fchmod(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.security._fchmod", None)
+
+    cipher = CredentialCipher(tmp_path)
+
+    token = cipher.encrypt("windows-compatible-secret")
+    assert cipher.decrypt(token) == "windows-compatible-secret"
+    assert (tmp_path / KEY_FILENAME).is_file()
+
+
 def test_credential_cipher_key_creation_is_atomic_under_concurrency(tmp_path, monkeypatch):
     worker_count = 32
     all_generating = threading.Barrier(worker_count)

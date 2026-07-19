@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import hmac
+import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -61,9 +62,12 @@ def test_credential_cipher_roundtrip(tmp_path):
     assert cipher.decrypt(token) == "super-secret-token"
 
 def test_credential_cipher_key_file_permissions(tmp_path):
-    CredentialCipher(tmp_path)
-    mode = (tmp_path / "secret.key").stat().st_mode & 0o777
-    assert mode == 0o600
+    cipher = CredentialCipher(tmp_path)
+    key_path = tmp_path / "secret.key"
+    assert key_path.is_file()
+    assert cipher.decrypt(cipher.encrypt("test-secret")) == "test-secret"
+    if os.name == "posix":
+        assert key_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_credential_cipher_key_creation_is_atomic_under_concurrency(tmp_path, monkeypatch):
@@ -83,7 +87,8 @@ def test_credential_cipher_key_creation_is_atomic_under_concurrency(tmp_path, mo
 
     token = ciphers[0].encrypt("shared-secret")
     assert all(cipher.decrypt(token) == "shared-secret" for cipher in ciphers)
-    assert (tmp_path / KEY_FILENAME).stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert (tmp_path / KEY_FILENAME).stat().st_mode & 0o777 == 0o600
     assert list(tmp_path.glob(f".{KEY_FILENAME}.*.tmp")) == []
 
 

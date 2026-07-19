@@ -67,7 +67,8 @@ def test_concurrent_thumbnail_writes_never_publish_mixed_bytes(
     assert not first.is_alive()
     assert errors == []
     assert target.read_bytes() == first_image
-    assert target.stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert target.stat().st_mode & 0o777 == 0o600
     assert list(tmp_path.glob(f".{target.name}.*.tmp")) == []
 
 

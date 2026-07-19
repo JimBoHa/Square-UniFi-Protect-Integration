@@ -2867,8 +2867,8 @@ def test_square_status_indicator_ui_wiring():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert 'api("/api/health/square")' in js
     assert "refreshSquareStatus" in js
     assert 'id="square-status"' in html
@@ -2924,8 +2924,8 @@ def test_protect_status_indicator_ui_wiring():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert 'api("/api/health/protect")' in js
     assert "refreshProtectStatus" in js
     assert 'id="protect-status"' in html
@@ -2960,8 +2960,8 @@ def test_dashboard_connected_with_webhook_freshness(configured):
     assert isinstance(data["webhook"]["last_event_ms"], int)
     assert data["queues"]["thumbnails_pending"] == 0
 
-def test_dashboard_counts_pending_queue_work(configured):
-    store = configured.app.state.store
+def test_dashboard_counts_pending_queue_work(authed):
+    store = authed.app.state.store
     store.upsert_transaction(
         {
             "id": "PAY_QUEUED_TILE",
@@ -2975,15 +2975,15 @@ def test_dashboard_counts_pending_queue_work(configured):
             "thumbnail_path": None,
         }
     )
-    data = configured.get("/api/dashboard").json()
+    data = authed.get("/api/dashboard").json()
     assert data["queues"]["thumbnails_pending"] == 1
 
 def test_dashboard_tiles_ui_wiring():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert 'api("/api/dashboard")' in js
     assert "startDashboardRefresh" in js
     for tile in ("protect", "square", "webhook", "queues"):

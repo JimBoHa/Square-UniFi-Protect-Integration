@@ -159,8 +159,8 @@ def test_oauth_ui_wiring():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert 'id="square-oauth-connect"' in html
     assert "/oauth/square/start" in js
     assert "/api/settings/square/oauth-app" in js

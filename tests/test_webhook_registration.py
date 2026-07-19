@@ -10,8 +10,6 @@ from app.main import create_app
 
 from .conftest import (
     ADMIN_PASSWORD,
-    PROTECT_PASS,
-    PROTECT_USER,
     SQUARE_TOKEN,
     protect_handler,
     square_handler,

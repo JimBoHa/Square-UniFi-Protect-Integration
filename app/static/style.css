@@ -61,7 +61,7 @@ button[type="submit"], #save-mapping, #sync-now {
 .txn .thumbnail-link:focus-visible { outline: 3px solid #2684ff; outline-offset: 3px; }
 .txn .thumb.placeholder {
   display: flex; align-items: center; justify-content: center;
-  font-size: 0.75rem; opacity: 0.6; cursor: default;
+  font-size: 0.75rem; opacity: 0.65; cursor: default;
 }
 .txn .amount { font-size: 1.15rem; font-weight: 700; min-width: 90px; }
 .txn .meta { font-size: 0.85rem; opacity: 0.8; }

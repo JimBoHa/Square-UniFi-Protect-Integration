@@ -5,7 +5,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
-import hashlib
 import json
 import logging
 import os
@@ -34,6 +33,10 @@ TRANSACTION_SNAPSHOT_TTL_SECONDS = SESSION_TTL_SECONDS
 MAX_TRANSACTION_SNAPSHOTS = 8
 MAX_TRANSACTION_ORDER_HISTORY = 10_000
 MAX_TRANSACTION_SEARCH_LENGTH = 64
+TRANSACTION_FILTER_SIGNATURE_PREFIX = "hmac-sha256-v1:"
+_TRANSACTION_FILTER_SIGNATURE_DOMAIN = (
+    b"square-unifi-protect:transaction-filter-signature:v1"
+)
 TRANSACTION_FILTER_STATUSES = frozenset(
     {"APPROVED", "PENDING", "COMPLETED", "CANCELED", "FAILED"}
 )
@@ -202,6 +205,7 @@ class TransactionSnapshotFilterMismatch(Exception):
 def _transaction_filter(
     query: str,
     status: str,
+    cipher: CredentialCipher,
 ) -> tuple[str, str, tuple[str, ...]]:
     """Return filter signature, fixed SQL, and bound parameters."""
     query = str(query)
@@ -216,11 +220,13 @@ def _transaction_filter(
 
     if not query and not status:
         return "", "", ()
-    signature = hashlib.sha256(
-        json.dumps([query, status], ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
-        )
-    ).hexdigest()
+    canonical_filter = json.dumps(
+        [query, status], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    signature = TRANSACTION_FILTER_SIGNATURE_PREFIX + cipher.keyed_hmac_hex(
+        _TRANSACTION_FILTER_SIGNATURE_DOMAIN,
+        canonical_filter,
+    )
     clauses: list[str] = []
     parameters: list[str] = []
     if query:
@@ -244,6 +250,18 @@ def _transaction_filter(
         clauses.append("t.status = ?")
         parameters.append(status)
     return signature, " AND " + " AND ".join(clauses), tuple(parameters)
+
+
+def _is_current_transaction_filter_signature(signature: str) -> bool:
+    """Recognize keyed filter signatures that this release can verify."""
+    if signature == "":
+        return True
+    if not signature.startswith(TRANSACTION_FILTER_SIGNATURE_PREFIX):
+        return False
+    digest = signature[len(TRANSACTION_FILTER_SIGNATURE_PREFIX) :]
+    return len(digest) == 64 and all(
+        character in "0123456789abcdef" for character in digest
+    )
 
 
 def _windows_try_lock_byte(fd: int, offset: int) -> bool:
@@ -622,6 +640,25 @@ class Store:
             ).fetchall()
         }
         if "filter_signature" in columns:
+            # The previous filter-aware schema stored raw SHA-256 signatures.
+            # Those values reveal low-entropy searches (for example card
+            # last-4) through offline guessing and correlate filters across
+            # installations. Expire only legacy filtered snapshots; empty
+            # signatures remain valid.
+            legacy_ids = [
+                row["id"]
+                for row in self._db.execute(
+                    "SELECT id, filter_signature FROM transaction_feed_snapshots "
+                    "WHERE filter_signature != ''"
+                ).fetchall()
+                if not _is_current_transaction_filter_signature(
+                    row["filter_signature"]
+                )
+            ]
+            self._db.executemany(
+                "DELETE FROM transaction_feed_snapshots WHERE id = ?",
+                ((snapshot_id,) for snapshot_id in legacy_ids),
+            )
             return
 
         # SQLite cannot extend the existing UNIQUE constraint in place. Keep
@@ -2329,7 +2366,7 @@ class Store:
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
         filter_signature, filter_sql, filter_parameters = _transaction_filter(
-            query, status
+            query, status, self.cipher
         )
         expired = False
         filter_mismatch = False

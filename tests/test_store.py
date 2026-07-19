@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import errno
+import hashlib
 import json
 import os
 import sqlite3
@@ -18,6 +19,7 @@ from app.store import (
     ProtectConsoleSwitchConfirmationRequired,
     ProtectSettingsConflict,
     Store,
+    TRANSACTION_FILTER_SIGNATURE_PREFIX,
     TransactionSnapshotExpired,
     TransactionSnapshotFilterMismatch,
 )
@@ -1522,8 +1524,123 @@ def test_store_migrates_unfiltered_snapshot_to_filter_bound_schema(tmp_path):
     assert [row["id"] for row in filtered] == ["PAY_LEGACY_SNAPSHOT"]
     assert [row["id"] for row in still_valid] == ["PAY_LEGACY_SNAPSHOT"]
     assert signatures[0] == ""
-    assert len(signatures[1]) == 64
+    assert signatures[1].startswith(TRANSACTION_FILTER_SIGNATURE_PREFIX)
+    assert len(signatures[1]) == len(TRANSACTION_FILTER_SIGNATURE_PREFIX) + 64
     assert "legacy_snapshot" not in signatures[1]
+
+
+def test_filtered_snapshot_signature_is_keyed_per_installation_and_durable(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("SPI_ENCRYPTION_KEY", raising=False)
+    canonical_filter = json.dumps(
+        ["4242", "COMPLETED"], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    raw_digest = hashlib.sha256(canonical_filter).hexdigest()
+    signatures = []
+
+    for install_name in ("install-a", "install-b"):
+        data_dir = tmp_path / install_name
+        store = Store(data_dir)
+        try:
+            store.upsert_transaction(
+                {
+                    "id": "PAY_FILTER_SIGNATURE",
+                    "created_at": "2026-07-16T15:30:00.000Z",
+                    "ts_ms": 100,
+                    "amount": 100,
+                    "currency": "USD",
+                    "status": "COMPLETED",
+                    "location_id": "LOC1",
+                    "card_last4": "4242",
+                }
+            )
+            _page, snapshot_id = store.list_transactions_page(
+                limit=1,
+                query="4242",
+                status="COMPLETED",
+            )
+            signature = store._db.execute(
+                "SELECT filter_signature FROM transaction_feed_snapshots WHERE id = ?",
+                (snapshot_id,),
+            ).fetchone()["filter_signature"]
+        finally:
+            store.close()
+
+        reopened = Store(data_dir)
+        try:
+            _page, durable_snapshot_id = reopened.list_transactions_page(
+                limit=1,
+                query="4242",
+                status="COMPLETED",
+            )
+            durable_signature = reopened._db.execute(
+                "SELECT filter_signature FROM transaction_feed_snapshots WHERE id = ?",
+                (durable_snapshot_id,),
+            ).fetchone()["filter_signature"]
+        finally:
+            reopened.close()
+
+        assert durable_snapshot_id == snapshot_id
+        assert durable_signature == signature
+        assert signature.startswith(TRANSACTION_FILTER_SIGNATURE_PREFIX)
+        assert signature != raw_digest
+        assert not signature.endswith(raw_digest)
+        signatures.append(signature)
+
+    assert signatures[0] != signatures[1]
+
+
+def test_store_expires_legacy_unkeyed_filtered_snapshots_only(tmp_path):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    store.upsert_transaction(
+        {
+            "id": "PAY_LEGACY_FILTER",
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "ts_ms": 100,
+            "amount": 100,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+            "card_last4": "4242",
+        }
+    )
+    _page, unfiltered_snapshot = store.list_transactions_page(limit=1)
+    _page, filtered_snapshot = store.list_transactions_page(limit=1, query="4242")
+    store.close()
+
+    raw_digest = hashlib.sha256(b'["4242",""]').hexdigest()
+    db = sqlite3.connect(data_dir / "spi.db")
+    db.execute(
+        "UPDATE transaction_feed_snapshots SET filter_signature = ? WHERE id = ?",
+        (raw_digest, filtered_snapshot),
+    )
+    db.commit()
+    db.close()
+
+    reopened = Store(data_dir)
+    try:
+        remaining_ids = {
+            row["id"]
+            for row in reopened._db.execute(
+                "SELECT id FROM transaction_feed_snapshots"
+            ).fetchall()
+        }
+        _page, same_unfiltered_snapshot = reopened.list_transactions_page(
+            limit=1,
+            snapshot_id=unfiltered_snapshot,
+        )
+        _page, replacement_filtered_snapshot = reopened.list_transactions_page(
+            limit=1,
+            query="4242",
+        )
+    finally:
+        reopened.close()
+
+    assert remaining_ids == {unfiltered_snapshot}
+    assert same_unfiltered_snapshot == unfiltered_snapshot
+    assert replacement_filtered_snapshot != filtered_snapshot
 
 
 def test_stale_event_with_old_timestamp_cannot_overwrite_thumbnail_file(tmp_path):

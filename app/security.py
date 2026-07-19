@@ -18,6 +18,9 @@ _SCRYPT_N = 2**14
 _SCRYPT_R = 8
 _SCRYPT_P = 1
 _SALT_BYTES = 16
+_KEYED_HMAC_DERIVATION_DOMAIN = (
+    b"square-unifi-protect:credential-cipher:keyed-hmac:v1"
+)
 
 
 class CredentialCipher:
@@ -29,7 +32,15 @@ class CredentialCipher:
     """
 
     def __init__(self, data_dir: Path):
-        self._fernet = Fernet(self._load_or_create_key(data_dir))
+        key = self._load_or_create_key(data_dir)
+        self._fernet = Fernet(key)
+        # Derive a distinct MAC key instead of reusing Fernet's key material
+        # directly in another protocol.
+        self._keyed_hmac_key = hmac.new(
+            key,
+            _KEYED_HMAC_DERIVATION_DOMAIN,
+            hashlib.sha256,
+        ).digest()
 
     @staticmethod
     def _load_or_create_key(data_dir: Path) -> bytes:
@@ -80,6 +91,16 @@ class CredentialCipher:
             return self._fernet.decrypt(ciphertext.encode()).decode()
         except InvalidToken as exc:
             raise ValueError("Could not decrypt stored credential") from exc
+
+    def keyed_hmac_hex(self, domain: bytes, payload: bytes) -> str:
+        """Return a domain-separated installation-specific HMAC digest."""
+        if not domain or b"\0" in domain:
+            raise ValueError("HMAC domain must be non-empty and contain no NUL bytes")
+        return hmac.new(
+            self._keyed_hmac_key,
+            domain + b"\0" + payload,
+            hashlib.sha256,
+        ).hexdigest()
 
 
 def hash_password(password: str) -> str:

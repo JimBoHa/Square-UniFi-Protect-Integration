@@ -32,7 +32,12 @@ PLIST="dist/Square Protect.app/Contents/Info.plist"
 if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
   codesign --deep --force --options runtime \
     --sign "$MACOS_SIGNING_IDENTITY" "dist/Square Protect.app"
+else
+  # PlistBuddy invalidates PyInstaller's ad-hoc bundle signature. Restore a
+  # valid local signature even when no release identity is configured.
+  codesign --deep --force --sign - "dist/Square Protect.app"
 fi
+codesign --verify --deep --strict "dist/Square Protect.app"
 
 STAGE=$(mktemp -d)
 cp -R "dist/Square Protect.app" "$STAGE/"

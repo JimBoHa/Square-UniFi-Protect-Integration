@@ -22,3 +22,20 @@ def test_macos_app_is_signed_before_it_enters_dmg():
     create_dmg = build_script.index("hdiutil create")
 
     assert signing_guard < sign_app < stage_app < create_dmg
+
+
+def test_unsigned_app_is_resigned_after_plist_editing():
+    build_script = (
+        REPO_ROOT / "scripts" / "macos" / "build_dmg.sh"
+    ).read_text(encoding="utf-8")
+
+    plist_edit = build_script.index("PlistBuddy")
+    adhoc_sign = build_script.index(
+        'codesign --deep --force --sign - "dist/Square Protect.app"'
+    )
+    verify_signature = build_script.index(
+        'codesign --verify --deep --strict "dist/Square Protect.app"'
+    )
+    stage_app = build_script.index('cp -R "dist/Square Protect.app"')
+
+    assert plist_edit < adhoc_sign < verify_signature < stage_app

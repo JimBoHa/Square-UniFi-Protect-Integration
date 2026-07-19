@@ -12,13 +12,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from . import deeplink, discovery, sync
 from .protect_client import (
@@ -58,6 +59,7 @@ SESSION_COOKIE = "spi_session"
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
 SQUARE_WEBHOOK_MAX_BODY_BYTES = 1024 * 1024
+TRANSACTION_QUERY_MAX_BODY_BYTES = 2 * 1024
 LOGIN_FAILURE_KEY_LIMIT = 10_000
 DRAIN_MAX_BATCHES = 100
 PROTECT_SETTING_KEYS = (
@@ -177,6 +179,14 @@ TransactionStatusFilter = Literal[
     "CANCELED",
     "FAILED",
 ]
+
+
+class TransactionQueryBody(BaseModel):
+    limit: int = Field(default=50, ge=1, le=500)
+    offset: int = Field(default=0, ge=0, le=1_000_000)
+    snapshot: int | None = Field(default=None, ge=1, le=(1 << 63) - 1)
+    q: str = Field(default="", max_length=64)
+    status: TransactionStatusFilter | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1401,29 +1411,24 @@ def create_app(
             "queues": queues,
         }
 
-    @app.get("/api/transactions")
-    def transactions(
-        limit: Annotated[int, Query(ge=1, le=500)] = 50,
-        offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
-        snapshot: Annotated[int | None, Query(ge=1, le=(1 << 63) - 1)] = None,
-        q: Annotated[str, Query(max_length=64)] = "",
-        status: TransactionStatusFilter | None = None,
-        _=authed,
-    ) -> JSONResponse:
-        if any(ord(character) < 32 or ord(character) == 127 for character in q):
+    def transaction_listing(body: TransactionQueryBody) -> JSONResponse:
+        query = body.q
+        if any(
+            ord(character) < 32 or ord(character) == 127 for character in query
+        ):
             raise HTTPException(
                 status_code=422,
                 detail="Search query cannot contain control characters",
             )
-        q = q.strip()
+        query = query.strip()
         with store.integration_guard():
             try:
                 rows, transaction_snapshot = store.list_transactions_page(
-                    limit,
-                    offset,
-                    snapshot,
-                    query=q,
-                    status=status or "",
+                    body.limit,
+                    body.offset,
+                    body.snapshot,
+                    query=query,
+                    status=body.status or "",
                 )
             except TransactionSnapshotFilterMismatch as exc:
                 raise HTTPException(
@@ -1444,6 +1449,81 @@ def create_app(
                     "Cache-Control": PRIVATE_NO_STORE,
                 },
             )
+
+    def require_transaction_query_transport(request: Request) -> None:
+        if request.query_params:
+            raise HTTPException(
+                status_code=422,
+                detail="Transaction read parameters must be sent in the JSON body",
+            )
+        media_type = request.headers.get("content-type", "").split(";", 1)[0]
+        media_type = media_type.strip().lower()
+        if media_type != "application/json" and not media_type.endswith("+json"):
+            raise HTTPException(
+                status_code=415,
+                detail="Transaction reads require an application/json body",
+            )
+
+    async def read_transaction_query_body(request: Request) -> TransactionQueryBody:
+        """Read and validate the small query payload after route dependencies run."""
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid transaction query Content-Length",
+                ) from exc
+            if declared_length < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid transaction query Content-Length",
+                )
+            if declared_length > TRANSACTION_QUERY_MAX_BODY_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Transaction query payload too large",
+                )
+
+        payload = bytearray()
+        async for chunk in request.stream():
+            if len(payload) + len(chunk) > TRANSACTION_QUERY_MAX_BODY_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Transaction query payload too large",
+                )
+            payload.extend(chunk)
+
+        try:
+            return TransactionQueryBody.model_validate_json(bytes(payload))
+        except ValidationError as exc:
+            errors = []
+            for error in exc.errors(include_url=False):
+                body_error = dict(error)
+                body_error["loc"] = ("body", *error.get("loc", ()))
+                body_error.pop("input", None)
+                errors.append(body_error)
+            raise RequestValidationError(errors) from None
+
+    @app.get("/api/transactions")
+    def legacy_transactions(request: Request, _=authed) -> JSONResponse:
+        """Compatibility read without filters or paging parameters."""
+        if request.query_params:
+            raise HTTPException(
+                status_code=422,
+                detail="Transaction read parameters must be sent in a POST JSON body",
+            )
+        return transaction_listing(TransactionQueryBody())
+
+    @app.post("/api/transactions")
+    async def transactions(
+        request: Request,
+        _=authed,
+        __=Depends(require_transaction_query_transport),
+    ) -> JSONResponse:
+        body = await read_transaction_query_body(request)
+        return await run_in_threadpool(transaction_listing, body)
 
     @app.get("/api/thumbnails/{txn_id}")
     def thumbnail(txn_id: str, _=authed) -> Response:

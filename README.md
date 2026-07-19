@@ -32,7 +32,9 @@ timeline near that timestamp.
   template to open the Protect timeline near the transaction timestamp.
 - **Fast retail lookup** — search the local feed by transaction ID, card last-4,
   POS device/name, location ID, or status, and narrow it to a Square payment
-  status. Searches use normalized local fields and do not retain new buyer data.
+  status. Searches use normalized local fields, do not retain new buyer data,
+  and send lookup terms in an authenticated JSON body rather than a URL that
+  ordinary web-server or proxy access logs may record.
 - **Real-time + backfill** — a Square webhook receiver acknowledges deliveries
   immediately (HMAC-SHA256 signature verified) and captures footage
   asynchronously, while a background poller reconciles every Square location

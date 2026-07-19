@@ -864,16 +864,16 @@ async function loadTransactions({
   let page = null;
   let pageSnapshot = null;
   try {
-    const snapshotParam = requestedOffset > 0 && transactionSnapshot !== null
-      ? `&snapshot=${encodeURIComponent(transactionSnapshot)}`
-      : "";
-    const filterQuery = transactionFilterQuery(requestedFilters);
-    const filterParam = filterQuery ? `&${filterQuery}` : "";
-    const result = await api(
-      `/api/transactions?limit=${TRANSACTION_PAGE_SIZE + 1}` +
-        `&offset=${requestedOffset}${snapshotParam}${filterParam}`,
-      { includeResponse: true },
-    );
+    const queryBody = transactionQueryBody(requestedFilters, {
+      limit: TRANSACTION_PAGE_SIZE + 1,
+      offset: requestedOffset,
+      snapshot: requestedOffset > 0 ? transactionSnapshot : null,
+    });
+    const result = await api("/api/transactions", {
+      method: "POST",
+      body: JSON.stringify(queryBody),
+      includeResponse: true,
+    });
     page = result.data;
     pageSnapshot = result.response.headers.get("x-transaction-snapshot");
   } catch (err) {

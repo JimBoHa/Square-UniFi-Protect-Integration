@@ -44,7 +44,11 @@ button[type="submit"], #save-mapping, #sync-now, #export-csv {
 .destructive-warning p { margin: 0.35rem 0 0.75rem; }
 #message { min-height: 1.5rem; font-size: 0.9rem; }
 #message.error { color: #d33; }
-#message.ok { color: #2a9d3a; }
+#message.ok { color: #187a28; }
+
+@media (prefers-color-scheme: dark) {
+  #message.ok { color: #4ec760; }
+}
 
 .mapping-row { display: flex; gap: 0.75rem; align-items: center; margin: 0.4rem 0; }
 .mapping-row .loc { min-width: 280px; font-weight: 600; }

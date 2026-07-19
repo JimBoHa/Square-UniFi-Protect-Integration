@@ -15,8 +15,6 @@ from app.store import SquareAccountChanged, SquareAccountSwitchRequired, Store
 from . import conftest as test_fixtures
 from .conftest import (
     ADMIN_PASSWORD,
-    PROTECT_PASS,
-    PROTECT_USER,
     SQUARE_TOKEN,
     bootstrap_setup_body,
     protect_handler,

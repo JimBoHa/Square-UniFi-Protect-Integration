@@ -1,8 +1,6 @@
 """Discovery protocol tests, including a real UNVR response fixture."""
 
-import pytest
-
-from app.discovery import discover_consoles, parse_discovery_response
+from app.discovery import parse_discovery_response
 
 # Captured verbatim from a UNVR (model UNVRAI4, Protect 7.1.87) answering the
 # UDP discovery probe on port 10001.

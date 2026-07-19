@@ -72,7 +72,7 @@ def test_discovery_ui_wiring():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert 'id="protect-discover"' in html
     assert "/api/discover/protect" in js

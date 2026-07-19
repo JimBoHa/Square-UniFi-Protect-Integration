@@ -140,7 +140,7 @@ def test_register_ui_wiring():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert 'id="square-register-webhook"' in html
     assert "/api/settings/square/webhook/register" in js

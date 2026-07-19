@@ -9,7 +9,12 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.square_client import oauth_authorize_url
 
-from .conftest import ADMIN_PASSWORD, protect_handler, square_handler
+from .conftest import (
+    ADMIN_PASSWORD,
+    bootstrap_setup_body,
+    protect_handler,
+    square_handler,
+)
 
 CLIENT_ID = "sq0idp-test-app-id"
 CLIENT_SECRET = "sq0csp-test-app-secret"
@@ -53,8 +58,12 @@ def oauth_client(tmp_path):
         square_transport=httpx.MockTransport(make_oauth_square(state)),
         enable_poller=False,
     )
-    with TestClient(app) as client:
-        assert client.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+    with TestClient(
+        app,
+        base_url="http://localhost",
+        client=("127.0.0.1", 50000),
+    ) as client:
+        assert client.post("/api/setup", json=bootstrap_setup_body()).status_code == 200
         assert client.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
         yield client, state, app.state.store
     app.state.store.close()

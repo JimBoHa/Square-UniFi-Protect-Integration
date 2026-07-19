@@ -16,7 +16,16 @@ def test_tls_forces_secure_session_cookies(tmp_path, monkeypatch):
     monkeypatch.setenv("SPI_TLS", "1")
     monkeypatch.setenv("SPI_COOKIE_SECURE", "0")
     monkeypatch.setenv("SPI_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(main_module, "create_app", lambda data_dir: sentinel_app)
+
+    def capture_create_app(*, data_dir, bind_host, tls_enabled):
+        captured.update(
+            create_data_dir=data_dir,
+            create_bind_host=bind_host,
+            create_tls_enabled=tls_enabled,
+        )
+        return sentinel_app
+
+    monkeypatch.setattr(main_module, "create_app", capture_create_app)
     monkeypatch.setattr(runner, "uvicorn_tls_kwargs", lambda *_: {"ssl_keyfile": "key"})
     monkeypatch.setattr(
         runner.uvicorn,
@@ -28,6 +37,8 @@ def test_tls_forces_secure_session_cookies(tmp_path, monkeypatch):
 
     assert captured["app"] is sentinel_app
     assert captured["ssl_keyfile"] == "key"
+    assert captured["create_bind_host"] == "127.0.0.1"
+    assert captured["create_tls_enabled"] is True
     assert runner.os.environ["SPI_COOKIE_SECURE"] == "1"
 
 
@@ -69,7 +80,16 @@ def test_runner_passes_normalized_port_to_uvicorn(tmp_path, monkeypatch):
     monkeypatch.setenv("SPI_PORT", "00080")
     monkeypatch.setenv("SPI_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("SPI_TLS", "0")
-    monkeypatch.setattr(main_module, "create_app", lambda data_dir: application)
+
+    def capture_create_app(*, data_dir, bind_host, tls_enabled):
+        captured.update(
+            create_data_dir=data_dir,
+            create_bind_host=bind_host,
+            create_tls_enabled=tls_enabled,
+        )
+        return application
+
+    monkeypatch.setattr(main_module, "create_app", capture_create_app)
     monkeypatch.setattr(runner, "uvicorn_tls_kwargs", lambda *args: {})
     monkeypatch.setattr(
         runner.uvicorn,
@@ -81,3 +101,5 @@ def test_runner_passes_normalized_port_to_uvicorn(tmp_path, monkeypatch):
 
     assert captured["app"] is application
     assert captured["port"] == 80
+    assert captured["create_bind_host"] == "127.0.0.1"
+    assert captured["create_tls_enabled"] is False

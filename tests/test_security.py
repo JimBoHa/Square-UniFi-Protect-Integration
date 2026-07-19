@@ -17,6 +17,7 @@ from .conftest import (
     SQUARE_MERCHANT_ID,
     SQUARE_TOKEN,
     WEBHOOK_KEY,
+    bootstrap_setup_body,
 )
 from .test_api import make_webhook_event
 
@@ -106,25 +107,25 @@ def test_endpoints_require_authentication(client, method, path):
     assert resp.status_code == 401, f"{method} {path} must require auth"
 
 def test_forged_session_cookie_rejected(client):
-    client.post("/api/setup", json={"password": ADMIN_PASSWORD})
+    client.post("/api/setup", json=bootstrap_setup_body())
     client.cookies.set("spi_session", "forged-token-attempt")
     assert client.get("/api/transactions").status_code == 401
 
 def test_session_cookie_flags(client):
-    client.post("/api/setup", json={"password": ADMIN_PASSWORD})
+    client.post("/api/setup", json=bootstrap_setup_body())
     resp = client.post("/api/login", json={"password": ADMIN_PASSWORD})
     cookie = resp.headers["set-cookie"].lower()
     assert "httponly" in cookie
     assert "samesite=lax" in cookie
 
 def test_setup_cannot_be_rerun(authed):
-    resp = authed.post("/api/setup", json={"password": "attacker-password"})
+    resp = authed.post("/api/setup", json=bootstrap_setup_body("attacker-password"))
     assert resp.status_code == 409
     # Original password still works
     assert authed.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
 
 def test_login_throttled_after_repeated_failures(client):
-    client.post("/api/setup", json={"password": ADMIN_PASSWORD})
+    client.post("/api/setup", json=bootstrap_setup_body())
     for _ in range(5):
         assert client.post("/api/login", json={"password": "wrong"}).status_code == 401
     resp = client.post("/api/login", json={"password": "wrong"})
@@ -134,7 +135,7 @@ def test_login_throttled_after_repeated_failures(client):
 
 
 def test_successful_login_resets_prior_failures(client):
-    client.post("/api/setup", json={"password": ADMIN_PASSWORD})
+    client.post("/api/setup", json=bootstrap_setup_body())
     for _ in range(4):
         assert client.post("/api/login", json={"password": "wrong"}).status_code == 401
 
@@ -147,7 +148,7 @@ def test_successful_login_resets_prior_failures(client):
 def test_login_failure_map_prunes_expired_keys_and_throttles_at_capacity(
     client, monkeypatch
 ):
-    client.post("/api/setup", json={"password": ADMIN_PASSWORD})
+    client.post("/api/setup", json=bootstrap_setup_body())
     now = time.time()
     client.app.state.login_failures.update(
         {

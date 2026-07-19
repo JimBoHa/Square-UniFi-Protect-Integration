@@ -18,6 +18,8 @@ let settingsLoadGeneration = 0;
 let squareAccountSwitchConfirmationToken = "";
 let squareAccountRevision = "";
 let cameraMappingGeneration = "";
+let wizardSquareAccountRevision = "";
+let wizardProtectConsoleGeneration = "";
 
 function show(viewId, focusHeading = true) {
   const view = $(viewId);
@@ -1010,7 +1012,17 @@ async function maybeStartWizard() {
 async function loadWizardMapping() {
   const data = await fetchMappingData();
   if (data === null) return false;
-  return buildMappingRows($("#wiz-mapping-rows"), data);
+  if (!settingsSnapshotsMatch(data)) {
+    wizardSquareAccountRevision = "";
+    wizardProtectConsoleGeneration = "";
+    $("#wiz-mapping-rows").textContent = "";
+    message("Provider settings changed while camera choices were loading. Try again.", "error");
+    return false;
+  }
+  const usable = buildMappingRows($("#wiz-mapping-rows"), data);
+  wizardSquareAccountRevision = usable ? data.mappingRevision || "" : "";
+  wizardProtectConsoleGeneration = usable ? data.mappingGeneration || "" : "";
+  return usable;
 }
 
 $("#wiz-protect-form").addEventListener("submit", async (e) => {
@@ -1058,7 +1070,14 @@ $("#wiz-square-form").addEventListener("submit", async (e) => {
 $("#wiz-save-mapping").addEventListener("click", async () => {
   const mappings = collectMappings($("#wiz-mapping-rows"));
   try {
-    await api("/api/camera-mapping", { method: "PUT", body: JSON.stringify({ mappings }) });
+    await api("/api/camera-mapping", {
+      method: "PUT",
+      headers: {
+        "X-Square-Account-Revision": wizardSquareAccountRevision,
+        "X-Protect-Console-Generation": wizardProtectConsoleGeneration,
+      },
+      body: JSON.stringify({ mappings }),
+    });
     message("Camera selection saved.", "ok");
     showWizardStep(4);
   } catch (err) {

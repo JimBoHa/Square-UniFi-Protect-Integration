@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
@@ -31,6 +32,7 @@ from cryptography.x509.oid import NameOID
 CERT_FILENAME = "tls-cert.pem"
 KEY_FILENAME = "tls-key.pem"
 _VALIDITY = datetime.timedelta(days=3650)
+_RENEWAL_MARGIN = datetime.timedelta(days=30)
 _GENERATIONS_DIRNAME = ".tls-material"
 _CURRENT_GENERATION_FILENAME = ".tls-current"
 _GENERATION_LOCK_FILENAME = ".tls-generation.lock"
@@ -224,18 +226,46 @@ def _local_ip() -> str | None:
         probe.close()
 
 
-def _cert_covers_current_ip(cert_path: Path, local_ip: str | None) -> bool:
-    if local_ip is None:
-        return True
+def _existing_pair_is_reusable(
+    cert_path: Path, key_path: Path, local_ip: str | None
+) -> bool:
+    """Return whether existing material is safe to reuse for this startup."""
     try:
+        # Invalid generations remain on disk because another process may still
+        # be serving them. Restrict their private key before any early return.
+        os.chmod(key_path, 0o600)
         cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
-        sans = cert.extensions.get_extension_for_class(
-            x509.SubjectAlternativeName
-        ).value
-        addresses = sans.get_values_for_type(x509.IPAddress)
-    except (ValueError, x509.ExtensionNotFound):
+        key = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if cert.not_valid_before_utc > now:
+            return False
+        if cert.not_valid_after_utc <= now + _RENEWAL_MARGIN:
+            return False
+        if local_ip is not None:
+            sans = cert.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value
+            addresses = sans.get_values_for_type(x509.IPAddress)
+            if ipaddress.ip_address(local_ip) not in addresses:
+                return False
+        public_format = serialization.PublicFormat.SubjectPublicKeyInfo
+        cert_public_key = cert.public_key().public_bytes(
+            serialization.Encoding.DER, public_format
+        )
+        key_public_key = key.public_key().public_bytes(
+            serialization.Encoding.DER, public_format
+        )
+        if cert_public_key != key_public_key:
+            return False
+    except (
+        OSError,
+        TypeError,
+        UnsupportedAlgorithm,
+        ValueError,
+        x509.ExtensionNotFound,
+    ):
         return False
-    return ipaddress.ip_address(local_ip) in addresses
+    return True
 
 
 def ensure_self_signed_cert(data_dir: Path) -> tuple[Path, Path]:
@@ -257,7 +287,7 @@ def ensure_self_signed_cert(data_dir: Path) -> tuple[Path, Path]:
         if (
             cert_path.is_file()
             and key_path.is_file()
-            and _cert_covers_current_ip(cert_path, local_ip)
+            and _existing_pair_is_reusable(cert_path, key_path, local_ip)
         ):
             return cert_path, key_path
 

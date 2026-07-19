@@ -1,6 +1,8 @@
 """Self-signed TLS helper tests."""
 
+import datetime
 import multiprocessing
+import os
 import ssl
 import stat
 import threading
@@ -8,6 +10,8 @@ from pathlib import Path
 
 import pytest
 from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from app.tls import ensure_self_signed_cert, uvicorn_tls_kwargs
 
@@ -28,6 +32,33 @@ def _generate_tls_in_process(data_dir, lock_attempted, lock_acquired, result) ->
         result.put(("ok", tuple(str(path) for path in paths)))
     except BaseException as exc:  # pragma: no cover - reported in parent process
         result.put(("error", repr(exc)))
+
+
+def _replace_certificate(
+    cert_path, key_path, *, not_valid_before, not_valid_after
+) -> bytes:
+    original = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    key = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(original.subject)
+        .issuer_name(original.issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_valid_before)
+        .not_valid_after(not_valid_after)
+    )
+    for extension in original.extensions:
+        builder = builder.add_extension(extension.value, extension.critical)
+    content = builder.sign(key, hashes.SHA256()).public_bytes(
+        serialization.Encoding.PEM
+    )
+    cert_path.write_bytes(content)
+    return content
+
+
+def _assert_pair_loads(cert_path, key_path) -> None:
+    ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert_path, key_path)
 
 
 def test_cert_generated_once_with_private_key_permissions(tmp_path):
@@ -237,3 +268,159 @@ def test_failed_pointer_swap_preserves_previous_pair(tmp_path, monkeypatch):
     monkeypatch.setattr(tls, "_local_ip", lambda: "192.0.2.10")
     assert tls.ensure_self_signed_cert(tmp_path) == original_pair
     ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(*original_pair)
+
+
+def test_mismatched_private_key_regenerates_pair(tmp_path, monkeypatch):
+    import app.tls as tls
+
+    monkeypatch.setattr(tls, "_local_ip", lambda: "192.0.2.10")
+    original_pair = tls.ensure_self_signed_cert(tmp_path)
+    original_cert = original_pair[0].read_bytes()
+    unrelated_key = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    original_pair[1].write_bytes(unrelated_key)
+    original_pair[1].chmod(0o644)
+
+    regenerated = tls.ensure_self_signed_cert(tmp_path)
+
+    assert regenerated != original_pair
+    assert original_pair[0].read_bytes() == original_cert
+    assert original_pair[1].read_bytes() == unrelated_key
+    if os.name == "posix":
+        assert stat.S_IMODE(original_pair[1].stat().st_mode) == 0o600
+        assert stat.S_IMODE(regenerated[1].stat().st_mode) == 0o600
+    _assert_pair_loads(*regenerated)
+    assert tls.ensure_self_signed_cert(tmp_path) == regenerated
+
+
+@pytest.mark.parametrize("corrupt_name", ["tls-cert.pem", "tls-key.pem"])
+def test_corrupt_tls_material_regenerates_pair(tmp_path, monkeypatch, corrupt_name):
+    import app.tls as tls
+
+    monkeypatch.setattr(tls, "_local_ip", lambda: "192.0.2.10")
+    original_pair = tls.ensure_self_signed_cert(tmp_path)
+    corrupt_path = (
+        original_pair[0] if corrupt_name == tls.CERT_FILENAME else original_pair[1]
+    )
+    if corrupt_name == tls.CERT_FILENAME:
+        original_pair[1].chmod(0o644)
+    corrupt_content = b"not PEM material"
+    corrupt_path.write_bytes(corrupt_content)
+
+    regenerated = tls.ensure_self_signed_cert(tmp_path)
+
+    assert regenerated != original_pair
+    assert corrupt_path.read_bytes() == corrupt_content
+    if os.name == "posix":
+        assert stat.S_IMODE(original_pair[1].stat().st_mode) == 0o600
+    x509.load_pem_x509_certificate(regenerated[0].read_bytes())
+    serialization.load_pem_private_key(regenerated[1].read_bytes(), password=None)
+    _assert_pair_loads(*regenerated)
+
+
+@pytest.mark.parametrize(
+    ("not_before_delta", "not_after_delta"),
+    [
+        (
+            -datetime.timedelta(days=2),
+            -datetime.timedelta(seconds=1),
+        ),
+        (
+            datetime.timedelta(days=1),
+            datetime.timedelta(days=365),
+        ),
+        (
+            -datetime.timedelta(days=1),
+            datetime.timedelta(days=29),
+        ),
+    ],
+    ids=("expired", "not-yet-valid", "inside-renewal-margin"),
+)
+def test_invalid_certificate_dates_regenerate_pair(
+    tmp_path,
+    monkeypatch,
+    not_before_delta,
+    not_after_delta,
+):
+    import app.tls as tls
+
+    monkeypatch.setattr(tls, "_local_ip", lambda: "192.0.2.10")
+    original_pair = tls.ensure_self_signed_cert(tmp_path)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    invalid_cert = _replace_certificate(
+        *original_pair,
+        not_valid_before=now + not_before_delta,
+        not_valid_after=now + not_after_delta,
+    )
+
+    regenerated = tls.ensure_self_signed_cert(tmp_path)
+
+    assert regenerated != original_pair
+    assert original_pair[0].read_bytes() == invalid_cert
+    assert regenerated[0].read_bytes() != invalid_cert
+    _assert_pair_loads(*regenerated)
+
+
+def test_reuse_repairs_private_key_permissions(tmp_path, monkeypatch):
+    import app.tls as tls
+
+    monkeypatch.setattr(tls, "_local_ip", lambda: "192.0.2.10")
+    pair = tls.ensure_self_signed_cert(tmp_path)
+    original_cert = pair[0].read_bytes()
+    pair[1].chmod(0o644)
+
+    assert tls.ensure_self_signed_cert(tmp_path) == pair
+    assert pair[0].read_bytes() == original_cert
+    if os.name == "posix":
+        assert stat.S_IMODE(pair[1].stat().st_mode) == 0o600
+
+
+def test_concurrent_corruption_repair_publishes_one_replacement(tmp_path, monkeypatch):
+    import app.tls as tls
+
+    monkeypatch.setattr(tls, "_local_ip", lambda: "192.0.2.10")
+    original_pair = tls.ensure_self_signed_cert(tmp_path)
+    original_pair[1].write_bytes(b"corrupt private key")
+    original_generate = tls.ec.generate_private_key
+    first_entered = threading.Event()
+    allow_first = threading.Event()
+    generation_count = 0
+    count_lock = threading.Lock()
+
+    def controlled_generate(*args, **kwargs):
+        nonlocal generation_count
+        with count_lock:
+            generation_count += 1
+        first_entered.set()
+        assert allow_first.wait(5)
+        return original_generate(*args, **kwargs)
+
+    monkeypatch.setattr(tls.ec, "generate_private_key", controlled_generate)
+    results = []
+    errors = []
+
+    def repair() -> None:
+        try:
+            results.append(tls.ensure_self_signed_cert(tmp_path))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first = threading.Thread(target=repair)
+    second = threading.Thread(target=repair)
+    first.start()
+    assert first_entered.wait(5)
+    second.start()
+    allow_first.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert generation_count == 1
+    assert len(results) == 2
+    assert results[0] == results[1]
+    assert results[0] != original_pair
+    _assert_pair_loads(*results[0])

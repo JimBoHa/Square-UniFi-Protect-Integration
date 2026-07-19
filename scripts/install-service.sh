@@ -76,7 +76,8 @@ Restart=on-failure
 WantedBy=multi-user.target
 UNIT_EOF
     sudo systemctl daemon-reload
-    sudo systemctl enable --now square-protect
+    sudo systemctl enable square-protect
+    sudo systemctl restart square-protect
     echo "Installed. Dashboard: https://<this-host>:8000"
     echo "Accept the self-signed certificate warning in your browser."
     echo "For the one-time setup secret, run:"

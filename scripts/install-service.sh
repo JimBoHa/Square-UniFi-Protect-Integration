@@ -6,12 +6,14 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 UNINSTALL="${1:-}"
 
-if [ ! -x "$REPO/.venv/bin/python" ]; then
-  echo "Setting up the Python environment..."
-  python3 -m venv "$REPO/.venv"
+if [ "$UNINSTALL" != "--uninstall" ]; then
+  if [ ! -x "$REPO/.venv/bin/python" ]; then
+    echo "Setting up the Python environment..."
+    python3 -m venv "$REPO/.venv"
+  fi
+  "$REPO/.venv/bin/python" "$REPO/scripts/ensure_dependencies.py" \
+    "$REPO" "$REPO/.venv"
 fi
-"$REPO/.venv/bin/python" "$REPO/scripts/ensure_dependencies.py" \
-  "$REPO" "$REPO/.venv"
 
 case "$(uname -s)" in
   Darwin)

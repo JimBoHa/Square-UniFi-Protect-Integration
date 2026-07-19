@@ -1,6 +1,7 @@
 """Connect-with-Square OAuth flow tests (token endpoint mocked)."""
 
 import concurrent.futures
+import inspect
 import json
 import threading
 import time
@@ -21,6 +22,7 @@ from app.store import (
     Store,
 )
 
+from . import conftest as test_fixtures
 from .conftest import (
     ADMIN_PASSWORD,
     PROTECT_PASS,
@@ -66,6 +68,8 @@ def make_oauth_square(state):
                 200,
                 json={"locations": [{"id": "LOC1", "name": "OAuth Store", "status": "ACTIVE"}]},
             )
+        if request.url.path == "/v2/payments" and auth.startswith("Bearer oauth-access-"):
+            return httpx.Response(200, json={"payments": []})
         return square_handler(request)
 
     return handler
@@ -558,17 +562,24 @@ def test_blocked_oauth_refresh_cannot_overwrite_switched_account(tmp_path):
         return httpx.Response(404)
 
     data_dir = tmp_path / "data"
-    app = create_app(
+    create_options = dict(
         data_dir=data_dir,
         protect_transport=httpx.MockTransport(protect_handler),
         square_transport=httpx.MockTransport(square),
         enable_poller=False,
     )
+    if "tls_enabled" in inspect.signature(create_app).parameters:
+        create_options["tls_enabled"] = True
+    app = create_app(**create_options)
     second_store = None
     try:
         with TestClient(app) as client:
+            setup_body = {"password": ADMIN_PASSWORD}
+            bootstrap_secret = getattr(test_fixtures, "BOOTSTRAP_SECRET", None)
+            if bootstrap_secret:
+                setup_body["bootstrap_secret"] = bootstrap_secret
             assert client.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=setup_body
             ).status_code == 200
             assert client.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}
@@ -989,6 +1000,31 @@ def test_manual_account_or_environment_switch_keeps_oauth_app_credentials(
     assert store.get_setting("square.oauth_client_id") == CLIENT_ID
     assert store.get_setting("square.oauth_client_secret") == CLIENT_SECRET
     assert store.get_setting("square.oauth_environment") == "sandbox"
+
+
+def test_manual_sync_refreshes_expiring_oauth_token(oauth_client):
+    client, state, store = oauth_client
+    _save_oauth_app(client)
+    start = client.get("/oauth/square/start", follow_redirects=False)
+    oauth_state = start.headers["location"].rsplit("state=", 1)[-1]
+    client.get(
+        f"/oauth/square/callback?code=auth-code-1&state={oauth_state}",
+        follow_redirects=False,
+    )
+    store.set_setting("square.token_expires_at", "2020-01-01T00:00:00Z")
+    state["expires_at"] = "2030-01-01T00:00:00Z"
+
+    synced = client.post("/api/sync")
+
+    assert synced.status_code == 200
+    assert synced.json() == {"ok": True, "ingested": 0}
+    assert store.get_setting("square.access_token") == "oauth-access-refreshed"
+    refresh_calls = [
+        request
+        for request in state["token_requests"]
+        if request.get("grant_type") == "refresh_token"
+    ]
+    assert len(refresh_calls) == 1
 
 
 def test_oauth_endpoints_require_auth(client):

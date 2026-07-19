@@ -5,6 +5,27 @@
 set -e
 cd "$(dirname "$0")"
 
+invalid_port() {
+  echo "SPI_PORT must be a whole number from 1 to 65535." >&2
+  read -r -p "Press Return to close..." _ || true
+  exit 1
+}
+
+PORT="${SPI_PORT-8000}"
+case "$PORT" in
+  ""|*[!0-9]*) invalid_port ;;
+esac
+# Normalize leading zeroes before Bash arithmetic, where 0-prefixed values are
+# otherwise interpreted as octal.
+while [ "${PORT#0}" != "$PORT" ]; do
+  PORT="${PORT#0}"
+done
+[ -n "$PORT" ] || PORT=0
+if [ "${#PORT}" -gt 5 ] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+  invalid_port
+fi
+PORT_START="$PORT"
+
 if [ ! -x .venv/bin/python ]; then
   # python3 is only needed to create the environment; an already-provisioned
   # machine can launch without it.
@@ -24,18 +45,20 @@ fi
 # Lets automated checks verify setup without starting a browser or server.
 [ "${SPI_LAUNCHER_SETUP_ONLY:-0}" = "1" ] && exit 0
 
-PORT="${SPI_PORT:-8000}"
 PORT_CAP=$((PORT + 20))
+if [ "$PORT_CAP" -gt 65535 ]; then
+  PORT_CAP=65535
+fi
 # If the preferred port is taken (another copy running, or another app),
 # walk forward to the next free port instead of failing with a traceback.
 while lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; do
-  echo "Port $PORT is in use; trying $((PORT + 1))..."
-  PORT=$((PORT + 1))
-  if [ "$PORT" -gt "$PORT_CAP" ]; then
-    echo "Could not find a free port between ${SPI_PORT:-8000} and $PORT_CAP."
+  if [ "$PORT" -ge "$PORT_CAP" ]; then
+    echo "Could not find a free port between $PORT_START and $PORT_CAP."
     read -r -p "Press Return to close..." _
     exit 1
   fi
+  echo "Port $PORT is in use; trying $((PORT + 1))..."
+  PORT=$((PORT + 1))
 done
 
 export SPI_DATA_DIR="${SPI_DATA_DIR:-$PWD/data}"

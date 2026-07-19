@@ -18,6 +18,7 @@ from .conftest import (
     PROTECT_PASS,
     PROTECT_USER,
     SQUARE_TOKEN,
+    bootstrap_setup_body,
     protect_handler,
     square_handler,
 )
@@ -87,8 +88,12 @@ def registration_app(tmp_path):
         square_transport=httpx.MockTransport(make_registration_square(state)),
         enable_poller=False,
     )
-    with TestClient(app) as client:
-        assert client.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+    with TestClient(
+        app,
+        base_url="http://localhost",
+        client=("127.0.0.1", 50000),
+    ) as client:
+        assert client.post("/api/setup", json=bootstrap_setup_body()).status_code == 200
         assert client.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
         assert client.put(
             "/api/settings/square",

@@ -22,7 +22,7 @@ from app.store import (
 )
 from app.sync import deliver_completed_alarm, ingest_payment
 
-from .conftest import ADMIN_PASSWORD
+from .conftest import ADMIN_PASSWORD, bootstrap_setup_body
 
 
 TOKEN_A = "square-token-merchant-a"
@@ -174,9 +174,13 @@ def _authed_account_app(tmp_path: Path) -> tuple[object, TestClient]:
         square_transport=httpx.MockTransport(_square_accounts),
         enable_poller=False,
     )
-    client = TestClient(app)
+    client = TestClient(
+        app,
+        base_url="http://localhost",
+        client=("127.0.0.1", 50000),
+    )
     assert client.post(
-        "/api/setup", json={"password": ADMIN_PASSWORD}
+        "/api/setup", json=bootstrap_setup_body()
     ).status_code == 200
     assert client.post(
         "/api/login", json={"password": ADMIN_PASSWORD}

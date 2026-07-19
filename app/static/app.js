@@ -441,37 +441,44 @@ function setConnStatus(id, state, text) {
   el.querySelector(".conn-text").textContent = text;
 }
 
-async function refreshProtectStatus() {
-  setConnStatus("#protect-status", "checking", "Checking…");
+async function fetchConnectionStatus(loadStatus) {
   try {
-    const health = await api("/api/health/protect");
-    if (!health.configured) {
-      setConnStatus("#protect-status", "", "Not connected");
-    } else if (health.ok) {
-      setConnStatus("#protect-status", "ok", health.detail);
-    } else {
-      setConnStatus("#protect-status", "bad", health.detail);
-    }
+    return { health: await loadStatus(), error: null };
   } catch (err) {
-    setConnStatus("#protect-status", "bad", err.message);
+    return { health: null, error: err };
   }
 }
 
-async function refreshSquareStatus() {
-  setConnStatus("#square-status", "checking", "Checking…");
-  try {
-    const health = await api("/api/health/square");
-    if (!health.configured) {
-      setConnStatus("#square-status", "", "Not connected");
-    } else if (health.ok) {
-      setConnStatus("#square-status", "ok", health.detail);
-    } else {
-      setConnStatus("#square-status", "bad", health.detail);
-    }
-  } catch (err) {
-    setConnStatus("#square-status", "bad", err.message);
+function renderConnectionStatus(id, result) {
+  if (result.error) {
+    setConnStatus(id, "bad", result.error.message);
+  } else if (!result.health.configured) {
+    setConnStatus(id, "", "Not connected");
+  } else if (result.health.ok) {
+    setConnStatus(id, "ok", result.health.detail);
+  } else {
+    setConnStatus(id, "bad", result.health.detail);
   }
 }
+
+function createConnectionStatusRefresher(id, loadStatus) {
+  return createLatestStatusRefresher(
+    () => {
+      setConnStatus(id, "checking", "Checking…");
+      return fetchConnectionStatus(loadStatus);
+    },
+    (result) => renderConnectionStatus(id, result),
+  );
+}
+
+const refreshProtectStatus = createConnectionStatusRefresher(
+  "#protect-status",
+  () => api("/api/health/protect"),
+);
+const refreshSquareStatus = createConnectionStatusRefresher(
+  "#square-status",
+  () => api("/api/health/square"),
+);
 
 async function fetchSettingsView() {
   // Clear any previous console's rows/preview before the provider reads so a
@@ -482,8 +489,8 @@ async function fetchSettingsView() {
     $("#camera-preview-wrap"),
     $("#camera-preview"),
   );
-  // Connection indicators refresh alongside every settings load; they render
-  // into their own elements, so they need no stale-load generation guard.
+  // Each indicator has its own latest-response guard, so a slow previous
+  // health request cannot overwrite the result of a newer settings load.
   void refreshSquareStatus();
   void refreshProtectStatus();
   return fetchMappingData();
@@ -798,13 +805,16 @@ function setTile(name, state, value, hint) {
 
 let dashboardTimer = null;
 
-async function refreshDashboard() {
-  let data;
+async function fetchDashboardStatus() {
   try {
-    data = await api("/api/dashboard");
+    return await api("/api/dashboard");
   } catch {
-    return;
+    return null;
   }
+}
+
+function renderDashboard(data) {
+  if (data === null) return;
   $("#dashboard-tiles").hidden = false;
 
   const conn = (info, fixHint) => {
@@ -835,6 +845,11 @@ async function refreshDashboard() {
       `${data.queues.thumbnails_pending} thumbnail(s), ${data.queues.alarms_pending} alarm(s) retrying`);
   }
 }
+
+const refreshDashboard = createLatestStatusRefresher(
+  fetchDashboardStatus,
+  renderDashboard,
+);
 
 function startDashboardRefresh() {
   if (dashboardTimer !== null) return;

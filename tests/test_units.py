@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import hmac
+import json
 import os
 import sqlite3
 import threading
@@ -1265,6 +1266,98 @@ def test_square_pagination_exhausts_cursor_pages_by_default():
     client.close()
 
 
+def test_square_webhook_subscriptions_exhaust_cursor_pages():
+    pages = {
+        None: {
+            "subscriptions": [{"id": "SUB_FIRST"}],
+            "cursor": "next-page",
+        },
+        "next-page": {"subscriptions": [{"id": "SUB_SECOND"}]},
+    }
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json=pages[request.url.params.get("cursor")],
+        )
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        subscriptions = client.list_webhook_subscriptions()
+    finally:
+        client.close()
+
+    assert [subscription["id"] for subscription in subscriptions] == [
+        "SUB_FIRST",
+        "SUB_SECOND",
+    ]
+    assert requests == [
+        {"limit": "100"},
+        {"limit": "100", "cursor": "next-page"},
+    ]
+
+
+@pytest.mark.parametrize("cursor", [123, [], {}])
+def test_square_webhook_subscriptions_reject_malformed_cursor(cursor):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"subscriptions": [], "cursor": cursor})
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match="invalid response"):
+            client.list_webhook_subscriptions()
+    finally:
+        client.close()
+
+
+def test_square_webhook_subscriptions_reject_cursor_cycle():
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            json={"subscriptions": [], "cursor": "loop"},
+        )
+
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match="repeated pagination cursor"):
+            client.list_webhook_subscriptions()
+    finally:
+        client.close()
+
+    assert requests == 2
+
+
+def test_square_webhook_subscription_pagination_is_bounded(monkeypatch):
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            json={"subscriptions": [], "cursor": f"page-{requests}"},
+        )
+
+    monkeypatch.setattr(
+        "app.square_client.MAX_WEBHOOK_SUBSCRIPTION_PAGES",
+        2,
+    )
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match="exceeded safety limit"):
+            client.list_webhook_subscriptions()
+    finally:
+        client.close()
+
+    assert requests == 2
+
+
 def test_square_payment_page_iterator_honors_total_limit():
     pages = {
         None: {
@@ -1544,6 +1637,115 @@ def test_square_rate_limit_caps_retry_after(monkeypatch):
         client.close()
 
     assert delays == [10.0]
+
+
+def test_square_webhook_create_retries_with_same_idempotency_key(monkeypatch):
+    bodies = []
+    delays = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return httpx.Response(429, headers={"Retry-After": "0.25"})
+        if len(bodies) == 2:
+            raise httpx.ReadTimeout("response lost", request=request)
+        return httpx.Response(200, json={"subscription": {"id": "sub-1"}})
+
+    monkeypatch.setattr("app.square_client.time.sleep", delays.append)
+    monkeypatch.setattr("app.square_client.random.uniform", lambda _low, _high: 0)
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        subscription = client.create_webhook_subscription(
+            "Protect POS", "https://protect.example/webhook", "fixed-key"
+        )
+    finally:
+        client.close()
+
+    assert subscription == {"id": "sub-1"}
+    assert len(bodies) == 3
+    assert bodies[0] == bodies[1] == bodies[2]
+    assert {body["idempotency_key"] for body in bodies} == {"fixed-key"}
+    assert delays == [0.25, 1.0]
+
+
+def test_square_webhook_update_retries_transient_5xx(monkeypatch):
+    bodies = []
+    delays = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PUT"
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return httpx.Response(503, headers={"Retry-After": "0.4"})
+        if len(bodies) == 2:
+            return httpx.Response(502)
+        return httpx.Response(200, json={"subscription": {"id": "sub-1"}})
+
+    monkeypatch.setattr("app.square_client.time.sleep", delays.append)
+    monkeypatch.setattr("app.square_client.random.uniform", lambda _low, _high: 0)
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        subscription = client.update_webhook_subscription(
+            "sub-1", "https://protect.example/webhook"
+        )
+    finally:
+        client.close()
+
+    assert subscription == {"id": "sub-1"}
+    assert len(bodies) == 3
+    assert bodies[0] == bodies[1] == bodies[2]
+    assert delays == [0.4, 1.0]
+
+
+def test_square_webhook_write_retries_are_bounded(monkeypatch):
+    requests = 0
+    delays = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(500)
+
+    monkeypatch.setattr("app.square_client.time.sleep", delays.append)
+    monkeypatch.setattr("app.square_client.random.uniform", lambda _low, _high: 0)
+    client = SquareClient(
+        "tok", transport=httpx.MockTransport(handler), rate_limit_max_retries=2
+    )
+    try:
+        with pytest.raises(SquareError, match=r"HTTP 500"):
+            client.create_webhook_subscription(
+                "Protect POS", "https://protect.example/webhook", "fixed-key"
+            )
+    finally:
+        client.close()
+
+    assert requests == 3
+    assert delays == [0.5, 1.0]
+
+
+def test_square_webhook_write_does_not_retry_nontransient_error(monkeypatch):
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(400)
+
+    monkeypatch.setattr(
+        "app.square_client.time.sleep",
+        lambda _delay: pytest.fail("non-transient response was retried"),
+    )
+    client = SquareClient("tok", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(SquareError, match=r"HTTP 400"):
+            client.update_webhook_subscription(
+                "sub-1", "https://protect.example/webhook"
+            )
+    finally:
+        client.close()
+
+    assert requests == 1
 
 
 def test_square_html_response_is_normalized():

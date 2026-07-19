@@ -26,6 +26,10 @@ def make_registration_square(state):
             return httpx.Response(401, json={"errors": [{"code": "UNAUTHORIZED"}]})
         path = request.url.path
         if path == "/v2/webhooks/subscriptions" and request.method == "GET":
+            cursor = request.url.params.get("cursor")
+            state["list_cursors"].append(cursor)
+            if state["pages"] is not None:
+                return httpx.Response(200, json=state["pages"][cursor])
             return httpx.Response(200, json={"subscriptions": state["existing"]})
         if path == "/v2/webhooks/subscriptions" and request.method == "POST":
             body = json.loads(request.content)
@@ -61,7 +65,13 @@ def make_registration_square(state):
 
 @pytest.fixture()
 def registration_app(tmp_path):
-    state = {"existing": [], "created": None, "updated": None}
+    state = {
+        "existing": [],
+        "pages": None,
+        "list_cursors": [],
+        "created": None,
+        "updated": None,
+    }
     app = create_app(
         data_dir=tmp_path / "data",
         protect_transport=httpx.MockTransport(protect_handler),
@@ -107,6 +117,33 @@ def test_register_updates_existing_subscription(registration_app):
     assert resp.status_code == 200
     assert resp.json()["updated"] is True
     assert state["updated"][0] == "SUB_OLD"
+    assert store.get_setting("square.webhook_signature_key") == SIGNATURE_KEY
+
+
+def test_register_updates_subscription_found_on_later_page(registration_app):
+    client, state, store = registration_app
+    state["pages"] = {
+        None: {
+            "subscriptions": [{"id": "SUB_OTHER", "name": "another-hook"}],
+            "cursor": "page-2",
+        },
+        "page-2": {
+            "subscriptions": [
+                {"id": "SUB_LATER", "name": "square-unifi-protect"}
+            ]
+        },
+    }
+
+    resp = client.post(
+        "/api/settings/square/webhook/register",
+        json={"notification_url": "https://new.example.com/webhooks/square"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["updated"] is True
+    assert state["list_cursors"] == [None, "page-2"]
+    assert state["updated"][0] == "SUB_LATER"
+    assert state["created"] is None
     assert store.get_setting("square.webhook_signature_key") == SIGNATURE_KEY
 
 

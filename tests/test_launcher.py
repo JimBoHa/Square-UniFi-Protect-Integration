@@ -11,25 +11,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_launcher_repairs_incomplete_existing_environment(tmp_path):
+def test_launcher_checks_dependencies_in_existing_environment(tmp_path):
     launcher = tmp_path / "Start Square Protect.command"
     shutil.copy2(ROOT / launcher.name, launcher)
     python = tmp_path / ".venv" / "bin" / "python"
     python.parent.mkdir(parents=True)
     python.write_text(
         "#!/bin/sh\n"
-        "if [ \"$1\" = \"-c\" ]; then exit 1; fi\n"
-        "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"pip\" ]; then\n"
-        "  : > \"$INSTALL_MARKER\"\n"
+        "if [ \"$1\" = \"scripts/ensure_dependencies.py\" ]; then\n"
+        "  : > \"$DEPENDENCY_CHECK_MARKER\"\n"
         "  exit 0\n"
         "fi\n"
         "exit 1\n"
     )
     python.chmod(0o755)
-    install_marker = tmp_path / "pip-was-run"
+    dependency_check_marker = tmp_path / "dependency-check-was-run"
     environment = {
         **os.environ,
-        "INSTALL_MARKER": str(install_marker),
+        "DEPENDENCY_CHECK_MARKER": str(dependency_check_marker),
         "SPI_LAUNCHER_SETUP_ONLY": "1",
     }
 
@@ -44,5 +43,4 @@ def test_launcher_repairs_incomplete_existing_environment(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert install_marker.is_file()
-    assert "repairing Python dependencies" in result.stdout
+    assert dependency_check_marker.is_file()

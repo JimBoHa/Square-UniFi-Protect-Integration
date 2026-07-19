@@ -6,11 +6,13 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 UNINSTALL="${1:-}"
 
-if [ ! -x "$REPO/.venv/bin/python" ]; then
-  echo "Setting up the Python environment..."
-  python3 -m venv "$REPO/.venv"
-  "$REPO/.venv/bin/pip" install --quiet --upgrade pip
-  "$REPO/.venv/bin/pip" install --quiet -e "$REPO"
+if [ "$UNINSTALL" != "--uninstall" ]; then
+  if [ ! -x "$REPO/.venv/bin/python" ]; then
+    echo "Setting up the Python environment..."
+    python3 -m venv "$REPO/.venv"
+  fi
+  "$REPO/.venv/bin/python" "$REPO/scripts/ensure_dependencies.py" \
+    "$REPO" "$REPO/.venv"
 fi
 
 case "$(uname -s)" in
@@ -66,6 +68,8 @@ Wants=network-online.target
 User=$USER
 WorkingDirectory=$REPO
 Environment=SPI_DATA_DIR=$REPO/data
+Environment=SPI_HOST=0.0.0.0
+Environment=SPI_TLS=1
 ExecStart=$REPO/.venv/bin/python -m app
 Restart=on-failure
 
@@ -73,8 +77,12 @@ Restart=on-failure
 WantedBy=multi-user.target
 UNIT_EOF
     sudo systemctl daemon-reload
-    sudo systemctl enable --now square-protect
-    echo "Installed. Dashboard: http://<this-host>:8000"
+    sudo systemctl enable square-protect
+    sudo systemctl restart square-protect
+    echo "Installed. Dashboard: https://<this-host>:8000"
+    echo "Accept the self-signed certificate warning in your browser."
+    echo "For the one-time setup secret, run:"
+    echo "  sudo journalctl -u square-protect -b --no-pager"
     ;;
   *)
     echo "Unsupported OS: $(uname -s). Use Docker or the Windows script."

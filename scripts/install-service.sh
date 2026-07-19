@@ -6,11 +6,13 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 UNINSTALL="${1:-}"
 
-if [ ! -x "$REPO/.venv/bin/python" ]; then
-  echo "Setting up the Python environment..."
-  python3 -m venv "$REPO/.venv"
-  "$REPO/.venv/bin/pip" install --quiet --upgrade pip
-  "$REPO/.venv/bin/pip" install --quiet -e "$REPO"
+if [ "$UNINSTALL" != "--uninstall" ]; then
+  if [ ! -x "$REPO/.venv/bin/python" ]; then
+    echo "Setting up the Python environment..."
+    python3 -m venv "$REPO/.venv"
+    "$REPO/.venv/bin/pip" install --quiet --upgrade pip
+    "$REPO/.venv/bin/pip" install --quiet -e "$REPO"
+  fi
 fi
 
 case "$(uname -s)" in

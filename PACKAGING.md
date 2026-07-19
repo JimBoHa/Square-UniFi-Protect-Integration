@@ -53,7 +53,11 @@ dmg to a GitHub release. Unsigned builds run via right-click → Open.
 - **macOS:** installs a `launchd` LaunchAgent
   (`~/Library/LaunchAgents/com.squareprotect.app.plist`), starts at login.
 - **Linux (Debian/Ubuntu/Raspberry Pi OS):** installs a `systemd` unit
-  (`/etc/systemd/system/square-protect.service`), starts at boot.
+  (`/etc/systemd/system/square-protect.service`), starts at boot. The service
+  listens on the network with the app's built-in TLS; open
+  `https://<host>:8000`, accept the self-signed certificate warning, and run
+  `sudo journalctl -u square-protect -b --no-pager` to find the generated
+  one-time setup secret. No plaintext secret is stored in the unit.
 
 Both use the repo checkout + its venv; `--uninstall` reverses everything.
 
@@ -61,7 +65,11 @@ Both use the repo checkout + its venv; `--uninstall` reverses everything.
 
 `scripts/windows/install-service.ps1` creates the venv and registers a
 Task Scheduler job that starts the server at logon (no third-party service
-wrapper needed). Docker Desktop users should prefer the compose file.
+wrapper needed). When secure first-run setup is available, the installer
+prints its one-time secret and hands it to the hidden task through a
+DPAPI-protected, current-user-only file. The runner removes that encrypted
+handoff automatically after setup succeeds; the task definition never stores
+the plaintext secret. Docker Desktop users should prefer the compose file.
 Future work: a signed MSI built with WiX + a pythonw-based tray icon,
 mirroring the macOS menu-bar app.
 

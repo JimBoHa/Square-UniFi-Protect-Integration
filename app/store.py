@@ -33,9 +33,9 @@ TRANSACTION_SNAPSHOT_TTL_SECONDS = SESSION_TTL_SECONDS
 MAX_TRANSACTION_SNAPSHOTS = 8
 MAX_TRANSACTION_ORDER_HISTORY = 10_000
 MAX_TRANSACTION_SEARCH_LENGTH = 64
-TRANSACTION_FILTER_SIGNATURE_PREFIX = "hmac-sha256-v1:"
+TRANSACTION_FILTER_SIGNATURE_PREFIX = "hmac-sha256-v2:"
 _TRANSACTION_FILTER_SIGNATURE_DOMAIN = (
-    b"square-unifi-protect:transaction-filter-signature:v1"
+    b"square-unifi-protect:transaction-filter-signature:v2"
 )
 TRANSACTION_FILTER_STATUSES = frozenset(
     {"APPROVED", "PENDING", "COMPLETED", "CANCELED", "FAILED"}
@@ -640,11 +640,11 @@ class Store:
             ).fetchall()
         }
         if "filter_signature" in columns:
-            # The previous filter-aware schema stored raw SHA-256 signatures.
-            # Those values reveal low-entropy searches (for example card
-            # last-4) through offline guessing and correlate filters across
-            # installations. Expire only legacy filtered snapshots; empty
-            # signatures remain valid.
+            # Previous schemas stored raw SHA-256 signatures or pre-salt v1
+            # HMACs. Those values reveal low-entropy searches through offline
+            # guessing or correlate filters across installations that share
+            # one encryption key. Expire only legacy filtered snapshots;
+            # empty signatures remain valid.
             legacy_ids = [
                 row["id"]
                 for row in self._db.execute(

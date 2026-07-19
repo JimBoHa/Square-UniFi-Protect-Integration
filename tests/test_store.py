@@ -1533,7 +1533,8 @@ def test_store_migrates_unfiltered_snapshot_to_filter_bound_schema(tmp_path):
 def test_filtered_snapshot_signature_is_keyed_per_installation_and_durable(
     tmp_path, monkeypatch
 ):
-    monkeypatch.delenv("SPI_ENCRYPTION_KEY", raising=False)
+    shared_key = base64.urlsafe_b64encode(bytes(range(32))).decode("ascii")
+    monkeypatch.setenv("SPI_ENCRYPTION_KEY", shared_key)
     canonical_filter = json.dumps(
         ["4242", "COMPLETED"], ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
@@ -1641,7 +1642,15 @@ def test_filtered_snapshot_signature_survives_equivalent_fernet_key_encoding(
     assert reopened_signature == signature
 
 
-def test_store_expires_legacy_unkeyed_filtered_snapshots_only(tmp_path):
+@pytest.mark.parametrize(
+    "legacy_signature",
+    [
+        hashlib.sha256(b'["4242",""]').hexdigest(),
+        "hmac-sha256-v1:" + "0" * 64,
+    ],
+    ids=("raw-sha256", "pre-salt-hmac-v1"),
+)
+def test_store_expires_legacy_filtered_snapshots_only(tmp_path, legacy_signature):
     data_dir = tmp_path / "data"
     store = Store(data_dir)
     store.upsert_transaction(
@@ -1660,11 +1669,10 @@ def test_store_expires_legacy_unkeyed_filtered_snapshots_only(tmp_path):
     _page, filtered_snapshot = store.list_transactions_page(limit=1, query="4242")
     store.close()
 
-    raw_digest = hashlib.sha256(b'["4242",""]').hexdigest()
     db = sqlite3.connect(data_dir / "spi.db")
     db.execute(
         "UPDATE transaction_feed_snapshots SET filter_signature = ? WHERE id = ?",
-        (raw_digest, filtered_snapshot),
+        (legacy_signature, filtered_snapshot),
     )
     db.commit()
     db.close()

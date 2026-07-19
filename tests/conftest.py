@@ -18,8 +18,13 @@ PROTECT_ALARM_TRIGGER_ID = "square-completed-sale"
 SQUARE_TOKEN = "sq-test-token-abc123"
 SQUARE_MERCHANT_ID = "MERCHANT_TEST_123"
 ADMIN_PASSWORD = "hunter2-hunter2"
+BOOTSTRAP_SECRET = "Qfzz1mF60qsKuwiB-wLqQJqIshvJHk3cRzCzhb2F6dY"
 WEBHOOK_KEY = "whsec_test_key_456"
 WEBHOOK_URL = "https://shop.example.com/webhooks/square"
+
+
+def bootstrap_setup_body(password: str = ADMIN_PASSWORD) -> dict[str, str]:
+    return {"password": password, "bootstrap_secret": BOOTSTRAP_SECRET}
 
 FAKE_JPEG = (
     b"\xff\xd8\xff\xe0\x00\x07JFIF\x00"
@@ -113,7 +118,13 @@ def protect_handler(request: httpx.Request) -> httpx.Response:
 
 
 @pytest.fixture(autouse=True)
-def reset_protect_integration_mock():
+def reset_protect_integration_mock(monkeypatch):
+    # TestClient has no listening socket, so tests explicitly model the bundled
+    # runner's local-only bind unless a security test overrides it.
+    monkeypatch.setenv("SPI_HOST", "127.0.0.1")
+    monkeypatch.setenv("SPI_TLS", "0")
+    monkeypatch.setenv("SPI_COOKIE_SECURE", "0")
+    monkeypatch.setenv("SPI_BOOTSTRAP_SECRET", BOOTSTRAP_SECRET)
     PROTECT_META_KEYS.clear()
     PROTECT_ALARM_CALLS.clear()
     PROTECT_ALARM_RESPONSES.clear()
@@ -146,8 +157,13 @@ def client(tmp_path):
         protect_transport=httpx.MockTransport(protect_handler),
         square_transport=httpx.MockTransport(square_handler),
         enable_poller=False,
+        bind_host="127.0.0.1",
     )
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        base_url="http://localhost",
+        client=("127.0.0.1", 50000),
+    ) as test_client:
         yield test_client
     app.state.store.close()
 
@@ -155,7 +171,9 @@ def client(tmp_path):
 @pytest.fixture()
 def authed(client):
     """Client with setup complete and an active session."""
-    assert client.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+    assert client.post(
+        "/api/setup", json=bootstrap_setup_body()
+    ).status_code == 200
     assert client.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
     return client
 

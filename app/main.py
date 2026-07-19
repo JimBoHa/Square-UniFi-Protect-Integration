@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
+import ipaddress
 import json
 import logging
 import math
@@ -12,6 +14,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
@@ -78,6 +81,207 @@ SQUARE_ACCOUNT_SWITCH_CODE = "square_account_switch_confirmation_required"
 MAX_CAMERA_MAPPINGS = 500
 PRIVATE_NO_STORE = "private, no-store"
 MIN_POLL_INTERVAL_SECONDS = 1.0
+BOOTSTRAP_SECRET_MIN_LENGTH = 32
+BOOTSTRAP_SECRET_MAX_LENGTH = 4096
+FORWARDED_CLIENT_HEADERS = frozenset(
+    {
+        "cf-connecting-ip",
+        "fastly-client-ip",
+        "fly-client-ip",
+        "forwarded",
+        "true-client-ip",
+        "via",
+        "x-client-ip",
+        "x-cluster-client-ip",
+        "x-envoy-external-address",
+        "x-real-ip",
+    }
+)
+
+
+def _normalized_ip_address(
+    host: str,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped
+    return address
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    """Accept only localhost or a literal loopback address."""
+    if not isinstance(host, str):
+        return False
+    normalized = host.strip().lower().rstrip(".")
+    if normalized == "localhost":
+        return True
+    address = _normalized_ip_address(normalized)
+    return address is not None and address.is_loopback
+
+
+def _authority_host(authority: str | None) -> str | None:
+    """Return a strictly parsed HTTP Host hostname, without its optional port."""
+    if not isinstance(authority, str):
+        return None
+    authority = authority.strip()
+    if (
+        not authority
+        or any(character.isspace() for character in authority)
+        or any(character in authority for character in "/\\@?#,")
+    ):
+        return None
+    if authority.startswith("["):
+        close = authority.find("]")
+        if close < 0:
+            return None
+        host = authority[1:close]
+        suffix = authority[close + 1 :]
+        if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
+            return None
+        port = suffix[1:] if suffix else ""
+    else:
+        if authority.count(":") > 1:
+            return None
+        host, separator, port = authority.partition(":")
+        if separator and not port.isdigit():
+            return None
+    if port:
+        # Bound work before int(): Python rejects conversions above its digit
+        # limit, and Host is attacker-controlled during first-run setup.
+        if len(port) > 5 or not port.isascii() or not 0 < int(port) <= 65535:
+            return None
+    return host
+
+
+def _is_loopback_origin(origin: str | None) -> bool:
+    if origin is None:
+        return True
+    if (
+        not origin
+        or any(character.isspace() for character in origin)
+        or "\\" in origin
+    ):
+        return False
+    try:
+        parsed = urlsplit(origin)
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not 0 < port <= 65535)
+    ):
+        return False
+    return _is_loopback_host(parsed.hostname)
+
+
+def _has_forwarding_headers(request: Request) -> bool:
+    for name in request.headers.keys():
+        normalized = name.lower()
+        if normalized in FORWARDED_CLIENT_HEADERS or normalized.startswith(
+            "x-forwarded-"
+        ):
+            return True
+    return False
+
+
+def _is_explicit_local_setup_request(request: Request, bind_host: str | None) -> bool:
+    """Require every independently visible signal to describe local-only use."""
+    if not _is_loopback_host(bind_host) or _has_forwarding_headers(request):
+        return False
+    peer = request.scope.get("client")
+    if (
+        not isinstance(peer, (tuple, list))
+        or not peer
+        or not isinstance(peer[0], str)
+    ):
+        return False
+    peer_address = _normalized_ip_address(peer[0].split("%", 1)[0])
+    return bool(
+        peer_address is not None
+        and peer_address.is_loopback
+        and _is_loopback_host(_authority_host(request.headers.get("host")))
+        and _is_loopback_origin(request.headers.get("origin"))
+    )
+
+
+class _BootstrapSecretVerifier:
+    """Keep only a wipeable digest of the one-time bootstrap secret."""
+
+    def __init__(self, secret: str | None):
+        self._lock = threading.Lock()
+        self._digest: bytearray | None = None
+        if secret is None or not (
+            BOOTSTRAP_SECRET_MIN_LENGTH
+            <= len(secret)
+            <= BOOTSTRAP_SECRET_MAX_LENGTH
+        ):
+            return
+        secret_bytes = bytearray(secret.encode("utf-8"))
+        try:
+            self._digest = bytearray(hashlib.sha256(secret_bytes).digest())
+        finally:
+            secret_bytes[:] = b"\0" * len(secret_bytes)
+
+    @classmethod
+    def from_environment(
+        cls, *, generate_if_missing: bool = True
+    ) -> "_BootstrapSecretVerifier":
+        plaintext = os.environ.get("SPI_BOOTSTRAP_SECRET")
+        invalid = plaintext is None or not (
+            BOOTSTRAP_SECRET_MIN_LENGTH
+            <= len(plaintext)
+            <= BOOTSTRAP_SECRET_MAX_LENGTH
+        )
+        generated = invalid and generate_if_missing
+        if generated:
+            plaintext = secrets.token_urlsafe(32)
+        elif invalid:
+            plaintext = None
+        try:
+            verifier = cls(plaintext)
+            if generated:
+                logger.warning(
+                    "Generated one-time first-run bootstrap secret: %s\n"
+                    "Enter it in the setup form. It will not be shown over HTTP.",
+                    plaintext,
+                )
+            return verifier
+        finally:
+            # Do not leave plaintext available to libraries or child processes.
+            os.environ.pop("SPI_BOOTSTRAP_SECRET", None)
+            plaintext = None
+
+    @property
+    def configured(self) -> bool:
+        with self._lock:
+            return self._digest is not None
+
+    def verify(self, candidate: str) -> bool:
+        candidate_digest = bytearray(
+            hashlib.sha256(candidate.encode("utf-8")).digest()
+        )
+        try:
+            with self._lock:
+                return self._digest is not None and secrets.compare_digest(
+                    candidate_digest, self._digest
+                )
+        finally:
+            candidate_digest[:] = b"\0" * len(candidate_digest)
+
+    def clear(self) -> None:
+        with self._lock:
+            if self._digest is not None:
+                self._digest[:] = b"\0" * len(self._digest)
+                self._digest = None
 
 
 def _parse_poll_interval(value: str) -> float:
@@ -114,6 +318,9 @@ def _read_thumbnail_bytes(path: Path) -> bytes:
 
 class SetupBody(BaseModel):
     password: str = Field(min_length=8, max_length=256)
+    bootstrap_secret: str = Field(
+        default="", max_length=BOOTSTRAP_SECRET_MAX_LENGTH
+    )
 
 class LoginBody(BaseModel):
     password: str = Field(max_length=256)
@@ -177,6 +384,8 @@ def create_app(
     protect_transport=None,
     square_transport=None,
     enable_poller: bool | None = None,
+    bind_host: str | None = None,
+    tls_enabled: bool = False,
 ) -> FastAPI:
     if enable_poller is None:
         enable_poller = os.environ.get("SPI_DISABLE_POLLER", "0") != "1"
@@ -203,6 +412,18 @@ def create_app(
     app.state.thumbnail_drain_queued = False
 
     cookie_secure = os.environ.get("SPI_COOKIE_SECURE", "0") == "1"
+    configured_bind_host = (
+        bind_host if bind_host is not None else os.environ.get("SPI_HOST")
+    )
+    # Only the bundled runner may assert this after installing its TLS kwargs.
+    # Never infer transport security from environment or request headers here.
+    configured_tls = tls_enabled
+    setup_pending = store.get_setting("admin.password_hash") is None
+    bootstrap_secret_verifier = _BootstrapSecretVerifier.from_environment(
+        generate_if_missing=setup_pending
+    )
+    if not setup_pending:
+        bootstrap_secret_verifier.clear()
 
     @app.middleware("http")
     async def apply_api_cache_policy(request: Request, call_next):
@@ -472,12 +693,46 @@ def create_app(
         }
 
     @app.post("/api/setup")
-    def setup(body: SetupBody) -> dict:
+    def setup(body: SetupBody, request: Request) -> dict:
         if store.get_setting("admin.password_hash") is not None:
+            bootstrap_secret_verifier.clear()
             raise HTTPException(status_code=409, detail="Setup already completed")
+        direct_request = _is_explicit_local_setup_request(
+            request, configured_bind_host
+        )
+        if not direct_request and not configured_tls:
+            body.bootstrap_secret = ""
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "bootstrap_tls_not_configured",
+                    "message": (
+                        "Non-local first-run setup requires the app's built-in "
+                        "TLS. Set SPI_TLS=1 and restart before opening the remote "
+                        "setup page. Forwarded request headers cannot satisfy "
+                        "this requirement."
+                    ),
+                },
+            )
+        secret_valid = bootstrap_secret_verifier.verify(body.bootstrap_secret)
+        body.bootstrap_secret = ""
+        if not secret_valid:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "invalid_bootstrap_secret",
+                    "message": (
+                        "First-run setup requires the one-time bootstrap secret "
+                        "configured in SPI_BOOTSTRAP_SECRET or printed in the "
+                        "server console at startup."
+                    ),
+                },
+            )
         password_hash = hash_password(body.password)
         if not store.set_setting_if_absent("admin.password_hash", password_hash):
+            bootstrap_secret_verifier.clear()
             raise HTTPException(status_code=409, detail="Setup already completed")
+        bootstrap_secret_verifier.clear()
         return {"ok": True}
 
     @app.post("/api/login")
@@ -1639,4 +1894,8 @@ def create_app(
 
 
 def app() -> FastAPI:  # uvicorn factory entry point: `uvicorn app.main:app --factory`
-    return create_app()
+    return create_app(
+        bind_host=os.environ.get("SPI_HOST"),
+        # A raw Uvicorn factory invocation does not install app.tls settings.
+        tls_enabled=False,
+    )

@@ -28,6 +28,7 @@ PROTECTED_ENDPOINTS = [
     ("PUT", "/api/camera-mapping"),
     ("GET", "/api/camera-preview/cam1aaaaaaaaaaaaaaaaaaaaa"),
     ("GET", "/api/transactions"),
+    ("POST", "/api/transactions"),
     ("GET", "/api/thumbnails/PAY_001"),
     ("POST", "/api/sync"),
     ("PUT", "/api/settings/protect"),
@@ -117,6 +118,49 @@ def test_session_cookie_flags(client):
     assert "httponly" in cookie
     assert "samesite=lax" in cookie
 
+
+def test_transaction_search_stays_out_of_request_target_even_when_unauthorized(client):
+    search_term = "private-card-4242"
+    response = client.post("/api/transactions", json={"q": search_term})
+
+    assert response.status_code == 401
+    assert search_term not in str(response.request.url)
+    assert not response.request.url.query
+
+
+def test_transaction_query_rejects_url_parameters_and_csrf_form_posts(authed):
+    ambiguous = authed.post(
+        "/api/transactions?offset=1",
+        json={"offset": 0, "q": "private-card-4242"},
+    )
+    legacy_query = authed.get(
+        "/api/transactions", params={"q": "private-card-4242"}
+    )
+    form_post = authed.post(
+        "/api/transactions", data={"q": "private-card-4242"}
+    )
+
+    assert ambiguous.status_code == 422
+    assert ambiguous.json()["detail"] == (
+        "Transaction read parameters must be sent in the JSON body"
+    )
+    assert legacy_query.status_code == 422
+    assert legacy_query.json()["detail"] == (
+        "Transaction read parameters must be sent in a POST JSON body"
+    )
+    assert form_post.status_code == 415
+    assert form_post.json()["detail"] == (
+        "Transaction reads require an application/json body"
+    )
+
+
+def test_legacy_unfiltered_transaction_read_remains_compatible(authed):
+    legacy = authed.get("/api/transactions")
+    body_read = authed.post("/api/transactions", json={})
+
+    assert legacy.status_code == 200
+    assert legacy.json() == body_read.json()
+
 def test_setup_cannot_be_rerun(authed):
     resp = authed.post("/api/setup", json={"password": "attacker-password"})
     assert resp.status_code == 409
@@ -191,7 +235,7 @@ def test_api_never_returns_stored_secrets(configured):
 def test_transaction_data_and_camera_media_are_not_cached(configured):
     preview = configured.get("/api/camera-preview/cam1aaaaaaaaaaaaaaaaaaaaa")
     assert configured.post("/api/sync").status_code == 200
-    transactions = configured.get("/api/transactions")
+    transactions = configured.post("/api/transactions", json={})
     thumbnail = configured.get(transactions.json()[0]["thumbnail_url"])
 
     for response in (preview, transactions, thumbnail):
@@ -389,7 +433,7 @@ def test_malicious_payment_fields_returned_as_json_not_html(configured):
         headers={"x-square-hmacsha256-signature": _webhook_signature(payload)},
     )
     assert resp.status_code == 200
-    listing = configured.get("/api/transactions")
+    listing = configured.post("/api/transactions", json={})
     assert listing.headers["content-type"].startswith("application/json")
     txn = next(t for t in listing.json() if t["id"] == "XSS1")
     assert txn["status"] == "<script>alert(1)</script>"  # normalized, escaped by JSON
@@ -442,7 +486,10 @@ def test_transaction_feed_pagination_wiring():
     html = (static_dir / "index.html").read_text()
     css = (static_dir / "style.css").read_text()
     assert "TRANSACTION_PAGE_SIZE + 1" in js
-    assert "&offset=${requestedOffset}" in js
+    assert "transactionQueryBody(requestedFilters" in js
+    assert 'api("/api/transactions", {' in js
+    assert 'method: "POST"' in js
+    assert "/api/transactions?" not in js
     assert "page.slice(0, TRANSACTION_PAGE_SIZE)" in js
     assert "transactionPendingOffset" in js
     assert "transactionSnapshot" in js

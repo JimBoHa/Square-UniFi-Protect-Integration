@@ -8,26 +8,35 @@ const test = require("node:test");
 const {
   TRANSACTION_QUERY_MAX_LENGTH,
   normalizeTransactionFilters,
-  transactionFilterQuery,
+  transactionQueryBody,
   transactionFiltersActive,
 } = require("../app/static/transaction-filters.js");
 
-test("transaction filters trim search and encode literal query data", () => {
+test("transaction filters trim search and keep it in a request body", () => {
   const filters = normalizeTransactionFilters("  PAY %_&42  ", "COMPLETED");
 
   assert.deepEqual(filters, { query: "PAY %_&42", status: "COMPLETED" });
-  assert.equal(
-    transactionFilterQuery(filters),
-    "q=PAY+%25_%2642&status=COMPLETED",
+  assert.deepEqual(
+    transactionQueryBody(filters, { limit: 101, offset: 100, snapshot: 7 }),
+    {
+      limit: 101,
+      offset: 100,
+      snapshot: 7,
+      q: "PAY %_&42",
+      status: "COMPLETED",
+    },
   );
   assert.equal(transactionFiltersActive(filters), true);
   assert.equal(TRANSACTION_QUERY_MAX_LENGTH, 64);
 });
 
-test("empty transaction filters add no query parameters", () => {
+test("empty transaction filters add no optional body fields", () => {
   const filters = normalizeTransactionFilters("   ", "");
 
-  assert.equal(transactionFilterQuery(filters), "");
+  assert.deepEqual(
+    transactionQueryBody(filters, { limit: 51, offset: 0 }),
+    { limit: 51, offset: 0 },
+  );
   assert.equal(transactionFiltersActive(filters), false);
 });
 
@@ -56,8 +65,9 @@ test("filter changes reset paging and bind every request to current filters", ()
   );
 
   assert.match(app, /const requestedFilters = transactionFilters/);
-  assert.match(app, /transactionFilterQuery\(requestedFilters\)/);
-  assert.match(app, /snapshotParam.*filterParam/s);
+  assert.match(app, /transactionQueryBody\(requestedFilters/);
+  assert.match(app, /api\("\/api\/transactions", \{\s*method: "POST"/s);
+  assert.doesNotMatch(app, /\/api\/transactions\?/);
   assert.match(
     app,
     /function applyTransactionFilters[\s\S]*transactionOffset = 0;[\s\S]*transactionSnapshot = null;/,

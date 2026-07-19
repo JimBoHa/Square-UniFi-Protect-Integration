@@ -1310,6 +1310,7 @@ def create_app(
             "ts_ms": txn["ts_ms"],
             "amount": txn["amount"],
             "currency": txn["currency"],
+            "refunded_amount": txn["refunded_amount"],
             "status": txn["status"],
             "location_id": txn["location_id"],
             "device_id": txn.get("device_id", ""),

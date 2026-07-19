@@ -755,9 +755,11 @@ function renderTransactions(txns) {
     const status = document.createElement("div");
     status.className = "status";
     status.textContent = txn.status;
+    const refundStatus = renderRefundStatus(document, txn);
     meta.appendChild(when);
     meta.appendChild(card);
     meta.appendChild(status);
+    if (refundStatus) meta.appendChild(refundStatus);
 
     row.appendChild(thumb);
     row.appendChild(amount);

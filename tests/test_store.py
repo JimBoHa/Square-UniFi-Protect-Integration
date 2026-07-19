@@ -1415,6 +1415,7 @@ def test_store_migrates_legacy_fields_and_scrubs_raw_payment(tmp_path):
         "ts_ms": ts_ms,
         "amount": 900,
         "currency": "USD",
+        "refunded_amount": 0,
         "status": "COMPLETED",
         "location_id": "LOC_LEGACY",
         "card_last4": "4242",

@@ -45,6 +45,10 @@ SQUARE_OAUTH_APP_SETTING_KEYS = (
     "square.oauth_client_secret",
     "square.oauth_environment",
 )
+SQUARE_OAUTH_TOKEN_SETTING_KEYS = (
+    "square.refresh_token",
+    "square.token_expires_at",
+)
 SQUARE_OAUTH_PENDING_SETTING_KEYS = (
     "square.oauth_pending_access_token",
     "square.oauth_pending_refresh_token",
@@ -1288,6 +1292,7 @@ class Store:
         oauth_refresh_token: str | None = None,
         oauth_token_expires_at: str | None = None,
         clear_oauth_pending: bool = False,
+        clear_oauth_token_metadata: bool = False,
     ) -> SquareAccountConfiguration:
         """Configure one merchant while excluding cross-process account work."""
         with self.integration_guard(exclusive=True):
@@ -1305,6 +1310,7 @@ class Store:
                 oauth_refresh_token=oauth_refresh_token,
                 oauth_token_expires_at=oauth_token_expires_at,
                 clear_oauth_pending=clear_oauth_pending,
+                clear_oauth_token_metadata=clear_oauth_token_metadata,
             )
             revision = self.square_account_revision()
             if revision is None:
@@ -1331,6 +1337,7 @@ class Store:
         oauth_refresh_token: str | None = None,
         oauth_token_expires_at: str | None = None,
         clear_oauth_pending: bool = False,
+        clear_oauth_token_metadata: bool = False,
     ) -> bool:
         """Save Square credentials and atomically isolate a changed account.
 
@@ -1338,6 +1345,8 @@ class Store:
         account. Database evidence is removed in the same transaction as the
         credential change. Files cannot participate in SQLite transactions,
         so unreferenced thumbnails are removed only after a successful commit.
+        ``clear_oauth_token_metadata`` marks a pasted token as the active
+        authorization while retaining installation-wide OAuth app credentials.
         """
         if bool(webhook_signature_key) != bool(webhook_url):
             raise ValueError(
@@ -1465,6 +1474,11 @@ class Store:
                     self._db.executemany(
                         "DELETE FROM settings WHERE key = ?",
                         ((key,) for key in SQUARE_OAUTH_PENDING_SETTING_KEYS),
+                    )
+                if clear_oauth_token_metadata:
+                    self._db.executemany(
+                        "DELETE FROM settings WHERE key = ?",
+                        ((key,) for key in SQUARE_OAUTH_TOKEN_SETTING_KEYS),
                     )
 
                 if switched or self._setting_value_locked(

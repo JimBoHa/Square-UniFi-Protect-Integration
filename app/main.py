@@ -874,6 +874,10 @@ def create_app(
                     account_switch_confirmation_token=(
                         body.account_switch_confirmation_token
                     ),
+                    # A pasted access token explicitly replaces any prior
+                    # OAuth grant. Clear only its refreshable token metadata;
+                    # keep the reusable OAuth application credentials.
+                    clear_oauth_token_metadata=True,
                 )
                 saved_webhook = store.get_settings(
                     ("square.webhook_signature_key", "square.webhook_url")

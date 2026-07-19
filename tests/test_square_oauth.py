@@ -23,6 +23,8 @@ from .conftest import (
     ADMIN_PASSWORD,
     PROTECT_PASS,
     PROTECT_USER,
+    SQUARE_MERCHANT_ID,
+    SQUARE_TOKEN,
     protect_handler,
     square_handler,
 )
@@ -646,6 +648,103 @@ def test_oauth_refresh_guard_serializes_store_instances(tmp_path):
         executor.shutdown(wait=True, cancel_futures=True)
         first.close()
         second.close()
+
+
+def test_manual_token_save_disables_prior_oauth_refresh(oauth_client):
+    client, state, store = oauth_client
+    store.configure_square_account(
+        merchant_id=SQUARE_MERCHANT_ID,
+        access_token="old-oauth-access-token",
+        environment="production",
+    )
+    store.update_settings(
+        {
+            "square.oauth_client_id": (CLIENT_ID, False),
+            "square.oauth_client_secret": (CLIENT_SECRET, True),
+            "square.refresh_token": ("oauth-refresh-token", True),
+            "square.token_expires_at": ("2020-01-01T00:00:00Z", False),
+        }
+    )
+
+    saved = client.put(
+        "/api/settings/square",
+        json={"access_token": SQUARE_TOKEN, "environment": "production"},
+    )
+
+    assert saved.status_code == 200, saved.text
+    assert store.get_setting("square.access_token") == SQUARE_TOKEN
+    assert store.get_setting("square.merchant_id") == SQUARE_MERCHANT_ID
+    assert store.get_setting("square.environment") == "production"
+    assert store.get_setting("square.refresh_token") is None
+    assert store.get_setting("square.token_expires_at") is None
+    assert store.get_setting("square.oauth_client_id") == CLIENT_ID
+    assert store.get_setting("square.oauth_client_secret") == CLIENT_SECRET
+
+    # A later Square read must keep using the explicitly pasted token instead
+    # of silently refreshing the OAuth grant that it replaced.
+    assert client.get("/api/locations").status_code == 200
+    assert state["token_requests"] == []
+    assert store.get_setting("square.access_token") == SQUARE_TOKEN
+
+
+@pytest.mark.parametrize(
+    ("old_merchant_id", "old_environment"),
+    (
+        ("MERCHANT_OLD", "production"),
+        (SQUARE_MERCHANT_ID, "sandbox"),
+    ),
+    ids=("account-switch", "environment-switch"),
+)
+def test_manual_account_or_environment_switch_keeps_oauth_app_credentials(
+    oauth_client,
+    old_merchant_id,
+    old_environment,
+):
+    client, _state, store = oauth_client
+    store.configure_square_account(
+        merchant_id=old_merchant_id,
+        access_token="old-oauth-access-token",
+        environment=old_environment,
+    )
+    store.update_settings(
+        {
+            "square.oauth_client_id": (CLIENT_ID, False),
+            "square.oauth_client_secret": (CLIENT_SECRET, True),
+            "square.refresh_token": ("old-oauth-refresh-token", True),
+            "square.token_expires_at": ("2020-01-01T00:00:00Z", False),
+        }
+    )
+
+    refused = client.put(
+        "/api/settings/square",
+        json={"access_token": SQUARE_TOKEN, "environment": "production"},
+    )
+
+    assert refused.status_code == 409
+    confirmation_token = refused.json()["detail"]["confirmation_token"]
+    # A refused switch must leave the active OAuth grant intact.
+    assert store.get_setting("square.refresh_token") == "old-oauth-refresh-token"
+    assert store.get_setting("square.token_expires_at") == "2020-01-01T00:00:00Z"
+
+    switched = client.put(
+        "/api/settings/square",
+        json={
+            "access_token": SQUARE_TOKEN,
+            "environment": "production",
+            "confirm_account_switch": True,
+            "account_switch_confirmation_token": confirmation_token,
+        },
+    )
+
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["account_switched"] is True
+    assert store.get_setting("square.access_token") == SQUARE_TOKEN
+    assert store.get_setting("square.merchant_id") == SQUARE_MERCHANT_ID
+    assert store.get_setting("square.environment") == "production"
+    assert store.get_setting("square.refresh_token") is None
+    assert store.get_setting("square.token_expires_at") is None
+    assert store.get_setting("square.oauth_client_id") == CLIENT_ID
+    assert store.get_setting("square.oauth_client_secret") == CLIENT_SECRET
 
 
 def test_oauth_endpoints_require_auth(client):

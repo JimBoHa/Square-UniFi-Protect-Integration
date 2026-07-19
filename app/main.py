@@ -1028,7 +1028,7 @@ def create_app(
         # Starting over explicitly abandons any older, unconfirmed grant.
         store.delete_settings(*SQUARE_OAUTH_PENDING_SETTING_KEYS)
         state = secrets.token_urlsafe(24)
-        store.set_setting("square.oauth_state", state)
+        store.create_square_oauth_state(state)
         return RedirectResponse(
             oauth_authorize_url(
                 oauth["square.oauth_environment"]
@@ -1044,19 +1044,14 @@ def create_app(
     def square_oauth_callback(
         code: str = "", state: str = "", error: str = "", _=authed
     ) -> RedirectResponse:
+        if not store.consume_square_oauth_state(state):
+            raise HTTPException(status_code=400, detail="Invalid OAuth state")
         if error:
             # The operator declined consent (or Square reported a problem);
             # land back in the app instead of on a bare JSON error.
-            store.delete_setting("square.oauth_state")
             return RedirectResponse("/?square_oauth=denied", status_code=302)
-        expected_state = store.get_setting("square.oauth_state")
-        if (
-            not code
-            or not expected_state
-            or not secrets.compare_digest(state, expected_state)
-        ):
+        if not code:
             raise HTTPException(status_code=400, detail="Invalid OAuth state")
-        store.delete_setting("square.oauth_state")
         oauth = store.get_settings(
             (
                 "square.oauth_client_id",

@@ -3,14 +3,21 @@
 import concurrent.futures
 import json
 import threading
+import time
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+import app.store as store_module
 from app.main import create_app
 from app.square_client import oauth_authorize_url
-from app.store import SquareAccountSwitchRequired, Store
+from app.store import (
+    MAX_PENDING_SQUARE_OAUTH_STATES,
+    SQUARE_OAUTH_STATE_TTL_SECONDS,
+    SquareAccountSwitchRequired,
+    Store,
+)
 
 from .conftest import (
     ADMIN_PASSWORD,
@@ -130,6 +137,7 @@ def test_full_oauth_flow_stores_tokens_and_merchant(oauth_client):
     assert b"oauth-access-initial" not in db_bytes
     assert b"oauth-refresh-token" not in db_bytes
     assert CLIENT_SECRET.encode() not in db_bytes
+    assert oauth_state.encode() not in db_bytes
 
 
 def test_fresh_oauth_account_can_save_revision_fenced_mapping(oauth_client):
@@ -338,6 +346,139 @@ def test_callback_rejects_bad_state(oauth_client):
     assert store.get_setting("square.access_token") is None
 
 
+def test_forged_denial_does_not_consume_valid_state(oauth_client):
+    client, state, store = oauth_client
+    _save_oauth_app(client)
+    start = client.get("/oauth/square/start", follow_redirects=False)
+    oauth_state = start.headers["location"].rsplit("state=", 1)[-1]
+
+    forged = client.get(
+        "/oauth/square/callback?error=access_denied&state=forged",
+        follow_redirects=False,
+    )
+    assert forged.status_code == 400
+    assert state["token_requests"] == []
+
+    valid = client.get(
+        f"/oauth/square/callback?code=auth-code-1&state={oauth_state}",
+        follow_redirects=False,
+    )
+    assert valid.status_code == 302
+    assert valid.headers["location"] == "/?square_oauth=connected"
+    assert store.get_setting("square.access_token") == "oauth-access-initial"
+
+
+def test_oauth_state_expires(oauth_client, monkeypatch):
+    client, state, store = oauth_client
+    _save_oauth_app(client)
+    started_at = time.time()
+    start = client.get("/oauth/square/start", follow_redirects=False)
+    oauth_state = start.headers["location"].rsplit("state=", 1)[-1]
+    monkeypatch.setattr(
+        store_module.time,
+        "time",
+        lambda: started_at + SQUARE_OAUTH_STATE_TTL_SECONDS + 1,
+    )
+
+    expired = client.get(
+        f"/oauth/square/callback?code=auth-code-1&state={oauth_state}",
+        follow_redirects=False,
+    )
+    assert expired.status_code == 400
+    assert state["token_requests"] == []
+    assert store.get_setting("square.access_token") is None
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM square_oauth_states"
+    ).fetchone()[0] == 0
+
+
+def test_oauth_state_is_single_use(oauth_client):
+    client, state, _store = oauth_client
+    _save_oauth_app(client)
+    start = client.get("/oauth/square/start", follow_redirects=False)
+    oauth_state = start.headers["location"].rsplit("state=", 1)[-1]
+
+    connected = client.get(
+        f"/oauth/square/callback?code=auth-code-1&state={oauth_state}",
+        follow_redirects=False,
+    )
+    assert connected.status_code == 302
+    assert connected.headers["location"] == "/?square_oauth=connected"
+    replay = client.get(
+        f"/oauth/square/callback?code=auth-code-1&state={oauth_state}",
+        follow_redirects=False,
+    )
+    assert replay.status_code == 400
+    assert len(state["token_requests"]) == 1
+
+
+def test_valid_oauth_denial_requires_and_consumes_state(oauth_client):
+    client, state, store = oauth_client
+    _save_oauth_app(client)
+    start = client.get("/oauth/square/start", follow_redirects=False)
+    oauth_state = start.headers["location"].rsplit("state=", 1)[-1]
+
+    denied = client.get(
+        f"/oauth/square/callback?error=access_denied&state={oauth_state}",
+        follow_redirects=False,
+    )
+    assert denied.status_code == 302
+    assert denied.headers["location"] == "/?square_oauth=denied"
+    assert state["token_requests"] == []
+    assert not store.consume_square_oauth_state(oauth_state)
+
+
+def test_concurrent_oauth_starts_remain_independently_valid(oauth_client):
+    client, state, store = oauth_client
+    _save_oauth_app(client)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        starts = [
+            future.result(timeout=5)
+            for future in (
+                executor.submit(
+                    client.get, "/oauth/square/start", follow_redirects=False
+                ),
+                executor.submit(
+                    client.get, "/oauth/square/start", follow_redirects=False
+                ),
+            )
+        ]
+    oauth_states = [
+        start.headers["location"].rsplit("state=", 1)[-1] for start in starts
+    ]
+    assert all(start.status_code == 302 for start in starts)
+    assert len(set(oauth_states)) == 2
+
+    for index, oauth_state in enumerate(oauth_states, start=1):
+        callback = client.get(
+            f"/oauth/square/callback?code=auth-code-{index}&state={oauth_state}",
+            follow_redirects=False,
+        )
+        assert callback.status_code == 302
+        assert callback.headers["location"] == "/?square_oauth=connected"
+
+    assert len(state["token_requests"]) == 2
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM square_oauth_states"
+    ).fetchone()[0] == 0
+
+
+def test_pending_oauth_state_store_is_bounded(oauth_client):
+    _client, _state, store = oauth_client
+    states = [
+        f"pending-oauth-state-{index}"
+        for index in range(MAX_PENDING_SQUARE_OAUTH_STATES + 2)
+    ]
+    for oauth_state in states:
+        store.create_square_oauth_state(oauth_state)
+
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM square_oauth_states"
+    ).fetchone()[0] == MAX_PENDING_SQUARE_OAUTH_STATES
+    assert not store.consume_square_oauth_state(states[0])
+    assert store.consume_square_oauth_state(states[-1])
+
+
 def test_expiring_token_is_refreshed_before_use(oauth_client):
     client, state, store = oauth_client
     _save_oauth_app(client)
@@ -513,6 +654,10 @@ def test_oauth_endpoints_require_auth(client):
         json={"client_id": "x" * 10, "client_secret": "y" * 10},
     ).status_code == 401
     assert client.get("/oauth/square/start", follow_redirects=False).status_code == 401
+    assert client.get(
+        "/oauth/square/callback?error=access_denied&state=forged",
+        follow_redirects=False,
+    ).status_code == 401
 
 
 def test_oauth_ui_wiring():

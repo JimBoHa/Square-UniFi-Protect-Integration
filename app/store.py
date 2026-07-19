@@ -67,6 +67,8 @@ PROTECT_CONSOLE_GENERATION_SETTING = "protect.console_generation"
 PROTECT_CONSOLE_ID_SETTING = "protect.console_id"
 PROTECT_SWITCH_TOKEN_TTL_SECONDS = 5 * 60
 ORPHAN_THUMBNAIL_CLEANUP_SETTING = "maintenance.orphan_thumbnail_cleanup_pending"
+SQUARE_OAUTH_STATE_TTL_SECONDS = 10 * 60
+MAX_PENDING_SQUARE_OAUTH_STATES = 16
 _NO_EXPECTED_PROTECT_HOST = object()
 
 # Windows' msvcrt backend offers only exclusive byte-range locks. A short-lived
@@ -203,6 +205,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
     expires_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS square_oauth_states (
+    state_hash TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_square_oauth_states_expiry
+    ON square_oauth_states (expires_at);
 """
 
 
@@ -355,6 +364,11 @@ class Store:
                     "AND t.camera_id IS NOT NULL AND t.thumbnail_path IS NULL)"
                 )
                 self._release_expired_alarm_claims_locked()
+                # The former single plaintext state had no issue time. It
+                # cannot be migrated safely into the expiring, hashed store.
+                self._db.execute(
+                    "DELETE FROM settings WHERE key = 'square.oauth_state'"
+                )
                 if self._db.execute(
                     "SELECT 1 FROM settings WHERE key LIKE 'square.%' LIMIT 1"
                 ).fetchone() and not self._db.execute(
@@ -1089,6 +1103,61 @@ class Store:
                 f"DELETE FROM settings WHERE key IN ({placeholders})", keys
             )
             self._db.commit()
+
+    def create_square_oauth_state(self, state: str) -> None:
+        """Retain one hashed, expiring OAuth state within a bounded set."""
+        if not state:
+            raise ValueError("OAuth state cannot be empty")
+        now = time.time()
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                self._db.execute(
+                    "DELETE FROM square_oauth_states WHERE expires_at <= ?",
+                    (now,),
+                )
+                self._db.execute(
+                    "INSERT INTO square_oauth_states "
+                    "(state_hash, created_at, expires_at) VALUES (?, ?, ?)",
+                    (
+                        hash_session_token(state),
+                        now,
+                        now + SQUARE_OAUTH_STATE_TTL_SECONDS,
+                    ),
+                )
+                self._db.execute(
+                    "DELETE FROM square_oauth_states WHERE state_hash IN ("
+                    "SELECT state_hash FROM square_oauth_states "
+                    "ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?)",
+                    (MAX_PENDING_SQUARE_OAUTH_STATES,),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def consume_square_oauth_state(self, state: str) -> bool:
+        """Atomically consume one unexpired OAuth state exactly once."""
+        if not state:
+            return False
+        now = time.time()
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                self._db.execute(
+                    "DELETE FROM square_oauth_states WHERE expires_at <= ?",
+                    (now,),
+                )
+                cursor = self._db.execute(
+                    "DELETE FROM square_oauth_states "
+                    "WHERE state_hash = ? AND expires_at > ?",
+                    (hash_session_token(state), now),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return cursor.rowcount == 1
 
     def _setting_value_locked(self, key: str) -> str | None:
         row = self._db.execute(

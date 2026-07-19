@@ -194,7 +194,11 @@
       </div>
       <div class="toolbar">
         <h2>Transactions</h2>
-        <button id="sync-now">Sync now</button>
+        <div class="toolbar-actions">
+          <a id="export-csv" href="/api/transactions/export.csv"
+             download="square-protect-transactions.csv">Download CSV</a>
+          <button id="sync-now">Sync now</button>
+        </div>
       </div>
       <p class="hint">Click a thumbnail to open the UniFi Protect timeline at the moment of the transaction.</p>
       <p id="txn-last-updated" class="hint" role="status"></p>

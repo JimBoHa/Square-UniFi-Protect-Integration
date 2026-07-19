@@ -42,6 +42,7 @@ from .store import (
     ALARM_ENABLED_AFTER_SETTING,
     PROTECT_CONSOLE_ID_SETTING,
     PROTECT_CONSOLE_GENERATION_SETTING,
+    SQUARE_OAUTH_AUTHORIZATION_REVISION_SETTING,
     ProtectConsoleSwitchConfirmationRequired,
     ProtectSettingsConflict,
     SquareAccountChanged,
@@ -875,8 +876,8 @@ def create_app(
                         body.account_switch_confirmation_token
                     ),
                     # A pasted access token explicitly replaces any prior
-                    # OAuth grant. Clear only its refreshable token metadata;
-                    # keep the reusable OAuth application credentials.
+                    # OAuth grant and pending callbacks. Keep the reusable
+                    # OAuth application credentials.
                     clear_oauth_token_metadata=True,
                 )
                 saved_webhook = store.get_settings(
@@ -1048,6 +1049,12 @@ def create_app(
     def square_oauth_callback(
         code: str = "", state: str = "", error: str = "", _=authed
     ) -> RedirectResponse:
+        # Read the manual-authorization fence before consuming the one-time
+        # state. A manual save racing either step will delete the state or
+        # rotate the fence before this callback can persist exchanged tokens.
+        authorization_revision = store.get_setting(
+            SQUARE_OAUTH_AUTHORIZATION_REVISION_SETTING
+        )
         if not store.consume_square_oauth_state(state):
             raise HTTPException(status_code=400, detail="Invalid OAuth state")
         if error:
@@ -1103,11 +1110,15 @@ def create_app(
                     oauth_refresh_token=refresh_token,
                     oauth_token_expires_at=expires_at,
                     clear_oauth_pending=True,
+                    expected_oauth_authorization_revision=(
+                        authorization_revision
+                    ),
                 )
         except SquareAccountSwitchRequired as exc:
             # Keep the active merchant untouched until the operator explicitly
             # confirms the same destructive switch shown by manual-token setup.
-            store.update_settings(
+            if not store.update_square_oauth_grant(
+                authorization_revision,
                 {
                     "square.oauth_pending_access_token": (access_token, True),
                     "square.oauth_pending_refresh_token": (refresh_token or "", True),
@@ -1119,9 +1130,16 @@ def create_app(
                         True,
                     ),
                     "square.oauth_pending_created_at": (str(time.time()), False),
-                }
-            )
+                    "square.oauth_pending_authorization_revision": (
+                        authorization_revision or "",
+                        False,
+                    ),
+                },
+            ):
+                raise HTTPException(status_code=400, detail="Invalid OAuth state")
             return RedirectResponse("/?square_oauth=switch_required", status_code=302)
+        except SquareAccountChanged:
+            raise HTTPException(status_code=400, detail="Invalid OAuth state")
         return RedirectResponse("/?square_oauth=connected", status_code=302)
 
     @app.post("/api/settings/square/oauth-switch/confirm")
@@ -1166,12 +1184,24 @@ def create_app(
                         pending["square.oauth_pending_expires_at"] or ""
                     ),
                     clear_oauth_pending=True,
+                    expected_oauth_authorization_revision=(
+                        pending[
+                            "square.oauth_pending_authorization_revision"
+                        ]
+                        or None
+                    ),
                 )
             except SquareAccountSwitchRequired as exc:
                 store.delete_settings(*SQUARE_OAUTH_PENDING_SETTING_KEYS)
                 raise HTTPException(
                     status_code=409,
                     detail="The Square account changed; connect again before confirming",
+                ) from exc
+            except SquareAccountChanged as exc:
+                store.delete_settings(*SQUARE_OAUTH_PENDING_SETTING_KEYS)
+                raise HTTPException(
+                    status_code=409,
+                    detail="The Square authorization changed; connect again",
                 ) from exc
         return {
             "ok": True,

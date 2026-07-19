@@ -19,10 +19,17 @@ let settingsLoadGeneration = 0;
 let squareAccountSwitchConfirmationToken = "";
 let squareAccountRevision = "";
 let cameraMappingGeneration = "";
+let wizardSquareAccountRevision = "";
+let wizardProtectConsoleGeneration = "";
 
-function show(viewId) {
-  for (const sec of document.querySelectorAll("main > section")) sec.hidden = true;
-  $(viewId).hidden = false;
+function show(viewId, focusHeading = true) {
+  const view = $(viewId);
+  activateViewState(
+    document.querySelectorAll("main > section"),
+    view,
+    document.querySelectorAll("nav button[data-view]"),
+  );
+  if (focusHeading) focusViewHeading(view);
 }
 
 function message(text, kind) {
@@ -50,7 +57,7 @@ async function api(path, options = {}) {
   if (sessionExpired) {
     show("#view-login");
     $("#nav").hidden = true;
-    throw new Error("Please log in");
+    throw sessionExpiredError();
   }
   if (!resp.ok) {
     const detail = data.detail;
@@ -71,12 +78,34 @@ async function api(path, options = {}) {
 
 // ---------------------------------------------------------------- boot
 
+function showBootFailure(error) {
+  $("#nav").hidden = true;
+  $("#boot-error-detail").textContent = bootFailureMessage(error);
+  $("#boot-retry").disabled = false;
+  show("#view-boot-error");
+}
+
 async function boot() {
-  if (new URLSearchParams(window.location.search).get("square_oauth") === "connected") {
-    message("Square account connected via OAuth.", "ok");
+  const oauthOutcome = new URLSearchParams(window.location.search).get("square_oauth");
+  const oauthFeedback = squareOAuthResultFeedback(window.location.search);
+  if (oauthFeedback) {
+    message(oauthFeedback.text, oauthFeedback.kind);
+    window.history.replaceState({}, "", "/");
+  } else if (oauthOutcome === "switch_required") {
+    $("#square-oauth-switch-warning").hidden = false;
+    message(
+      "A different Square account authorized. Open Settings to confirm or cancel the switch.",
+      "error",
+    );
     window.history.replaceState({}, "", "/");
   }
-  const status = await api("/api/status");
+  let status;
+  try {
+    status = await api("/api/status");
+  } catch (err) {
+    showBootFailure(err);
+    return;
+  }
   if (!status.setup_complete) {
     show("#view-setup");
     return;
@@ -85,10 +114,17 @@ async function boot() {
   try {
     await api("/api/camera-mapping");
     await enterAppOrWizard();
-  } catch {
-    /* api() already routed to login view */
+  } catch (err) {
+    if (isSessionExpiredError(err)) return;
+    showBootFailure(err);
   }
 }
+
+$("#boot-retry").addEventListener("click", () => {
+  $("#boot-retry").disabled = true;
+  $("#boot-error-detail").textContent = "Retrying…";
+  void boot();
+});
 
 function enterApp() {
   $("#nav").hidden = false;
@@ -112,11 +148,22 @@ async function enterAppOrWizard() {
 
 $("#setup-form").addEventListener("submit", async (e) => {
   e.preventDefault();
+  const bootstrapSecret = $("#setup-bootstrap-secret").value;
+  const transportError = bootstrapTransportError(window.location);
+  if (transportError) {
+    message(transportError, "error");
+    return;
+  }
   try {
     await api("/api/setup", {
       method: "POST",
-      body: JSON.stringify({ password: $("#setup-password").value }),
+      body: JSON.stringify({
+        password: $("#setup-password").value,
+        bootstrap_secret: bootstrapSecret,
+      }),
     });
+    $("#setup-password").value = "";
+    $("#setup-bootstrap-secret").value = "";
     message("Admin password created. Please log in.", "ok");
     show("#view-login");
   } catch (err) {
@@ -148,8 +195,6 @@ $("#logout-btn").addEventListener("click", async () => {
 
 for (const btn of document.querySelectorAll("nav button[data-view]")) {
   btn.addEventListener("click", () => {
-    for (const b of document.querySelectorAll("nav button[data-view]"))
-      b.classList.toggle("active", b === btn);
     show(`#view-${btn.dataset.view}`);
     if (btn.dataset.view === "transactions") loadTransactions();
     if (btn.dataset.view === "settings") loadSettingsView();
@@ -356,6 +401,38 @@ $("#square-oauth-connect").addEventListener("click", () => {
   window.location.href = "/oauth/square/start";
 });
 
+$("#square-oauth-switch-confirm").addEventListener("click", async () => {
+  try {
+    const result = await api("/api/settings/square/oauth-switch/confirm", {
+      method: "POST",
+    });
+    $("#square-oauth-switch-warning").hidden = true;
+    squareAccountRevision = result.account_revision || "";
+    lastTransactionPayload = null;
+    renderTransactions([]);
+    void loadTransactions({ reset: true });
+    void loadSettingsView();
+    message(
+      result.evidence_cleanup_pending
+        ? "Square account switched. Old evidence cleanup will retry automatically."
+        : "Square account switched; map this account's POS cameras and configure its webhook.",
+      "ok",
+    );
+  } catch (err) {
+    message(err.message, "error");
+  }
+});
+
+$("#square-oauth-switch-cancel").addEventListener("click", async () => {
+  try {
+    await api("/api/settings/square/oauth-switch", { method: "DELETE" });
+    $("#square-oauth-switch-warning").hidden = true;
+    message("Kept the current Square account.", "");
+  } catch (err) {
+    message(err.message, "error");
+  }
+});
+
 $("#square-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {
@@ -419,37 +496,44 @@ function setConnStatus(id, state, text) {
   el.querySelector(".conn-text").textContent = text;
 }
 
-async function refreshProtectStatus() {
-  setConnStatus("#protect-status", "checking", "Checking…");
+async function fetchConnectionStatus(loadStatus) {
   try {
-    const health = await api("/api/health/protect");
-    if (!health.configured) {
-      setConnStatus("#protect-status", "", "Not connected");
-    } else if (health.ok) {
-      setConnStatus("#protect-status", "ok", health.detail);
-    } else {
-      setConnStatus("#protect-status", "bad", health.detail);
-    }
+    return { health: await loadStatus(), error: null };
   } catch (err) {
-    setConnStatus("#protect-status", "bad", err.message);
+    return { health: null, error: err };
   }
 }
 
-async function refreshSquareStatus() {
-  setConnStatus("#square-status", "checking", "Checking…");
-  try {
-    const health = await api("/api/health/square");
-    if (!health.configured) {
-      setConnStatus("#square-status", "", "Not connected");
-    } else if (health.ok) {
-      setConnStatus("#square-status", "ok", health.detail);
-    } else {
-      setConnStatus("#square-status", "bad", health.detail);
-    }
-  } catch (err) {
-    setConnStatus("#square-status", "bad", err.message);
+function renderConnectionStatus(id, result) {
+  if (result.error) {
+    setConnStatus(id, "bad", result.error.message);
+  } else if (!result.health.configured) {
+    setConnStatus(id, "", "Not connected");
+  } else if (result.health.ok) {
+    setConnStatus(id, "ok", result.health.detail);
+  } else {
+    setConnStatus(id, "bad", result.health.detail);
   }
 }
+
+function createConnectionStatusRefresher(id, loadStatus) {
+  return createLatestStatusRefresher(
+    () => {
+      setConnStatus(id, "checking", "Checking…");
+      return fetchConnectionStatus(loadStatus);
+    },
+    (result) => renderConnectionStatus(id, result),
+  );
+}
+
+const refreshProtectStatus = createConnectionStatusRefresher(
+  "#protect-status",
+  () => api("/api/health/protect"),
+);
+const refreshSquareStatus = createConnectionStatusRefresher(
+  "#square-status",
+  () => api("/api/health/square"),
+);
 
 async function fetchSettingsView() {
   // Clear any previous console's rows/preview before the provider reads so a
@@ -460,8 +544,8 @@ async function fetchSettingsView() {
     $("#camera-preview-wrap"),
     $("#camera-preview"),
   );
-  // Connection indicators refresh alongside every settings load; they render
-  // into their own elements, so they need no stale-load generation guard.
+  // Each indicator has its own latest-response guard, so a slow previous
+  // health request cannot overwrite the result of a newer settings load.
   void refreshSquareStatus();
   void refreshProtectStatus();
   return fetchMappingData();
@@ -534,7 +618,7 @@ function buildMappingRows(container, data) {
     for (const target of targets) {
       const row = document.createElement("div");
       row.className = "mapping-row";
-      const label = document.createElement("span");
+      const label = document.createElement("label");
       label.className = "loc";
       const locationName = loc.name || loc.id;
       if (target.device_id) {
@@ -545,6 +629,12 @@ function buildMappingRows(container, data) {
         label.textContent = locationName;
       }
       const select = document.createElement("select");
+      select.id = cameraMappingSelectId(
+        container.id,
+        loc.id,
+        target.device_id,
+      );
+      label.htmlFor = select.id;
       select.dataset.locationId = loc.id;
       select.dataset.deviceId = target.device_id || "";
       select.dataset.deviceName = target.device_name || "";
@@ -698,6 +788,21 @@ function updateTransactionPagination(loading = false) {
   }
 }
 
+function protectTimelineLink(txn, content) {
+  const link = document.createElement("a");
+  link.className = "thumbnail-link";
+  link.href = txn.deep_link;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.setAttribute(
+    "aria-label",
+    `Open UniFi Protect footage for transaction at ${new Date(txn.ts_ms).toLocaleString()}`,
+  );
+  link.title = "Open UniFi Protect timeline at this moment";
+  link.appendChild(content);
+  return link;
+}
+
 function renderTransactions(
   txns,
   filtered = transactionFiltersActive(transactionFilters),
@@ -724,18 +829,7 @@ function renderTransactions(
       image.src = txn.thumbnail_url;
       image.alt = "POS camera at time of transaction";
       if (txn.deep_link) {
-        const link = document.createElement("a");
-        link.className = "thumbnail-link";
-        link.href = txn.deep_link;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        link.setAttribute(
-          "aria-label",
-          `Open UniFi Protect footage for transaction at ${new Date(txn.ts_ms).toLocaleString()}`,
-        );
-        link.title = "Open UniFi Protect timeline at this moment";
-        link.appendChild(image);
-        thumb = link;
+        thumb = protectTimelineLink(txn, image);
       } else {
         thumb = image;
       }
@@ -748,6 +842,9 @@ function renderTransactions(
         retrying: "capture retrying",
       };
       thumb.textContent = thumbnailLabels[txn.thumbnail_status] || "no footage";
+      if (txn.deep_link) {
+        thumb = protectTimelineLink(txn, thumb);
+      }
     }
 
     const amount = document.createElement("div");
@@ -777,11 +874,13 @@ function renderTransactions(
     const status = document.createElement("div");
     status.className = "status";
     status.textContent = txn.status;
+    const refundStatus = renderRefundStatus(document, txn);
     meta.appendChild(when);
     meta.appendChild(card);
     meta.appendChild(source);
     meta.appendChild(transactionId);
     meta.appendChild(status);
+    if (refundStatus) meta.appendChild(refundStatus);
 
     row.appendChild(thumb);
     row.appendChild(amount);
@@ -799,13 +898,16 @@ function setTile(name, state, value, hint) {
 
 let dashboardTimer = null;
 
-async function refreshDashboard() {
-  let data;
+async function fetchDashboardStatus() {
   try {
-    data = await api("/api/dashboard");
+    return await api("/api/dashboard");
   } catch {
-    return;
+    return null;
   }
+}
+
+function renderDashboard(data) {
+  if (data === null) return;
   $("#dashboard-tiles").hidden = false;
 
   const conn = (info, fixHint) => {
@@ -836,6 +938,11 @@ async function refreshDashboard() {
       `${data.queues.thumbnails_pending} thumbnail(s), ${data.queues.alarms_pending} alarm(s) retrying`);
   }
 }
+
+const refreshDashboard = createLatestStatusRefresher(
+  fetchDashboardStatus,
+  renderDashboard,
+);
 
 function startDashboardRefresh() {
   if (dashboardTimer !== null) return;
@@ -987,15 +1094,20 @@ $("#sync-now").addEventListener("click", async () => {
 const WIZARD_SKIP_KEY = "spi-wizard-skipped";
 
 function showWizardStep(step) {
-  show("#view-wizard");
+  show("#view-wizard", false);
   $("#nav").hidden = false;
-  for (const el of document.querySelectorAll(".wiz-step"))
-    el.hidden = el.dataset.step !== String(step);
+  let activeStep = null;
+  for (const el of document.querySelectorAll(".wiz-step")) {
+    const active = el.dataset.step === String(step);
+    el.hidden = !active;
+    if (active) activeStep = el;
+  }
   for (const dot of document.querySelectorAll(".wiz-dot")) {
     const dotStep = Number(dot.dataset.step);
     dot.className = "wiz-dot" +
       (dotStep < step ? " done" : dotStep === step ? " active" : "");
   }
+  focusViewHeading(activeStep);
 }
 
 async function maybeStartWizard() {
@@ -1027,7 +1139,17 @@ async function maybeStartWizard() {
 async function loadWizardMapping() {
   const data = await fetchMappingData();
   if (data === null) return false;
-  return buildMappingRows($("#wiz-mapping-rows"), data);
+  if (!settingsSnapshotsMatch(data)) {
+    wizardSquareAccountRevision = "";
+    wizardProtectConsoleGeneration = "";
+    $("#wiz-mapping-rows").textContent = "";
+    message("Provider settings changed while camera choices were loading. Try again.", "error");
+    return false;
+  }
+  const usable = buildMappingRows($("#wiz-mapping-rows"), data);
+  wizardSquareAccountRevision = usable ? data.mappingRevision || "" : "";
+  wizardProtectConsoleGeneration = usable ? data.mappingGeneration || "" : "";
+  return usable;
 }
 
 $("#wiz-protect-form").addEventListener("submit", async (e) => {
@@ -1075,7 +1197,14 @@ $("#wiz-square-form").addEventListener("submit", async (e) => {
 $("#wiz-save-mapping").addEventListener("click", async () => {
   const mappings = collectMappings($("#wiz-mapping-rows"));
   try {
-    await api("/api/camera-mapping", { method: "PUT", body: JSON.stringify({ mappings }) });
+    await api("/api/camera-mapping", {
+      method: "PUT",
+      headers: {
+        "X-Square-Account-Revision": wizardSquareAccountRevision,
+        "X-Protect-Console-Generation": wizardProtectConsoleGeneration,
+      },
+      body: JSON.stringify({ mappings }),
+    });
     message("Camera selection saved.", "ok");
     showWizardStep(4);
   } catch (err) {

@@ -27,12 +27,15 @@ input, select {
   padding: 0.45rem 0.6rem; border: 1px solid var(--border); border-radius: 6px;
   background: transparent; color: inherit; font-size: 1rem;
 }
-button[type="submit"], #save-mapping, #sync-now {
+button[type="submit"], #save-mapping, #sync-now, #export-csv {
   padding: 0.5rem 1rem; border: none; border-radius: 6px;
   background: var(--accent); color: #fff; font-size: 0.95rem; cursor: pointer;
   justify-self: start;
 }
-.toolbar { display: flex; align-items: center; justify-content: space-between; }
+.toolbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.toolbar-actions { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+#export-csv { text-decoration: none; }
+#export-csv:focus-visible { outline: 3px solid #2684ff; outline-offset: 3px; }
 .hint { opacity: 0.7; font-size: 0.85rem; }
 .destructive-warning {
   padding: 0.75rem; border: 1px solid #c33; border-radius: 6px;
@@ -41,7 +44,11 @@ button[type="submit"], #save-mapping, #sync-now {
 .destructive-warning p { margin: 0.35rem 0 0.75rem; }
 #message { min-height: 1.5rem; font-size: 0.9rem; }
 #message.error { color: #d33; }
-#message.ok { color: #2a9d3a; }
+#message.ok { color: #187a28; }
+
+@media (prefers-color-scheme: dark) {
+  #message.ok { color: #4ec760; }
+}
 
 .transaction-filters {
   display: grid; grid-template-columns: minmax(220px, 1fr) minmax(150px, 0.35fr) auto;
@@ -74,12 +81,18 @@ button[type="submit"], #save-mapping, #sync-now {
 .txn .thumbnail-link:focus-visible { outline: 3px solid #2684ff; outline-offset: 3px; }
 .txn .thumb.placeholder {
   display: flex; align-items: center; justify-content: center;
-  font-size: 0.75rem; opacity: 0.6; cursor: default;
+  font-size: 0.75rem; opacity: 0.65; cursor: default;
 }
+.txn .thumbnail-link .thumb.placeholder { cursor: pointer; }
 .txn .amount { font-size: 1.15rem; font-weight: 700; min-width: 90px; }
 .txn .txn-details { min-width: 0; overflow-wrap: anywhere; }
 .txn .meta { font-size: 0.85rem; opacity: 0.8; }
 .txn .status { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.txn .refund-status {
+  display: inline-block; margin-top: 0.25rem; padding: 0.1rem 0.4rem;
+  border: 1px solid currentColor; border-radius: 999px;
+  font-size: 0.8rem; font-weight: 600;
+}
 .pagination {
   display: flex; align-items: center; justify-content: center; gap: 0.75rem;
   flex-wrap: wrap; margin-top: 1rem;
@@ -96,6 +109,38 @@ button[type="submit"], #save-mapping, #sync-now {
 @media (max-width: 520px) {
   .transaction-filters { grid-template-columns: 1fr; }
   .transaction-filters .filter-actions button { flex: 1 1 0; }
+  header {
+    align-items: stretch; flex-direction: column; gap: 0.75rem;
+    padding: 0.75rem 1rem;
+  }
+  nav {
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.35rem; width: 100%;
+  }
+  nav[hidden] { display: none; }
+  nav button { margin-left: 0; min-width: 0; padding-inline: 0.4rem; }
+  main { padding: 1rem; }
+  form, label, input, select, button { min-width: 0; max-width: 100%; }
+  label.check {
+    grid-auto-flow: initial; grid-template-columns: auto minmax(0, 1fr);
+    width: 100%;
+  }
+  code { overflow-wrap: anywhere; }
+  .toolbar { flex-wrap: wrap; gap: 0.75rem; }
+  .mapping-row {
+    align-items: stretch; flex-direction: column; gap: 0.25rem;
+  }
+  .mapping-row .loc { min-width: 0; width: 100%; }
+  .mapping-row select { width: 100%; }
+  .txn {
+    display: grid; grid-template-columns: minmax(0, 1fr); align-items: stretch;
+  }
+  .txn .thumbnail-link { width: 100%; }
+  .txn .thumb { width: 100%; height: auto; aspect-ratio: 16 / 9; }
+  .txn .amount { min-width: 0; }
+  .txn .meta { min-width: 0; overflow-wrap: anywhere; }
+  .conn-status { margin-left: 0; max-width: 100%; }
+  .conn-text { min-width: 0; overflow-wrap: anywhere; }
   .pagination .hint { order: -1; flex-basis: 100%; max-width: none; }
   .pagination button { flex: 1 1 0; }
 }
@@ -134,3 +179,7 @@ button[type="submit"], #save-mapping, #sync-now {
 .wiz-dot.active { background: var(--accent); }
 .wiz-nav { margin-top: 2rem; font-size: 0.85rem; }
 .wiz-nav a { color: inherit; opacity: 0.7; }
+
+@media (prefers-color-scheme: dark) {
+  #message.error { color: #ff6b6b; }
+}

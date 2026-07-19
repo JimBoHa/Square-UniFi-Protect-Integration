@@ -1,0 +1,7 @@
+.venv
+data
+tests
+.git
+*.dmg
+build
+dist

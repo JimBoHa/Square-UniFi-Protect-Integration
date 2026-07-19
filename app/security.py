@@ -14,6 +14,7 @@ from cryptography.fernet import Fernet, InvalidToken
 
 ENCRYPTION_KEY_ENV = "SPI_ENCRYPTION_KEY"
 KEY_FILENAME = "secret.key"
+_fchmod = getattr(os, "fchmod", None)
 HMAC_SALT_FILENAME = "hmac.salt"
 
 _SCRYPT_N = 2**14
@@ -69,7 +70,12 @@ class CredentialCipher:
         temp_path = Path(temp_name)
         try:
             try:
-                os.fchmod(fd, 0o600)
+                if _fchmod is not None:
+                    _fchmod(fd, 0o600)
+                else:
+                    # Windows has no fchmod. mkstemp creates a private file;
+                    # chmod keeps the path writable while preserving that ACL.
+                    os.chmod(temp_path, 0o600)
                 offset = 0
                 while offset < len(key):
                     written = os.write(fd, key[offset:])

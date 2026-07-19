@@ -23,7 +23,7 @@ from app.store import (
 )
 from app.sync import deliver_completed_alarm, ingest_payment
 
-from .conftest import ADMIN_PASSWORD
+from .conftest import ADMIN_PASSWORD, bootstrap_setup_body
 
 
 TOKEN_A = "square-token-merchant-a"
@@ -175,9 +175,13 @@ def _authed_account_app(tmp_path: Path) -> tuple[object, TestClient]:
         square_transport=httpx.MockTransport(_square_accounts),
         enable_poller=False,
     )
-    client = TestClient(app)
+    client = TestClient(
+        app,
+        base_url="http://localhost",
+        client=("127.0.0.1", 50000),
+    )
     assert client.post(
-        "/api/setup", json={"password": ADMIN_PASSWORD}
+        "/api/setup", json=bootstrap_setup_body()
     ).status_code == 200
     assert client.post(
         "/api/login", json={"password": ADMIN_PASSWORD}
@@ -921,8 +925,8 @@ def test_unidentified_legacy_thumbnail_requires_confirmation_and_cleanup(tmp_pat
 
 def test_account_switch_ui_reveals_destructive_confirmation_after_409():
     static_dir = Path(__file__).parents[1] / "app" / "static"
-    html = (static_dir / "index.html").read_text()
-    js = (static_dir / "app.js").read_text()
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
 
     assert 'id="square-account-switch-warning"' in html
     assert 'role="alert" hidden' in html

@@ -26,8 +26,10 @@ timeline near that timestamp.
   at-least-once with durable state; sales completed before the feature is
   enabled are never replayed.
 - **Transaction feed** — payments appear in the companion app with timestamp,
-  tip-inclusive amount, card last-4, status, and a camera thumbnail; the feed
-  auto-refreshes while visible.
+  tip-inclusive amount, partial or full refund totals, card last-4, status, and
+  a camera thumbnail; the feed auto-refreshes while visible. Refund totals come
+  from each Payment object's `refunded_money`, so no extra Square permission or
+  refund API request is needed.
 - **Click through to footage** — clicking a thumbnail uses the configured URL
   template to open the Protect timeline near the transaction timestamp.
 - **Fast retail lookup** — search the local feed by transaction ID, card last-4,
@@ -71,7 +73,7 @@ the app.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/uvicorn app.main:app --factory --host 0.0.0.0 --port 8000
+.venv/bin/python -m app
 ```
 
 **Windows (PowerShell):**
@@ -79,10 +81,34 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e '.[dev]'
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --factory --host 0.0.0.0 --port 8000
+.\.venv\Scripts\python.exe -m app
 ```
 
-Open `http://<host>:8000`, then:
+The bundled runner binds only to `127.0.0.1` by default. On first start it
+prints a generated one-time bootstrap secret in the server console. Copy that
+secret, open `http://localhost:8000` on the same computer, and enter it with the
+new admin password. Direct explicit loopback setup may use HTTP; every setup
+still requires the one-time secret.
+
+### First-time setup from another device
+
+Configure TLS and a one-time bootstrap secret **before** exposing a new
+installation on the network:
+
+```bash
+export SPI_TLS=1
+export SPI_BOOTSTRAP_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export SPI_HOST=0.0.0.0
+.venv/bin/python -m app
+```
+
+Only after those settings are active, open `https://<server-ip>:8000` from the
+other device, accept the one-time self-signed certificate warning, and enter
+`SPI_BOOTSTRAP_SECRET` in **One-time bootstrap secret**. A wildcard or
+non-loopback bind always requires the app's built-in TLS, even when a proxy
+claims that the original request used HTTPS.
+
+Then:
 
 1. **Create the admin password** (first run only).
 2. **Settings → UniFi Protect console** — host/IP of your console plus a local
@@ -121,12 +147,33 @@ Open `http://<host>:8000`, then:
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
 | `SPI_DATA_DIR` | `./data` | SQLite DB, encryption key/HMAC salt, thumbnails |
+| `SPI_HOST` | `127.0.0.1` | Server bind address. Wildcard and non-loopback values require TLS plus a bootstrap secret for first setup. |
 | `SPI_PORT` | `8000` | Port used by `Start Square Protect.command` |
+| `SPI_BOOTSTRAP_SECRET` | generated at startup | Random 32–4096 character one-time secret required when creating the first admin password; generate with `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`. Missing or invalid values are replaced with an ephemeral secret printed once to the server console. Only its digest remains in memory, and it is never written to the data directory. |
 | `SPI_POLL_INTERVAL` | `60` | Seconds between Square polls |
 | `SPI_DISABLE_POLLER` | `0` | Set `1` to disable background polling |
 | `SPI_COOKIE_SECURE` | `0` | Set `1` when serving over HTTPS |
 | `SPI_ENCRYPTION_KEY` | — | Fernet key overriding the on-disk key file |
-| `SPI_TLS` | `0` | Set `1` to serve HTTPS with an auto-generated self-signed certificate (via `python -m app` or the macOS launcher); enables Secure cookies automatically. `python -m app` binds `SPI_HOST` (default `0.0.0.0`); the launcher stays on `127.0.0.1` |
+| `SPI_TLS` | `0` | Set `1` to serve HTTPS with an auto-generated self-signed certificate (via `python -m app` or the macOS launcher); enables Secure cookies automatically. |
+
+Every first-time setup requires the one-time secret. The configured bind host,
+socket peer, HTTP `Host`, optional `Origin`, and absence of forwarding headers
+must all indicate loopback before HTTP is allowed. All other requests require
+the app's built-in TLS (`SPI_TLS=1`); request URL schemes and
+`X-Forwarded-Proto` never satisfy that rule. This keeps DNS rebinding and
+reverse/local proxies from removing the secret or transport requirements. The
+bundled runner retains Uvicorn's trusted-proxy defaults so login throttling can
+use a real forwarded client address from an explicitly trusted proxy, while
+bootstrap authorization remains independent and fail-closed.
+
+The app removes the plaintext bootstrap secret from its own process environment
+immediately after hashing it. The launching shell, service manager, or container
+configuration can still retain the original value. After setup succeeds, unset
+`SPI_BOOTSTRAP_SECRET` there and restart the app. To rotate a configured secret
+before setup, stop the app, replace the environment value, and restart. An
+automatically generated secret rotates on every pre-setup restart, so only the
+newly printed value remains valid. Changing this secret after setup does not
+rotate the admin password.
 
 The Protect timeline URL can be adjusted under **Settings → Protect timeline
 link**. Custom templates must use `https://` with `{host}` as the entire hostname and include
@@ -165,8 +212,12 @@ default (verified on Protect 7.1.87):
   failures; sessions are random 256-bit tokens in `HttpOnly`/`SameSite` cookies.
 - **Webhooks verified** — Square's `x-square-hmacsha256-signature` is checked
   with a constant-time comparison; unsigned or forged deliveries are rejected,
-  request bodies are capped at 1 MiB, and the endpoint is disabled until a
-  signature key is configured.
+  and the endpoint is disabled until a signature key is configured.
+- **Request bodies bounded** — general HTTP requests are capped at 1 MiB before
+  routing, authentication, or JSON parsing, including streamed/chunked bodies;
+  this leaves ample room for the maximum 500-entry camera mapping. Square
+  webhooks retain their dedicated 1 MiB streaming/HMAC cap, while transaction
+  search uses a tighter auth-first streaming cap.
 - **Input validation** — Protect host and camera ids are strictly validated
   (no URL/path injection), thumbnail serving is confined to the thumbnail
   directory, and the frontend renders all server data as text, never markup.

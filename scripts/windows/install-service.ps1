@@ -94,7 +94,9 @@ $Action = New-ScheduledTaskAction `
   -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Runner`"" `
   -WorkingDirectory $Repo
 $Trigger = New-ScheduledTaskTrigger -AtLogOn
-$Settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+$Settings = New-ScheduledTaskSettingsSet `
+  -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
+  -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger `
   -Settings $Settings -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName

@@ -31,6 +31,15 @@ def test_task_persists_only_a_dpapi_protected_secret():
     assert "SPI_BOOTSTRAP_SECRET" not in action
 
 
+def test_scheduled_service_has_no_execution_time_limit():
+    installer = INSTALLER.read_text(encoding="utf-8")
+    settings_start = installer.index("$Settings = New-ScheduledTaskSettingsSet")
+    registration = installer.index("Register-ScheduledTask")
+    settings = installer[settings_start:registration]
+
+    assert "-ExecutionTimeLimit (New-TimeSpan -Seconds 0)" in settings
+
+
 def test_runner_clears_plaintext_and_deletes_handoff_after_setup():
     runner = RUNNER.read_text(encoding="utf-8")
 

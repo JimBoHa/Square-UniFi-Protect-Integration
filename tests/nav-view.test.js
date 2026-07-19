@@ -73,7 +73,10 @@ test("all view transitions use the helper loaded before the application", () => 
   const app = fs.readFileSync(path.join(staticDir, "app.js"), "utf8");
 
   assert.ok(html.indexOf("/nav-view.js") < html.indexOf("/app.js"));
-  assert.match(app, /function show\(viewId\) \{\s*activateViewState\(/);
+  assert.match(
+    app,
+    /function show\(viewId, focusHeading = true\)[\s\S]*activateViewState\(/,
+  );
   assert.match(app, /function enterApp\(\)[\s\S]*show\("#view-transactions"\)/);
   assert.match(
     app,

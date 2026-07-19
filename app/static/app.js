@@ -19,12 +19,14 @@ let squareAccountSwitchConfirmationToken = "";
 let squareAccountRevision = "";
 let cameraMappingGeneration = "";
 
-function show(viewId) {
+function show(viewId, focusHeading = true) {
+  const view = $(viewId);
   activateViewState(
     document.querySelectorAll("main > section"),
-    $(viewId),
+    view,
     document.querySelectorAll("nav button[data-view]"),
   );
+  if (focusHeading) focusViewHeading(view);
 }
 
 function message(text, kind) {
@@ -928,15 +930,20 @@ $("#sync-now").addEventListener("click", async () => {
 const WIZARD_SKIP_KEY = "spi-wizard-skipped";
 
 function showWizardStep(step) {
-  show("#view-wizard");
+  show("#view-wizard", false);
   $("#nav").hidden = false;
-  for (const el of document.querySelectorAll(".wiz-step"))
-    el.hidden = el.dataset.step !== String(step);
+  let activeStep = null;
+  for (const el of document.querySelectorAll(".wiz-step")) {
+    const active = el.dataset.step === String(step);
+    el.hidden = !active;
+    if (active) activeStep = el;
+  }
   for (const dot of document.querySelectorAll(".wiz-dot")) {
     const dotStep = Number(dot.dataset.step);
     dot.className = "wiz-dot" +
       (dotStep < step ? " done" : dotStep === step ? " active" : "");
   }
+  focusViewHeading(activeStep);
 }
 
 async function maybeStartWizard() {

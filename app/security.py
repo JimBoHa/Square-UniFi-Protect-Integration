@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import os
@@ -14,11 +15,16 @@ from cryptography.fernet import Fernet, InvalidToken
 ENCRYPTION_KEY_ENV = "SPI_ENCRYPTION_KEY"
 KEY_FILENAME = "secret.key"
 _fchmod = getattr(os, "fchmod", None)
+HMAC_SALT_FILENAME = "hmac.salt"
 
 _SCRYPT_N = 2**14
 _SCRYPT_R = 8
 _SCRYPT_P = 1
 _SALT_BYTES = 16
+_HMAC_SALT_BYTES = 32
+_KEYED_HMAC_DERIVATION_DOMAIN = (
+    b"square-unifi-protect:credential-cipher:keyed-hmac:v2"
+)
 
 
 class CredentialCipher:
@@ -30,7 +36,20 @@ class CredentialCipher:
     """
 
     def __init__(self, data_dir: Path):
-        self._fernet = Fernet(self._load_or_create_key(data_dir))
+        key = self._load_or_create_key(data_dir)
+        self._fernet = Fernet(key)
+        raw_key = base64.urlsafe_b64decode(key)
+        installation_salt = self._load_or_create_hmac_salt(data_dir)
+        # Derive a distinct MAC key instead of reusing Fernet's key material
+        # directly in another protocol. Derive from the decoded key so every
+        # equivalent Fernet encoding produces the same durable MAC key, then
+        # bind it to this installation so shared encryption keys cannot link
+        # signatures from independent data directories.
+        self._keyed_hmac_key = hmac.new(
+            raw_key,
+            _KEYED_HMAC_DERIVATION_DOMAIN + b"\0" + installation_salt,
+            hashlib.sha256,
+        ).digest()
 
     @staticmethod
     def _load_or_create_key(data_dir: Path) -> bytes:
@@ -78,6 +97,49 @@ class CredentialCipher:
         finally:
             temp_path.unlink(missing_ok=True)
 
+    @staticmethod
+    def _load_or_create_hmac_salt(data_dir: Path) -> bytes:
+        salt_path = data_dir / HMAC_SALT_FILENAME
+        try:
+            salt = salt_path.read_bytes()
+        except FileNotFoundError:
+            pass
+        else:
+            if len(salt) != _HMAC_SALT_BYTES:
+                raise ValueError("Invalid installation HMAC salt")
+            return salt
+
+        salt = secrets.token_bytes(_HMAC_SALT_BYTES)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{HMAC_SALT_FILENAME}.", suffix=".tmp", dir=data_dir
+        )
+        temp_path = Path(temp_name)
+        try:
+            try:
+                os.fchmod(fd, 0o600)
+                offset = 0
+                while offset < len(salt):
+                    written = os.write(fd, salt[offset:])
+                    if written <= 0:
+                        raise OSError("Could not write installation HMAC salt")
+                    offset += written
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+            try:
+                # Publish exactly one winner so concurrent workers derive the
+                # same installation key without overwriting each other.
+                os.link(temp_path, salt_path)
+            except FileExistsError:
+                salt = salt_path.read_bytes()
+            if len(salt) != _HMAC_SALT_BYTES:
+                raise ValueError("Invalid installation HMAC salt")
+            return salt
+        finally:
+            temp_path.unlink(missing_ok=True)
+
     def encrypt(self, plaintext: str) -> str:
         return self._fernet.encrypt(plaintext.encode()).decode()
 
@@ -86,6 +148,16 @@ class CredentialCipher:
             return self._fernet.decrypt(ciphertext.encode()).decode()
         except InvalidToken as exc:
             raise ValueError("Could not decrypt stored credential") from exc
+
+    def keyed_hmac_hex(self, domain: bytes, payload: bytes) -> str:
+        """Return a domain-separated installation-specific HMAC digest."""
+        if not domain or b"\0" in domain:
+            raise ValueError("HMAC domain must be non-empty and contain no NUL bytes")
+        return hmac.new(
+            self._keyed_hmac_key,
+            domain + b"\0" + payload,
+            hashlib.sha256,
+        ).hexdigest()
 
 
 def hash_password(password: str) -> str:

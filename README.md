@@ -32,6 +32,11 @@ timeline near that timestamp.
   refund API request is needed.
 - **Click through to footage** — clicking a thumbnail uses the configured URL
   template to open the Protect timeline near the transaction timestamp.
+- **Fast retail lookup** — search the local feed by transaction ID, card last-4,
+  POS device/name, location ID, or status, and narrow it to a Square payment
+  status. Searches use normalized local fields, do not retain new buyer data,
+  and send lookup terms in an authenticated JSON body rather than a URL that
+  ordinary web-server or proxy access logs may record.
 - **Real-time + backfill** — a Square webhook receiver acknowledges deliveries
   immediately (HMAC-SHA256 signature verified) and captures footage
   asynchronously, while a background poller reconciles every Square location
@@ -141,7 +146,7 @@ Then:
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
-| `SPI_DATA_DIR` | `./data` | SQLite DB, encryption key, thumbnails |
+| `SPI_DATA_DIR` | `./data` | SQLite DB, encryption key/HMAC salt, thumbnails |
 | `SPI_HOST` | `127.0.0.1` | Server bind address. Wildcard and non-loopback values require TLS plus a bootstrap secret for first setup. |
 | `SPI_PORT` | `8000` | Port used by `Start Square Protect.command` |
 | `SPI_BOOTSTRAP_SECRET` | generated at startup | Random 32–4096 character one-time secret required when creating the first admin password; generate with `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`. Missing or invalid values are replaced with an ephemeral secret printed once to the server console. Only its digest remains in memory, and it is never written to the data directory. |

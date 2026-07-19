@@ -1,7 +1,10 @@
 """Transaction versioning and database migration tests."""
 
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import errno
+import hashlib
+import json
 import os
 import sqlite3
 import threading
@@ -17,7 +20,9 @@ from app.store import (
     ProtectConsoleSwitchConfirmationRequired,
     ProtectSettingsConflict,
     Store,
+    TRANSACTION_FILTER_SIGNATURE_PREFIX,
     TransactionSnapshotExpired,
+    TransactionSnapshotFilterMismatch,
 )
 from app.sync import (
     ingest_payment,
@@ -1438,6 +1443,323 @@ def test_store_migrates_legacy_fields_and_scrubs_raw_payment(tmp_path):
         "transaction_feed_snapshots",
         "transaction_feed_state",
     }
+
+
+def test_store_migrates_unfiltered_snapshot_to_filter_bound_schema(tmp_path):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    store.upsert_transaction(
+        {
+            "id": "PAY_LEGACY_SNAPSHOT",
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "ts_ms": 100,
+            "amount": 100,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        }
+    )
+    _page, legacy_snapshot = store.list_transactions_page(limit=1)
+    store.close()
+
+    # Recreate the immediately previous release's snapshot table exactly.
+    db = sqlite3.connect(data_dir / "spi.db")
+    db.executescript(
+        """
+        DROP TRIGGER invalidate_transaction_feed_after_delete;
+        DROP INDEX idx_transaction_feed_snapshots_access;
+        ALTER TABLE transaction_feed_snapshots
+            RENAME TO transaction_feed_snapshots_current;
+        CREATE TABLE transaction_feed_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_revision INTEGER NOT NULL,
+            rowid_boundary INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            last_accessed_at REAL NOT NULL,
+            UNIQUE (order_revision, rowid_boundary)
+        );
+        INSERT INTO transaction_feed_snapshots (
+            id, order_revision, rowid_boundary, created_at, last_accessed_at
+        )
+        SELECT id, order_revision, rowid_boundary, created_at, last_accessed_at
+        FROM transaction_feed_snapshots_current;
+        DROP TABLE transaction_feed_snapshots_current;
+        """
+    )
+    db.commit()
+    db.close()
+
+    reopened = Store(data_dir)
+    try:
+        durable, same_snapshot = reopened.list_transactions_page(
+            limit=1,
+            snapshot_id=legacy_snapshot,
+        )
+        filtered, filtered_snapshot = reopened.list_transactions_page(
+            limit=1,
+            query="legacy_snapshot",
+        )
+        signatures = [
+            row["filter_signature"]
+            for row in reopened._db.execute(
+                "SELECT filter_signature FROM transaction_feed_snapshots "
+                "ORDER BY id"
+            ).fetchall()
+        ]
+        with pytest.raises(TransactionSnapshotFilterMismatch):
+            reopened.list_transactions_page(
+                limit=1,
+                snapshot_id=filtered_snapshot,
+                query="different",
+            )
+        still_valid, _ = reopened.list_transactions_page(
+            limit=1,
+            snapshot_id=filtered_snapshot,
+            query="legacy_snapshot",
+        )
+    finally:
+        reopened.close()
+
+    assert [row["id"] for row in durable] == ["PAY_LEGACY_SNAPSHOT"]
+    assert same_snapshot == legacy_snapshot
+    assert filtered_snapshot != legacy_snapshot
+    assert [row["id"] for row in filtered] == ["PAY_LEGACY_SNAPSHOT"]
+    assert [row["id"] for row in still_valid] == ["PAY_LEGACY_SNAPSHOT"]
+    assert signatures[0] == ""
+    assert signatures[1].startswith(TRANSACTION_FILTER_SIGNATURE_PREFIX)
+    assert len(signatures[1]) == len(TRANSACTION_FILTER_SIGNATURE_PREFIX) + 64
+    assert "legacy_snapshot" not in signatures[1]
+
+
+def test_filtered_snapshot_signature_is_keyed_per_installation_and_durable(
+    tmp_path, monkeypatch
+):
+    shared_key = base64.urlsafe_b64encode(bytes(range(32))).decode("ascii")
+    monkeypatch.setenv("SPI_ENCRYPTION_KEY", shared_key)
+    canonical_filter = json.dumps(
+        ["4242", "COMPLETED"], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    raw_digest = hashlib.sha256(canonical_filter).hexdigest()
+    signatures = []
+
+    for install_name in ("install-a", "install-b"):
+        data_dir = tmp_path / install_name
+        store = Store(data_dir)
+        try:
+            store.upsert_transaction(
+                {
+                    "id": "PAY_FILTER_SIGNATURE",
+                    "created_at": "2026-07-16T15:30:00.000Z",
+                    "ts_ms": 100,
+                    "amount": 100,
+                    "currency": "USD",
+                    "status": "COMPLETED",
+                    "location_id": "LOC1",
+                    "card_last4": "4242",
+                }
+            )
+            _page, snapshot_id = store.list_transactions_page(
+                limit=1,
+                query="4242",
+                status="COMPLETED",
+            )
+            signature = store._db.execute(
+                "SELECT filter_signature FROM transaction_feed_snapshots WHERE id = ?",
+                (snapshot_id,),
+            ).fetchone()["filter_signature"]
+        finally:
+            store.close()
+
+        reopened = Store(data_dir)
+        try:
+            _page, durable_snapshot_id = reopened.list_transactions_page(
+                limit=1,
+                query="4242",
+                status="COMPLETED",
+            )
+            durable_signature = reopened._db.execute(
+                "SELECT filter_signature FROM transaction_feed_snapshots WHERE id = ?",
+                (durable_snapshot_id,),
+            ).fetchone()["filter_signature"]
+        finally:
+            reopened.close()
+
+        assert durable_snapshot_id == snapshot_id
+        assert durable_signature == signature
+        assert signature.startswith(TRANSACTION_FILTER_SIGNATURE_PREFIX)
+        assert signature != raw_digest
+        assert not signature.endswith(raw_digest)
+        signatures.append(signature)
+
+    assert signatures[0] != signatures[1]
+
+
+def test_filtered_snapshot_signature_survives_equivalent_fernet_key_encoding(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    raw_key = bytes([251, 255]) * 16
+    canonical_key = base64.urlsafe_b64encode(raw_key)
+    (data_dir / "secret.key").write_bytes(canonical_key)
+    monkeypatch.delenv("SPI_ENCRYPTION_KEY", raising=False)
+
+    store = Store(data_dir)
+    try:
+        store.set_setting("proof.secret", "still decrypts", secret=True)
+        _page, snapshot_id = store.list_transactions_page(
+            limit=1,
+            query="4242",
+            status="COMPLETED",
+        )
+        signature = store._db.execute(
+            "SELECT filter_signature FROM transaction_feed_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()["filter_signature"]
+    finally:
+        store.close()
+
+    # Fernet accepts whitespace and the standard Base64 alphabet as an
+    # equivalent encoding of the same raw key material.
+    equivalent_key = " " + base64.b64encode(raw_key).decode("ascii") + "\n"
+    monkeypatch.setenv("SPI_ENCRYPTION_KEY", equivalent_key)
+    reopened = Store(data_dir)
+    try:
+        assert reopened.get_setting("proof.secret") == "still decrypts"
+        _page, reopened_snapshot_id = reopened.list_transactions_page(
+            limit=1,
+            snapshot_id=snapshot_id,
+            query="4242",
+            status="COMPLETED",
+        )
+        reopened_signature = reopened._db.execute(
+            "SELECT filter_signature FROM transaction_feed_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()["filter_signature"]
+    finally:
+        reopened.close()
+
+    assert reopened_snapshot_id == snapshot_id
+    assert reopened_signature == signature
+
+
+@pytest.mark.parametrize(
+    "legacy_signature",
+    [
+        hashlib.sha256(b'["4242",""]').hexdigest(),
+        "hmac-sha256-v1:" + "0" * 64,
+    ],
+    ids=("raw-sha256", "pre-salt-hmac-v1"),
+)
+def test_store_expires_legacy_filtered_snapshots_only(tmp_path, legacy_signature):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    store.upsert_transaction(
+        {
+            "id": "PAY_LEGACY_FILTER",
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "ts_ms": 100,
+            "amount": 100,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+            "card_last4": "4242",
+        }
+    )
+    _page, unfiltered_snapshot = store.list_transactions_page(limit=1)
+    _page, filtered_snapshot = store.list_transactions_page(limit=1, query="4242")
+    store.close()
+
+    db = sqlite3.connect(data_dir / "spi.db")
+    db.execute(
+        "UPDATE transaction_feed_snapshots SET filter_signature = ? WHERE id = ?",
+        (legacy_signature, filtered_snapshot),
+    )
+    db.commit()
+    db.close()
+
+    reopened = Store(data_dir)
+    try:
+        remaining_ids = {
+            row["id"]
+            for row in reopened._db.execute(
+                "SELECT id FROM transaction_feed_snapshots"
+            ).fetchall()
+        }
+        _page, same_unfiltered_snapshot = reopened.list_transactions_page(
+            limit=1,
+            snapshot_id=unfiltered_snapshot,
+        )
+        _page, replacement_filtered_snapshot = reopened.list_transactions_page(
+            limit=1,
+            query="4242",
+        )
+    finally:
+        reopened.close()
+
+    assert remaining_ids == {unfiltered_snapshot}
+    assert same_unfiltered_snapshot == unfiltered_snapshot
+    assert replacement_filtered_snapshot != filtered_snapshot
+
+
+def test_snapshot_migration_does_not_reuse_expired_ids(tmp_path):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    store.upsert_transaction(
+        {
+            "id": "PAY_SNAPSHOT_SEQUENCE",
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "ts_ms": 100,
+            "amount": 100,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        }
+    )
+    _page, expired_snapshot = store.list_transactions_page(limit=1)
+    store.close()
+
+    # Recreate the previous schema after all retained snapshots expired. Its
+    # AUTOINCREMENT sequence must survive even though the table itself is empty.
+    db = sqlite3.connect(data_dir / "spi.db")
+    db.executescript(
+        """
+        DROP TRIGGER invalidate_transaction_feed_after_delete;
+        DROP INDEX idx_transaction_feed_snapshots_access;
+        ALTER TABLE transaction_feed_snapshots
+            RENAME TO transaction_feed_snapshots_current;
+        CREATE TABLE transaction_feed_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_revision INTEGER NOT NULL,
+            rowid_boundary INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            last_accessed_at REAL NOT NULL,
+            UNIQUE (order_revision, rowid_boundary)
+        );
+        DROP TABLE transaction_feed_snapshots_current;
+        DELETE FROM sqlite_sequence
+        WHERE name = 'transaction_feed_snapshots';
+        INSERT INTO sqlite_sequence (name, seq)
+        VALUES ('transaction_feed_snapshots', 42);
+        """
+    )
+    db.commit()
+    db.close()
+
+    reopened = Store(data_dir)
+    try:
+        page, new_snapshot = reopened.list_transactions_page(limit=1)
+        with pytest.raises(TransactionSnapshotExpired):
+            reopened.list_transactions_page(
+                limit=1,
+                snapshot_id=expired_snapshot,
+            )
+    finally:
+        reopened.close()
+
+    assert expired_snapshot == 1
+    assert new_snapshot == 43
+    assert [row["id"] for row in page] == ["PAY_SNAPSHOT_SEQUENCE"]
 
 
 def test_stale_event_with_old_timestamp_cannot_overwrite_thumbnail_file(tmp_path):

@@ -50,6 +50,19 @@ button[type="submit"], #save-mapping, #sync-now, #export-csv {
   #message.ok { color: #4ec760; }
 }
 
+.transaction-filters {
+  display: grid; grid-template-columns: minmax(220px, 1fr) minmax(150px, 0.35fr) auto;
+  gap: 0.75rem; align-items: end; max-width: none; margin: 1rem 0 0.25rem;
+}
+.transaction-filters .filter-actions { display: flex; gap: 0.5rem; }
+.transaction-filters button {
+  padding: 0.45rem 0.8rem; border: 1px solid var(--border); border-radius: 6px;
+  background: transparent; color: inherit; cursor: pointer;
+}
+.transaction-filters button[type="submit"] {
+  border-color: var(--accent); background: var(--accent); color: #fff;
+}
+
 .mapping-row { display: flex; gap: 0.75rem; align-items: center; margin: 0.4rem 0; }
 .mapping-row .loc { min-width: 280px; font-weight: 600; }
 #camera-preview { max-width: 480px; width: 100%; border-radius: 8px; border: 1px solid var(--border); }
@@ -72,6 +85,7 @@ button[type="submit"], #save-mapping, #sync-now, #export-csv {
 }
 .txn .thumbnail-link .thumb.placeholder { cursor: pointer; }
 .txn .amount { font-size: 1.15rem; font-weight: 700; min-width: 90px; }
+.txn .txn-details { min-width: 0; overflow-wrap: anywhere; }
 .txn .meta { font-size: 0.85rem; opacity: 0.8; }
 .txn .status { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
 .txn .refund-status {
@@ -93,6 +107,8 @@ button[type="submit"], #save-mapping, #sync-now, #export-csv {
   margin: 0; text-align: center;
 }
 @media (max-width: 520px) {
+  .transaction-filters { grid-template-columns: 1fr; }
+  .transaction-filters .filter-actions button { flex: 1 1 0; }
   header {
     align-items: stretch; flex-direction: column; gap: 0.75rem;
     padding: 0.75rem 1rem;

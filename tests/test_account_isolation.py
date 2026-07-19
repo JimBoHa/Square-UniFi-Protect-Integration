@@ -19,6 +19,7 @@ from app.store import (
     SquareAccountChanged,
     SquareAccountSwitchRequired,
     Store,
+    TransactionSnapshotExpired,
 )
 from app.sync import deliver_completed_alarm, ingest_payment
 
@@ -432,6 +433,44 @@ def test_same_merchant_refresh_retains_data_even_when_confirmation_is_set(tmp_pa
         assert (store.thumbnail_dir / "account-a.jpg").exists()
     finally:
         client.close()
+        store.close()
+
+
+def test_account_switch_expires_empty_feed_search_snapshots(tmp_path):
+    store = Store(tmp_path / "data")
+    try:
+        _configure(store, MERCHANT_A, TOKEN_A)
+        page, old_snapshot = store.list_transactions_page(
+            limit=10,
+            query="merchant-a-private-filter",
+        )
+        old_revision = store._db.execute(
+            "SELECT order_revision FROM transaction_feed_state WHERE singleton = 1"
+        ).fetchone()["order_revision"]
+        assert page == []
+        assert store._db.execute(
+            "SELECT filter_signature FROM transaction_feed_snapshots WHERE id = ?",
+            (old_snapshot,),
+        ).fetchone()["filter_signature"]
+
+        assert _configure(store, MERCHANT_B, TOKEN_B, confirm=True)
+
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM transaction_feed_snapshots"
+        ).fetchone()[0] == 0
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM transaction_feed_order_history"
+        ).fetchone()[0] == 0
+        assert store._db.execute(
+            "SELECT order_revision FROM transaction_feed_state WHERE singleton = 1"
+        ).fetchone()["order_revision"] > old_revision
+        with pytest.raises(TransactionSnapshotExpired):
+            store.list_transactions_page(
+                limit=10,
+                snapshot_id=old_snapshot,
+                query="merchant-a-private-filter",
+            )
+    finally:
         store.close()
 
 

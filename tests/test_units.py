@@ -13,6 +13,7 @@ import httpx
 import pytest
 from cryptography.fernet import Fernet
 
+import app.security as security_module
 from app.deeplink import (
     DEFAULT_TEMPLATE,
     build_deep_link,
@@ -27,7 +28,13 @@ from app.protect_client import (
     validate_camera_id,
     validate_host,
 )
-from app.security import CredentialCipher, KEY_FILENAME, hash_password, verify_password
+from app.security import (
+    CredentialCipher,
+    HMAC_SALT_FILENAME,
+    KEY_FILENAME,
+    hash_password,
+    verify_password,
+)
 from app.square_client import (
     SquareClient,
     SquareError,
@@ -101,6 +108,41 @@ def test_credential_cipher_key_creation_is_atomic_under_concurrency(tmp_path, mo
     if os.name == "posix":
         assert (tmp_path / KEY_FILENAME).stat().st_mode & 0o777 == 0o600
     assert list(tmp_path.glob(f".{KEY_FILENAME}.*.tmp")) == []
+
+
+def test_store_hmac_salt_is_atomic_under_concurrent_opens(tmp_path, monkeypatch):
+    worker_count = 32
+    all_generating = threading.Barrier(worker_count)
+    token_bytes = security_module.secrets.token_bytes
+
+    def synchronized_token_bytes(size):
+        all_generating.wait(timeout=10)
+        return token_bytes(size)
+
+    monkeypatch.setenv("SPI_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+    monkeypatch.setattr(
+        security_module.secrets,
+        "token_bytes",
+        synchronized_token_bytes,
+    )
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(Store, tmp_path) for _ in range(worker_count)]
+        stores = [future.result(timeout=20) for future in futures]
+
+    try:
+        signatures = {
+            store.cipher.keyed_hmac_hex(b"concurrency-test", b"same payload")
+            for store in stores
+        }
+    finally:
+        for store in stores:
+            store.close()
+    salt_path = tmp_path / HMAC_SALT_FILENAME
+    assert len(signatures) == 1
+    assert len(salt_path.read_bytes()) == 32
+    assert salt_path.stat().st_mode & 0o777 == 0o600
+    assert list(tmp_path.glob(f".{HMAC_SALT_FILENAME}.*.tmp")) == []
 
 
 def test_credential_cipher_rejects_tampered(tmp_path):

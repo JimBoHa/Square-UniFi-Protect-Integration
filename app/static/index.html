@@ -222,6 +222,26 @@
         </div>
       </div>
       <p class="hint">Click a thumbnail to open the UniFi Protect timeline at the moment of the transaction.</p>
+      <form id="txn-filter-form" class="transaction-filters" role="search">
+        <label for="txn-query">Search transactions
+          <input id="txn-query" type="search" maxlength="64" autocomplete="off" spellcheck="false" aria-describedby="txn-filter-help" placeholder="Transaction ID, card last 4, POS, or location">
+        </label>
+        <label for="txn-status-filter">Status
+          <select id="txn-status-filter">
+            <option value="">All statuses</option>
+            <option value="APPROVED">Approved</option>
+            <option value="PENDING">Pending</option>
+            <option value="COMPLETED">Completed</option>
+            <option value="CANCELED">Canceled</option>
+            <option value="FAILED">Failed</option>
+          </select>
+        </label>
+        <div class="filter-actions">
+          <button type="submit">Search</button>
+          <button type="button" id="txn-filter-clear">Clear</button>
+        </div>
+      </form>
+      <p id="txn-filter-help" class="hint">Search uses only locally stored transaction ID, card last 4, POS device/name, location ID, and status.</p>
       <p id="txn-last-updated" class="hint" role="status"></p>
       <div id="txn-list"></div>
       <div class="pagination" role="navigation" aria-label="Transaction pages">
@@ -243,6 +263,7 @@
   <script src="/view-focus.js"></script>
   <script src="/settings-loader.js"></script>
   <script src="/nav-view.js"></script>
+  <script src="/transaction-filters.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

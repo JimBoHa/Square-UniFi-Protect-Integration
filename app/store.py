@@ -1359,6 +1359,18 @@ class Store:
                             f"DELETE FROM {PROTECT_EVIDENCE_RETIRED_TABLE}"
                         )
                     self._db.execute("DELETE FROM transactions")
+                    # A DELETE trigger normally expires feed snapshots, but it
+                    # never runs when the old account has no transactions. An
+                    # empty filtered page still owns account-scoped search
+                    # metadata, so fence every confirmed merchant switch
+                    # explicitly.
+                    self._db.execute("DELETE FROM transaction_feed_snapshots")
+                    self._db.execute("DELETE FROM transaction_feed_order_history")
+                    self._db.execute(
+                        "UPDATE transaction_feed_state "
+                        "SET order_revision = order_revision + 1 "
+                        "WHERE singleton = 1"
+                    )
                     self._db.execute("DELETE FROM camera_map")
                     if self._table_exists_locked(SQUARE_POLL_WATERMARK_TABLE):
                         self._db.execute(

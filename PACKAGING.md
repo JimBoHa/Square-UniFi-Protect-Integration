@@ -65,7 +65,11 @@ Both use the repo checkout + its venv; `--uninstall` reverses everything.
 
 `scripts/windows/install-service.ps1` creates the venv and registers a
 Task Scheduler job that starts the server at logon (no third-party service
-wrapper needed). Docker Desktop users should prefer the compose file.
+wrapper needed). When secure first-run setup is available, the installer
+prints its one-time secret and hands it to the hidden task through a
+DPAPI-protected, current-user-only file. The runner removes that encrypted
+handoff automatically after setup succeeds; the task definition never stores
+the plaintext secret. Docker Desktop users should prefer the compose file.
 Future work: a signed MSI built with WiX + a pythonw-based tray icon,
 mirroring the macOS menu-bar app.
 

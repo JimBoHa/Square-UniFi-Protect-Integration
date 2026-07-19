@@ -16,6 +16,8 @@ import httpx
 logger = logging.getLogger("spi.square")
 
 SQUARE_VERSION = "2025-01-23"
+WEBHOOK_SUBSCRIPTION_PAGE_SIZE = 100
+MAX_WEBHOOK_SUBSCRIPTION_PAGES = 100
 
 BASE_URLS = {
     "production": "https://connect.squareup.com",
@@ -24,6 +26,7 @@ BASE_URLS = {
 RATE_LIMIT_MAX_RETRIES = 3
 RATE_LIMIT_BASE_DELAY_SECONDS = 0.5
 RATE_LIMIT_MAX_DELAY_SECONDS = 10.0
+IDEMPOTENT_RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 
 class SquareError(Exception):
@@ -68,12 +71,46 @@ class SquareClient:
         self._client.close()
 
     def _request_json(
-        self, method: str, path: str, json_body: dict | None = None
+        self,
+        method: str,
+        path: str,
+        json_body: dict | None = None,
+        *,
+        retry_idempotent: bool = False,
     ) -> dict:
-        try:
-            resp = self._client.request(method, path, json=json_body)
-        except httpx.RequestError as exc:
-            raise SquareError("Network error while contacting Square") from exc
+        attempt = 0
+        while True:
+            try:
+                resp = self._client.request(method, path, json=json_body)
+            except httpx.RequestError as exc:
+                if not retry_idempotent or attempt >= self.rate_limit_max_retries:
+                    raise SquareError("Network error while contacting Square") from exc
+                delay = self._retry_delay(attempt)
+                logger.warning(
+                    "Square %s %s had a network error; retrying in %.2f seconds",
+                    method,
+                    path,
+                    delay,
+                )
+                time.sleep(delay)
+                attempt += 1
+                continue
+            if (
+                not retry_idempotent
+                or resp.status_code not in IDEMPOTENT_RETRY_STATUS_CODES
+                or attempt >= self.rate_limit_max_retries
+            ):
+                break
+            delay = self._retry_delay(attempt, resp)
+            logger.warning(
+                "Square %s %s returned HTTP %d; retrying in %.2f seconds",
+                method,
+                path,
+                resp.status_code,
+                delay,
+            )
+            time.sleep(delay)
+            attempt += 1
         if resp.status_code == 401:
             raise SquareAuthError("Square rejected the access token")
         if resp.status_code == 403:
@@ -97,7 +134,7 @@ class SquareClient:
                 raise SquareError("Network error while contacting Square") from exc
             if resp.status_code != 429 or attempt >= self.rate_limit_max_retries:
                 break
-            delay = self._rate_limit_delay(resp, attempt)
+            delay = self._retry_delay(attempt, resp)
             logger.warning(
                 "Square rate limited %s; retrying in %.2f seconds",
                 path,
@@ -119,11 +156,13 @@ class SquareClient:
             raise SquareError("Square returned an invalid response")
         return data
 
-    def _rate_limit_delay(self, resp: httpx.Response, attempt: int) -> float:
+    def _retry_delay(
+        self, attempt: int, resp: httpx.Response | None = None
+    ) -> float:
         # Retry-After may also arrive as an HTTP-date; that form falls back to
         # exponential backoff below.
         max_delay = self.rate_limit_max_delay
-        retry_after = resp.headers.get("retry-after")
+        retry_after = resp.headers.get("retry-after") if resp is not None else None
         if retry_after is not None:
             try:
                 requested_delay = float(retry_after)
@@ -179,13 +218,32 @@ class SquareClient:
         return merchant_id
 
     def list_webhook_subscriptions(self) -> list[dict]:
-        data = self._get("/v2/webhooks/subscriptions")
-        subscriptions = data.get("subscriptions", [])
-        if not isinstance(subscriptions, list) or any(
-            not isinstance(item, dict) for item in subscriptions
-        ):
-            raise SquareError("Square returned an invalid response")
-        return subscriptions
+        """Return all subscription pages within a defensive request bound."""
+        subscriptions: list[dict] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        for page_number in range(MAX_WEBHOOK_SUBSCRIPTION_PAGES):
+            params: dict = {"limit": WEBHOOK_SUBSCRIPTION_PAGE_SIZE}
+            if cursor:
+                params["cursor"] = cursor
+            data = self._get("/v2/webhooks/subscriptions", params=params)
+            subscriptions.extend(self._object_list(data, "subscriptions"))
+            next_cursor = data.get("cursor")
+            if next_cursor is not None and not isinstance(next_cursor, str):
+                raise SquareError("Square returned an invalid response")
+            if not next_cursor:
+                return subscriptions
+            if next_cursor in seen_cursors:
+                raise SquareError("Square returned a repeated pagination cursor")
+            seen_cursors.add(next_cursor)
+            if page_number + 1 >= MAX_WEBHOOK_SUBSCRIPTION_PAGES:
+                raise SquareError(
+                    "Square webhook subscription pagination exceeded safety limit"
+                )
+            cursor = next_cursor
+        raise SquareError(
+            "Square webhook subscription pagination exceeded safety limit"
+        )
 
     def create_webhook_subscription(
         self, name: str, notification_url: str, idempotency_key: str
@@ -202,6 +260,7 @@ class SquareClient:
                     "api_version": SQUARE_VERSION,
                 },
             },
+            retry_idempotent=True,
         )
         subscription = data.get("subscription")
         if not isinstance(subscription, dict):
@@ -223,6 +282,7 @@ class SquareClient:
                     "enabled": True,
                 }
             },
+            retry_idempotent=True,
         )
         subscription = data.get("subscription")
         if not isinstance(subscription, dict):

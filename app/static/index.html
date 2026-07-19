@@ -17,6 +17,13 @@
   </header>
 
   <main>
+    <!-- Startup error recovery -->
+    <section id="view-boot-error" hidden>
+      <h2>Could not load the application</h2>
+      <p id="boot-error-detail" role="alert"></p>
+      <button type="button" id="boot-retry">Try again</button>
+    </section>
+
     <!-- First-run setup -->
     <section id="view-setup" hidden>
       <h2>Create admin password</h2>
@@ -156,6 +163,12 @@
         <button type="submit">Save application</button>
         <button type="button" id="square-oauth-connect">Connect with Square</button>
       </form>
+      <div id="square-oauth-switch-warning" class="destructive-warning" role="alert" hidden>
+        <strong>Different Square account authorized.</strong>
+        <p>Confirming permanently erases the previous account's local transactions, thumbnails, observed POS devices, camera mappings, sync history, and saved Square webhook credentials.</p>
+        <button type="button" id="square-oauth-switch-confirm">Switch account and erase old data</button>
+        <button type="button" id="square-oauth-switch-cancel">Keep current account</button>
+      </div>
       <p class="hint"><strong>Option B — paste an access token manually:</strong></p>
       <form id="square-form">
         <label>Access token <input type="password" id="square-token" autocomplete="off" required></label>
@@ -202,7 +215,11 @@
       </div>
       <div class="toolbar">
         <h2>Transactions</h2>
-        <button id="sync-now">Sync now</button>
+        <div class="toolbar-actions">
+          <a id="export-csv" href="/api/transactions/export.csv"
+             download="square-protect-transactions.csv">Download CSV</a>
+          <button id="sync-now">Sync now</button>
+        </div>
       </div>
       <p class="hint">Click a thumbnail to open the UniFi Protect timeline at the moment of the transaction.</p>
       <p id="txn-last-updated" class="hint" role="status"></p>
@@ -218,11 +235,14 @@
   </main>
 
   <script src="/bootstrap-form.js"></script>
+  <script src="/boot-recovery.js"></script>
   <script src="/protect-console-switch.js"></script>
   <script src="/format.js"></script>
   <script src="/square-form.js"></script>
   <script src="/deep-link-form.js"></script>
+  <script src="/view-focus.js"></script>
   <script src="/settings-loader.js"></script>
+  <script src="/nav-view.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

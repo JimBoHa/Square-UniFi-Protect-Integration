@@ -19,7 +19,7 @@ from app.main import create_app
 from app.protect_client import ProtectClient
 from app.square_client import SquareClient, SquarePermissionError
 from app.store import Store
-from app.sync import ingest_payment, retry_missing_thumbnails
+from app.sync import Poller, ingest_payment, retry_missing_thumbnails
 
 from .conftest import (
     ADMIN_PASSWORD,
@@ -82,6 +82,99 @@ def _mutable_identity_protect_handler(identity: dict[str, str | None]):
         return httpx.Response(200, json=payload)
 
     return handler
+
+
+def test_shutdown_joins_background_work_before_closing_store(tmp_path, monkeypatch):
+    poll_started = threading.Event()
+    release_poll = threading.Event()
+    poll_finished = threading.Event()
+    executor_started = threading.Event()
+    release_executor = threading.Event()
+    executor_finished = threading.Event()
+    executor_shutdown_started = threading.Event()
+    store_closed = threading.Event()
+
+    monkeypatch.setattr(
+        "app.main.sync.Poller",
+        lambda sync_fn, interval_seconds: Poller(sync_fn, interval_seconds=0.001),
+    )
+    app = create_app(data_dir=tmp_path / "data", enable_poller=True)
+    store = app.state.store
+    original_cleanup = store.retry_orphan_thumbnail_cleanup
+    original_store_close = store.close
+    original_executor_shutdown = app.state.thumbnail_executor.shutdown
+    close_states = []
+
+    def blocking_cleanup() -> None:
+        poll_started.set()
+        assert release_poll.wait(timeout=10)
+        try:
+            original_cleanup()
+        finally:
+            poll_finished.set()
+
+    def blocking_executor_work() -> None:
+        executor_started.set()
+        assert release_executor.wait(timeout=10)
+        executor_finished.set()
+
+    def tracked_executor_shutdown(*args, **kwargs) -> None:
+        executor_shutdown_started.set()
+        original_executor_shutdown(*args, **kwargs)
+
+    def tracked_store_close() -> None:
+        close_states.append(
+            (app.state.poller._thread.is_alive(), executor_finished.is_set())
+        )
+        original_store_close()
+        store_closed.set()
+
+    monkeypatch.setattr(store, "retry_orphan_thumbnail_cleanup", blocking_cleanup)
+    monkeypatch.setattr(
+        app.state.thumbnail_executor, "shutdown", tracked_executor_shutdown
+    )
+    monkeypatch.setattr(store, "close", tracked_store_close)
+
+    client = TestClient(app)
+    client_entered = False
+    client.__enter__()
+    client_entered = True
+    shutdown_future = None
+    try:
+        assert poll_started.wait(timeout=3)
+        executor_future = app.state.thumbnail_executor.submit(blocking_executor_work)
+        assert executor_started.wait(timeout=3)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as shutdown_executor:
+            shutdown_future = shutdown_executor.submit(
+                client.__exit__, None, None, None
+            )
+            try:
+                assert app.state.poller._stop.wait(timeout=3)
+                assert not executor_shutdown_started.wait(timeout=0.1)
+                assert not store_closed.is_set()
+
+                release_poll.set()
+                assert poll_finished.wait(timeout=3)
+                assert executor_shutdown_started.wait(timeout=3)
+                assert not store_closed.is_set()
+
+                release_executor.set()
+                shutdown_future.result(timeout=3)
+                executor_future.result(timeout=3)
+            finally:
+                release_poll.set()
+                release_executor.set()
+                shutdown_future.result(timeout=3)
+    finally:
+        release_poll.set()
+        release_executor.set()
+        if shutdown_future is None and client_entered:
+            client.__exit__(None, None, None)
+        if not store_closed.is_set():
+            original_store_close()
+
+    assert store_closed.is_set()
+    assert close_states == [(False, True)]
 
 
 # -- setup / login flow ------------------------------------------------------------
@@ -976,6 +1069,7 @@ def test_protect_settings_malformed_camera_response_returns_502(tmp_path, malfor
                     "password": PROTECT_PASS,
                 },
             )
+            assert app.state.store.get_setting("protect.host") is None
 
         assert response.status_code == 502
         assert response.json()["detail"].startswith(
@@ -985,7 +1079,6 @@ def test_protect_settings_malformed_camera_response_returns_502(tmp_path, malfor
         assert "private camera item" not in response.text
         assert "private name" not in response.text
         assert "camera id" not in response.text
-        assert app.state.store.get_setting("protect.host") is None
     finally:
         app.state.store.close()
 
@@ -1038,6 +1131,7 @@ def test_square_settings_malformed_response_returns_502(tmp_path, malformed):
                 "/api/settings/square",
                 json={"access_token": SQUARE_TOKEN, "environment": "production"},
             )
+            assert app.state.store.get_setting("square.access_token") is None
 
         assert response.status_code == 502
         assert response.json()["detail"].startswith(
@@ -1046,7 +1140,6 @@ def test_square_settings_malformed_response_returns_502(tmp_path, malformed):
         assert "private Square body" not in response.text
         assert "private location item" not in response.text
         assert "private payment item" not in response.text
-        assert app.state.store.get_setting("square.access_token") is None
     finally:
         app.state.store.close()
 
@@ -2932,8 +3025,8 @@ def test_square_status_indicator_ui_wiring():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert 'api("/api/health/square")' in js
     assert "refreshSquareStatus" in js
     assert 'id="square-status"' in html
@@ -2993,8 +3086,8 @@ def test_protect_status_indicator_ui_wiring():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert 'api("/api/health/protect")' in js
     assert "refreshProtectStatus" in js
     assert 'id="protect-status"' in html
@@ -3029,8 +3122,8 @@ def test_dashboard_connected_with_webhook_freshness(configured):
     assert isinstance(data["webhook"]["last_event_ms"], int)
     assert data["queues"]["thumbnails_pending"] == 0
 
-def test_dashboard_counts_pending_queue_work(configured):
-    store = configured.app.state.store
+def test_dashboard_counts_pending_queue_work(authed):
+    store = authed.app.state.store
     store.upsert_transaction(
         {
             "id": "PAY_QUEUED_TILE",
@@ -3044,15 +3137,15 @@ def test_dashboard_counts_pending_queue_work(configured):
             "thumbnail_path": None,
         }
     )
-    data = configured.get("/api/dashboard").json()
+    data = authed.get("/api/dashboard").json()
     assert data["queues"]["thumbnails_pending"] == 1
 
 def test_dashboard_tiles_ui_wiring():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert 'api("/api/dashboard")' in js
     assert "startDashboardRefresh" in js
     for tile in ("protect", "square", "webhook", "queues"):

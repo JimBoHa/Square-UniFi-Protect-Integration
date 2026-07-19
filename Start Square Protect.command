@@ -40,11 +40,7 @@ if [ ! -x .venv/bin/python ]; then
   python3 -m venv .venv
 fi
 
-if ! .venv/bin/python -c 'import cryptography, fastapi, httpx, uvicorn' >/dev/null 2>&1; then
-  echo "Installing or repairing Python dependencies (about a minute)..."
-  .venv/bin/python -m pip install --quiet --upgrade pip
-  .venv/bin/python -m pip install --quiet -e .
-fi
+.venv/bin/python scripts/ensure_dependencies.py "$PWD" "$PWD/.venv"
 
 # Lets automated checks verify setup without starting a browser or server.
 [ "${SPI_LAUNCHER_SETUP_ONLY:-0}" = "1" ] && exit 0

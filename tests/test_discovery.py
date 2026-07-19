@@ -11,6 +11,11 @@ REAL_UNVR_RESPONSE = bytes.fromhex(
 )
 
 
+def _response(*tlvs: bytes) -> bytes:
+    payload = b"".join(tlvs)
+    return b"\x01\x00" + len(payload).to_bytes(2, "big") + payload
+
+
 def test_parse_real_unvr_response():
     device = parse_discovery_response(REAL_UNVR_RESPONSE, "10.255.7.91")
     assert device == {
@@ -28,16 +33,27 @@ def test_parse_rejects_garbage():
     assert parse_discovery_response(b"\xff" * 40, "10.0.0.1") is None
 
 def test_parse_accessory_is_not_console():
-    payload = b"\x01\x00\x00\x00" + bytes([0x0B, 0x00, 0x04]) + b"Gate" + bytes(
-        [0x0C, 0x00, 0x09]
-    ) + b"UFP-UAP-B"
+    payload = _response(
+        bytes([0x0B, 0x00, 0x04]) + b"Gate",
+        bytes([0x0C, 0x00, 0x09]) + b"UFP-UAP-B",
+    )
     device = parse_discovery_response(payload, "10.0.0.9")
     assert device["is_console"] is False
     assert device["model"] == "UFP-UAP-B"
 
 def test_truncated_tlv_does_not_crash():
-    payload = b"\x01\x00\x00\x00" + bytes([0x0B, 0x00, 0x40]) + b"short"
+    payload = _response(bytes([0x0B, 0x00, 0x40]) + b"short")
     assert parse_discovery_response(payload, "10.0.0.9") is None
+
+
+def test_parse_rejects_wrong_protocol_header_and_declared_length():
+    valid = _response(
+        bytes([0x0B, 0x00, 0x04]) + b"UNVR",
+        bytes([0x0C, 0x00, 0x04]) + b"UNVR",
+    )
+    assert parse_discovery_response(b"EV" + valid[2:], "10.0.0.9") is None
+    assert parse_discovery_response(valid[:2] + b"\x00\x00" + valid[4:], "10.0.0.9") is None
+    assert parse_discovery_response(valid[:-1], "10.0.0.9") is None
 
 def test_discover_endpoint_requires_auth(client):
     assert client.post("/api/discover/protect", json={}).status_code == 401
@@ -72,7 +88,7 @@ def test_discovery_ui_wiring():
     from pathlib import Path
 
     static_dir = Path(__file__).parent.parent / "app" / "static"
-    js = (static_dir / "app.js").read_text()
-    html = (static_dir / "index.html").read_text()
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
     assert 'id="protect-discover"' in html
     assert "/api/discover/protect" in js

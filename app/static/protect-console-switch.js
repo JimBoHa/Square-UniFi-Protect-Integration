@@ -1,5 +1,10 @@
 "use strict";
 
+function cameraMappingSelectId(containerId, locationId, deviceId = "") {
+  const target = JSON.stringify([String(locationId), String(deviceId || "")]);
+  return `${containerId}-camera-${encodeURIComponent(target)}`;
+}
+
 function protectConsoleSwitchTokenRequest(confirmationCheckbox, settings) {
   if (!confirmationCheckbox.checked) return null;
   return {
@@ -61,6 +66,7 @@ function clearProtectConsoleView(mappingRows, saveButton, previewWrap, previewIm
 
 if (typeof module !== "undefined") {
   module.exports = {
+    cameraMappingSelectId,
     protectConnectionMessage,
     protectConsoleSwitchTokenRequest,
     publishLatestSettingsLoad,

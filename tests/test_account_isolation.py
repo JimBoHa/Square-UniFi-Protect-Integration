@@ -886,8 +886,8 @@ def test_unidentified_legacy_thumbnail_requires_confirmation_and_cleanup(tmp_pat
 
 def test_account_switch_ui_reveals_destructive_confirmation_after_409():
     static_dir = Path(__file__).parents[1] / "app" / "static"
-    html = (static_dir / "index.html").read_text()
-    js = (static_dir / "app.js").read_text()
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    js = (static_dir / "app.js").read_text(encoding="utf-8")
 
     assert 'id="square-account-switch-warning"' in html
     assert 'role="alert" hidden' in html

@@ -6,6 +6,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const {
+  cameraMappingSelectId,
   protectConnectionMessage,
   protectConsoleSwitchTokenRequest,
   publishLatestSettingsLoad,
@@ -55,6 +56,42 @@ test("same-host refresh does not claim that evidence was cleared", () => {
   });
   assert.match(message, /Alarm trigger enabled/);
   assert.doesNotMatch(message, /cleared/);
+});
+
+test("camera mapping controls get stable globally unique ids", () => {
+  const settingsFallback = cameraMappingSelectId("mapping-rows", "LOC1", "");
+  assert.equal(
+    settingsFallback,
+    cameraMappingSelectId("mapping-rows", "LOC1", ""),
+  );
+  assert.notEqual(
+    settingsFallback,
+    cameraMappingSelectId("mapping-rows", "LOC1", "fallback"),
+  );
+  assert.notEqual(
+    settingsFallback,
+    cameraMappingSelectId("wiz-mapping-rows", "LOC1", ""),
+  );
+  assert.notEqual(
+    cameraMappingSelectId("mapping-rows", "LOC-1", "DEVICE-2"),
+    cameraMappingSelectId("mapping-rows", "LOC", "1-DEVICE-2"),
+  );
+  assert.doesNotMatch(settingsFallback, /\s/);
+});
+
+test("generated camera selects use their visible text as a label", () => {
+  const app = fs.readFileSync(
+    path.join(__dirname, "../app/static/app.js"),
+    "utf8",
+  );
+  const buildStart = app.indexOf("function buildMappingRows");
+  const buildEnd = app.indexOf("function collectMappings", buildStart);
+  const build = app.slice(buildStart, buildEnd);
+
+  assert.match(build, /const label = document\.createElement\("label"\)/);
+  assert.match(build, /select\.id = cameraMappingSelectId\(/);
+  assert.match(build, /label\.htmlFor = select\.id/);
+  assert.ok(build.indexOf("label.htmlFor = select.id") < build.indexOf("row.appendChild(label)"));
 });
 
 test("older settings load cannot publish cameras with a newer generation", async () => {
@@ -239,4 +276,44 @@ test("console-switch helper loads before the app entry point", () => {
     /if \(!settingsSnapshotsMatch\(settings\)\)[\s\S]*void loadSettingsView\(\)/,
   );
   assert.match(app, /Provider settings kept changing[\s\S]*Reload the page/);
+});
+
+test("wizard maps only a coherent provider snapshot with fenced headers", () => {
+  const app = fs.readFileSync(
+    path.join(__dirname, "../app/static/app.js"),
+    "utf8",
+  );
+  const loadStart = app.indexOf("async function loadWizardMapping");
+  const loadEnd = app.indexOf(
+    '$("#wiz-protect-form").addEventListener',
+    loadStart,
+  );
+  const load = app.slice(loadStart, loadEnd);
+  const coherenceCheck = load.indexOf("if (!settingsSnapshotsMatch(data))");
+  const render = load.indexOf('buildMappingRows($("#wiz-mapping-rows"), data)');
+  const squareToken = load.indexOf("wizardSquareAccountRevision = usable");
+  const protectToken = load.indexOf("wizardProtectConsoleGeneration = usable");
+
+  assert.ok(loadStart >= 0);
+  assert.ok(coherenceCheck >= 0);
+  assert.ok(render > coherenceCheck);
+  assert.ok(squareToken > coherenceCheck);
+  assert.ok(protectToken > coherenceCheck);
+
+  const saveStart = app.indexOf(
+    '$("#wiz-save-mapping").addEventListener',
+  );
+  const saveEnd = app.indexOf(
+    '$("#wiz-finish").addEventListener',
+    saveStart,
+  );
+  const save = app.slice(saveStart, saveEnd);
+  assert.match(
+    save,
+    /"X-Square-Account-Revision": wizardSquareAccountRevision/,
+  );
+  assert.match(
+    save,
+    /"X-Protect-Console-Generation": wizardProtectConsoleGeneration/,
+  );
 });

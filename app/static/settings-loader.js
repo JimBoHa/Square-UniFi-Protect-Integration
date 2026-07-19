@@ -1,14 +1,27 @@
 "use strict";
 
-function createLatestSettingsLoader(loadSettings, renderSettings) {
+function createLatestAsyncRenderer(loadValue, renderValue) {
   let latestRequest = 0;
-  return async function loadLatestSettings() {
+  return async function loadLatestValue() {
     const request = ++latestRequest;
-    const settings = await loadSettings();
+    const value = await loadValue();
     if (request !== latestRequest) return false;
-    renderSettings(settings);
+    renderValue(value);
     return true;
   };
 }
 
-if (typeof module !== "undefined") module.exports = { createLatestSettingsLoader };
+function createLatestSettingsLoader(loadSettings, renderSettings) {
+  return createLatestAsyncRenderer(loadSettings, renderSettings);
+}
+
+function createLatestStatusRefresher(loadStatus, renderStatus) {
+  return createLatestAsyncRenderer(loadStatus, renderStatus);
+}
+
+if (typeof module !== "undefined") {
+  module.exports = {
+    createLatestSettingsLoader,
+    createLatestStatusRefresher,
+  };
+}

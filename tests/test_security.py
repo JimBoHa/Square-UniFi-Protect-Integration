@@ -309,6 +309,7 @@ def test_webhook_rejects_oversized_content_length(configured):
 
     assert resp.status_code == 413
     assert resp.json()["detail"] == "Webhook payload too large"
+    assert resp.headers["cache-control"] == "private, no-store"
 
 
 @pytest.mark.parametrize("headers", [{}, {"content-length": "1"}])
@@ -325,6 +326,7 @@ def test_webhook_rejects_oversized_streamed_or_underdeclared_body(
 
     assert resp.status_code == 413
     assert resp.json()["detail"] == "Webhook payload too large"
+    assert resp.headers["cache-control"] == "private, no-store"
 
 
 @pytest.mark.parametrize(

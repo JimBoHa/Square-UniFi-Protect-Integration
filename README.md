@@ -205,8 +205,12 @@ default (verified on Protect 7.1.87):
   failures; sessions are random 256-bit tokens in `HttpOnly`/`SameSite` cookies.
 - **Webhooks verified** — Square's `x-square-hmacsha256-signature` is checked
   with a constant-time comparison; unsigned or forged deliveries are rejected,
-  request bodies are capped at 1 MiB, and the endpoint is disabled until a
-  signature key is configured.
+  and the endpoint is disabled until a signature key is configured.
+- **Request bodies bounded** — general HTTP requests are capped at 1 MiB before
+  routing, authentication, or JSON parsing, including streamed/chunked bodies;
+  this leaves ample room for the maximum 500-entry camera mapping. Square
+  webhooks retain their dedicated 1 MiB streaming/HMAC cap, while transaction
+  search uses a tighter auth-first streaming cap.
 - **Input validation** — Protect host and camera ids are strictly validated
   (no URL/path injection), thumbnail serving is confined to the thumbnail
   directory, and the frontend renders all server data as text, never markup.

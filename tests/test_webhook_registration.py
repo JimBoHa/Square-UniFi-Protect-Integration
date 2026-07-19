@@ -1,13 +1,18 @@
 """Automatic Square webhook subscription registration."""
 
+import concurrent.futures
+import inspect
 import json
+import threading
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.store import SquareAccountChanged, SquareAccountSwitchRequired, Store
 
+from . import conftest as test_fixtures
 from .conftest import (
     ADMIN_PASSWORD,
     PROTECT_PASS,
@@ -18,6 +23,10 @@ from .conftest import (
 )
 
 SIGNATURE_KEY = "whsec_auto_registered_123"
+ACCOUNT_A_TOKEN = "registration-token-account-a"
+ACCOUNT_B_TOKEN = "registration-token-account-b"
+ACCOUNT_A_MERCHANT = "REGISTRATION_MERCHANT_A"
+ACCOUNT_B_MERCHANT = "REGISTRATION_MERCHANT_B"
 
 
 def make_registration_square(state):
@@ -134,6 +143,161 @@ def test_register_requires_auth(client):
         json={"notification_url": "https://shop.example.com/webhooks/square"},
     )
     assert resp.status_code == 401
+
+
+def test_blocked_registration_cannot_cross_confirmed_account_switch(tmp_path):
+    registration_started = threading.Event()
+    release_registration = threading.Event()
+    state = {"created": False}
+
+    def blocked_square(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("authorization") == f"Bearer {ACCOUNT_A_TOKEN}"
+        if (
+            request.url.path == "/v2/webhooks/subscriptions"
+            and request.method == "GET"
+        ):
+            registration_started.set()
+            assert release_registration.wait(timeout=5)
+            return httpx.Response(200, json={"subscriptions": []})
+        if (
+            request.url.path == "/v2/webhooks/subscriptions"
+            and request.method == "POST"
+        ):
+            state["created"] = True
+            return httpx.Response(
+                200,
+                json={
+                    "subscription": {
+                        "id": "SUB_ACCOUNT_A",
+                        "signature_key": SIGNATURE_KEY,
+                    }
+                },
+            )
+        return httpx.Response(404)
+
+    data_dir = tmp_path / "data"
+    create_options = dict(
+        data_dir=data_dir,
+        square_transport=httpx.MockTransport(blocked_square),
+        enable_poller=False,
+    )
+    if "tls_enabled" in inspect.signature(create_app).parameters:
+        create_options["tls_enabled"] = True
+    app = create_app(**create_options)
+    app_store = app.state.store
+    second_store = Store(data_dir)
+    app_store.configure_square_account(
+        merchant_id=ACCOUNT_A_MERCHANT,
+        access_token=ACCOUNT_A_TOKEN,
+        environment="production",
+    )
+    account_a_revision = app_store.square_account_revision()
+    assert account_a_revision
+    with pytest.raises(SquareAccountSwitchRequired) as challenge:
+        second_store.configure_square_account(
+            merchant_id=ACCOUNT_B_MERCHANT,
+            access_token=ACCOUNT_B_TOKEN,
+            environment="sandbox",
+        )
+
+    try:
+        with TestClient(app) as client:
+            setup_body = {"password": ADMIN_PASSWORD}
+            bootstrap_secret = getattr(test_fixtures, "BOOTSTRAP_SECRET", None)
+            if bootstrap_secret:
+                setup_body["bootstrap_secret"] = bootstrap_secret
+            assert client.post(
+                "/api/setup", json=setup_body
+            ).status_code == 200
+            assert client.post(
+                "/api/login", json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                registration = executor.submit(
+                    client.post,
+                    "/api/settings/square/webhook/register",
+                    json={
+                        "notification_url": (
+                            "https://account-a.example/webhooks/square"
+                        )
+                    },
+                )
+                assert registration_started.wait(timeout=5)
+                switch = executor.submit(
+                    second_store.configure_square_account,
+                    merchant_id=ACCOUNT_B_MERCHANT,
+                    access_token=ACCOUNT_B_TOKEN,
+                    environment="sandbox",
+                    confirm_account_switch=True,
+                    account_switch_confirmation_token=(
+                        challenge.value.confirmation_token
+                    ),
+                )
+                switched = switch.result(timeout=2)
+                assert switched.switched
+                release_registration.set()
+                response = registration.result(timeout=5)
+
+        assert state["created"]
+        assert response.status_code == 409
+        assert second_store.get_setting("square.merchant_id") == ACCOUNT_B_MERCHANT
+        assert second_store.get_setting("square.access_token") == ACCOUNT_B_TOKEN
+        assert second_store.get_setting("square.environment") == "sandbox"
+        assert second_store.square_account_revision() != account_a_revision
+        assert second_store.get_setting("square.webhook_signature_key") is None
+        assert second_store.get_setting("square.webhook_url") is None
+    finally:
+        release_registration.set()
+        second_store.close()
+        app_store.close()
+
+
+@pytest.mark.parametrize(
+    ("changed_key", "changed_value", "secret"),
+    (
+        ("square.merchant_id", ACCOUNT_B_MERCHANT, False),
+        ("square.environment", "sandbox", False),
+        ("square.account_revision", "replacement-revision", False),
+        ("square.access_token", ACCOUNT_B_TOKEN, True),
+    ),
+)
+def test_webhook_commit_rejects_each_changed_square_identity_field(
+    tmp_path, changed_key, changed_value, secret
+):
+    data_dir = tmp_path / "data"
+    first = Store(data_dir)
+    second = Store(data_dir)
+    try:
+        first.configure_square_account(
+            merchant_id=ACCOUNT_A_MERCHANT,
+            access_token=ACCOUNT_A_TOKEN,
+            environment="production",
+        )
+        snapshot = first.get_settings(
+            (
+                "square.merchant_id",
+                "square.environment",
+                "square.account_revision",
+                "square.access_token",
+            )
+        )
+        second.set_setting(changed_key, changed_value, secret=secret)
+
+        with pytest.raises(SquareAccountChanged):
+            first.update_square_webhook_settings(
+                SIGNATURE_KEY,
+                "https://account-a.example/webhooks/square",
+                expected_merchant_id=snapshot["square.merchant_id"],
+                expected_environment=snapshot["square.environment"] or "production",
+                expected_account_revision=snapshot["square.account_revision"],
+                expected_access_token=snapshot["square.access_token"] or "",
+            )
+
+        assert second.get_setting("square.webhook_signature_key") is None
+        assert second.get_setting("square.webhook_url") is None
+    finally:
+        first.close()
+        second.close()
 
 
 def test_register_ui_wiring():

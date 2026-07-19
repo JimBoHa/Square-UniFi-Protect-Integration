@@ -37,12 +37,16 @@ def test_linux_service_uses_builtin_tls_for_its_remote_dashboard(tmp_path):
         fake_bin / "sudo",
         "#!/bin/sh\n"
         'if [ "$1" = "tee" ]; then cat > "$UNIT_CAPTURE"; exit 0; fi\n'
+        'if [ "$1" = "systemctl" ]; then '
+        'printf "%s\\n" "$*" >> "$SYSTEMCTL_CAPTURE"; exit 0; fi\n'
         "exit 0\n",
     )
     unit_path = tmp_path / "square-protect.service"
+    systemctl_path = tmp_path / "systemctl-calls"
     environment = {
         **os.environ,
         "PATH": f"{fake_bin}{os.pathsep}/usr/bin:/bin",
+        "SYSTEMCTL_CAPTURE": str(systemctl_path),
         "UNIT_CAPTURE": str(unit_path),
         "USER": "square-protect-test",
     }
@@ -65,6 +69,10 @@ def test_linux_service_uses_builtin_tls_for_its_remote_dashboard(tmp_path):
     assert "https://<this-host>:8000" in result.stdout
     assert "journalctl -u square-protect" in result.stdout
     assert "http://<this-host>:8000" not in result.stdout
+    systemctl_calls = systemctl_path.read_text(encoding="utf-8").splitlines()
+    assert "systemctl enable square-protect" in systemctl_calls
+    assert "systemctl restart square-protect" in systemctl_calls
+    assert "systemctl enable --now square-protect" not in systemctl_calls
 
 
 def test_linux_service_instructions_match_the_secure_unit():

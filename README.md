@@ -120,7 +120,7 @@ Open `http://<host>:8000`, then:
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
-| `SPI_DATA_DIR` | `./data` | SQLite DB, encryption key, thumbnails |
+| `SPI_DATA_DIR` | `./data` | SQLite DB, encryption key/HMAC salt, thumbnails |
 | `SPI_PORT` | `8000` | Port used by `Start Square Protect.command` |
 | `SPI_POLL_INTERVAL` | `60` | Seconds between Square polls |
 | `SPI_DISABLE_POLLER` | `0` | Set `1` to disable background polling |

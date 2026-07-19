@@ -7,8 +7,15 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
+BASH = Path("/bin/bash")
+pytestmark = pytest.mark.skipif(
+    not BASH.is_file() or not os.access(BASH, os.X_OK),
+    reason="requires executable /bin/bash",
+)
 
 
 def test_launcher_repairs_incomplete_existing_environment(tmp_path):
@@ -34,7 +41,7 @@ def test_launcher_repairs_incomplete_existing_environment(tmp_path):
     }
 
     result = subprocess.run(
-        ["/bin/bash", str(launcher)],
+        [str(BASH), str(launcher)],
         cwd=tmp_path,
         env=environment,
         capture_output=True,

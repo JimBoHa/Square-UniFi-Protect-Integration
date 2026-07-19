@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 import datetime
+import io
 import json
 import logging
 import math
@@ -78,6 +80,38 @@ SQUARE_ACCOUNT_SWITCH_CODE = "square_account_switch_confirmation_required"
 MAX_CAMERA_MAPPINGS = 500
 PRIVATE_NO_STORE = "private, no-store"
 MIN_POLL_INTERVAL_SECONDS = 1.0
+TRANSACTION_EXPORT_HEADERS = (
+    "transaction_id",
+    "timestamp",
+    "amount_minor_units",
+    "currency",
+    "status",
+    "location_id",
+    "device_id",
+    "device_name",
+    "card_last4",
+    "receipt_url",
+    "protect_timeline_url",
+)
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+def _safe_csv_cell(value: object) -> str:
+    """Return spreadsheet-safe text while preserving RFC 4180 line endings."""
+    text = "" if value is None else str(value)
+    text = (
+        text.replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\n", "\r\n")
+    )
+    formula_candidate = text.lstrip()
+    if formula_candidate.startswith("\ufeff"):
+        formula_candidate = formula_candidate[1:].lstrip()
+    if text.startswith(("\t", "\r", "\n")) or formula_candidate.startswith(
+        CSV_FORMULA_PREFIXES
+    ):
+        return f"'{text}"
+    return text
 
 
 def _parse_poll_interval(value: str) -> float:
@@ -1385,6 +1419,58 @@ def create_app(
             "webhook": webhook,
             "queues": queues,
         }
+
+    @app.get("/api/transactions/export.csv")
+    def export_transactions(_=authed) -> Response:
+        with store.integration_guard():
+            transactions = store.list_transaction_export_facts()
+            protect_settings = store.get_settings(
+                ("protect.host", "deep_link_template")
+            )
+            host = protect_settings["protect.host"]
+            template = protect_settings["deep_link_template"]
+            output = io.StringIO(newline="")
+            writer = csv.writer(output, lineterminator="\r\n")
+            writer.writerow(TRANSACTION_EXPORT_HEADERS)
+            for transaction in transactions:
+                timeline_url = ""
+                if host and transaction.get("camera_id"):
+                    try:
+                        timeline_url = deeplink.build_deep_link(
+                            host,
+                            transaction["camera_id"],
+                            transaction["ts_ms"],
+                            template=template,
+                        )
+                    except ValueError:
+                        timeline_url = ""
+                writer.writerow(
+                    (
+                        _safe_csv_cell(transaction["id"]),
+                        _safe_csv_cell(transaction["created_at"]),
+                        transaction["amount"],
+                        _safe_csv_cell(transaction["currency"]),
+                        _safe_csv_cell(transaction["status"]),
+                        _safe_csv_cell(transaction["location_id"]),
+                        _safe_csv_cell(transaction["device_id"]),
+                        _safe_csv_cell(transaction["device_name"]),
+                        _safe_csv_cell(transaction["card_last4"]),
+                        _safe_csv_cell(transaction["receipt_url"]),
+                        _safe_csv_cell(timeline_url),
+                    )
+                )
+            # Build the complete body before releasing the provider-state guard;
+            # streaming it later could mix old evidence with a new console URL.
+            return Response(
+                content=output.getvalue(),
+                media_type="text/csv",
+                headers={
+                    "Cache-Control": PRIVATE_NO_STORE,
+                    "Content-Disposition": (
+                        'attachment; filename="square-protect-transactions.csv"'
+                    ),
+                },
+            )
 
     @app.get("/api/transactions")
     def transactions(

@@ -2289,6 +2289,16 @@ class Store:
         rows, _snapshot_id = self.list_transactions_page(limit, offset)
         return rows
 
+    def list_transaction_export_facts(self) -> list[dict]:
+        """Return all CSV facts without loading raw payloads or evidence paths."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, created_at, ts_ms, amount, currency, status, "
+                "location_id, device_id, device_name, card_last4, receipt_url, "
+                "camera_id FROM transactions ORDER BY ts_ms DESC, id DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_observed_devices(self) -> list[dict]:
         with self._lock:
             rows = self._db.execute(

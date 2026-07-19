@@ -43,14 +43,21 @@ def parse_discovery_response(data: bytes, source_ip: str) -> dict | None:
     """Parse one TLV discovery response into a device description."""
     if len(data) < 8:
         return None
+    if data[:2] != DISCOVERY_PROBE[:2]:
+        return None
+    declared_payload_length = struct.unpack(">H", data[2:4])[0]
+    if declared_payload_length != len(data) - 4:
+        return None
     device: dict = {"ip": source_ip}
     index = 4
-    while index + 3 <= len(data):
+    while index < len(data):
+        if index + 3 > len(data):
+            return None
         tlv_type = data[index]
         length = struct.unpack(">H", data[index + 1 : index + 3])[0]
         value = data[index + 3 : index + 3 + length]
         if len(value) != length:
-            break
+            return None
         if tlv_type == _TLV_FRIENDLY_NAME:
             device["name"] = value.decode(errors="replace")
         elif tlv_type == _TLV_HOSTNAME:

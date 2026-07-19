@@ -13,6 +13,7 @@ let transactionOffset = 0;
 let transactionHasNext = false;
 let transactionPageCount = 0;
 let transactionSnapshot = null;
+let transactionFilters = normalizeTransactionFilters("", "");
 let lastTransactionPayload = null;
 let settingsLoadGeneration = 0;
 let squareAccountSwitchConfirmationToken = "";
@@ -690,17 +691,25 @@ function updateTransactionPagination(loading = false) {
     const last = transactionOffset + transactionPageCount;
     const oldest = transactionHasNext ? "" : " · oldest reached";
     const paused = transactionOffset > 0 ? " · auto-refresh paused" : "";
-    status.textContent = `Showing transactions ${first}–${last}${oldest}${paused}`;
+    const noun = transactionFiltersActive(transactionFilters)
+      ? "matches"
+      : "transactions";
+    status.textContent = `Showing ${noun} ${first}–${last}${oldest}${paused}`;
   }
 }
 
-function renderTransactions(txns) {
+function renderTransactions(
+  txns,
+  filtered = transactionFiltersActive(transactionFilters),
+) {
   const list = $("#txn-list");
   list.textContent = "";
   if (!txns.length) {
     const p = document.createElement("p");
     p.className = "hint";
-    p.textContent = "No transactions yet. Connect Square, then press “Sync now”.";
+    p.textContent = filtered
+      ? "No transactions match these filters."
+      : "No transactions yet. Connect Square, then press “Sync now”.";
     list.appendChild(p);
     return;
   }
@@ -746,17 +755,32 @@ function renderTransactions(txns) {
     amount.textContent = formatAmount(txn.amount, txn.currency);
 
     const meta = document.createElement("div");
+    meta.className = "txn-details";
     const when = document.createElement("div");
     when.className = "meta";
     when.textContent = new Date(txn.ts_ms).toLocaleString();
     const card = document.createElement("div");
     card.className = "meta";
     card.textContent = txn.card_last4 ? `Card •••• ${txn.card_last4}` : "";
+    const source = document.createElement("div");
+    source.className = "meta";
+    const deviceLabel = txn.device_name && txn.device_id
+      ? `${txn.device_name} (${txn.device_id})`
+      : txn.device_name || txn.device_id;
+    source.textContent = [
+      deviceLabel,
+      txn.location_id,
+    ].filter(Boolean).join(" · ");
+    const transactionId = document.createElement("div");
+    transactionId.className = "meta transaction-id";
+    transactionId.textContent = `ID ${txn.id}`;
     const status = document.createElement("div");
     status.className = "status";
     status.textContent = txn.status;
     meta.appendChild(when);
     meta.appendChild(card);
+    meta.appendChild(source);
+    meta.appendChild(transactionId);
     meta.appendChild(status);
 
     row.appendChild(thumb);
@@ -835,6 +859,7 @@ async function loadTransactions({
     return;
   }
   transactionLoadInFlight = true;
+  const requestedFilters = transactionFilters;
   updateTransactionPagination(true);
   let page = null;
   let pageSnapshot = null;
@@ -842,9 +867,11 @@ async function loadTransactions({
     const snapshotParam = requestedOffset > 0 && transactionSnapshot !== null
       ? `&snapshot=${encodeURIComponent(transactionSnapshot)}`
       : "";
+    const filterQuery = transactionFilterQuery(requestedFilters);
+    const filterParam = filterQuery ? `&${filterQuery}` : "";
     const result = await api(
       `/api/transactions?limit=${TRANSACTION_PAGE_SIZE + 1}` +
-        `&offset=${requestedOffset}${snapshotParam}`,
+        `&offset=${requestedOffset}${snapshotParam}${filterParam}`,
       { includeResponse: true },
     );
     page = result.data;
@@ -882,11 +909,12 @@ async function loadTransactions({
         offset: transactionOffset,
         snapshot: transactionSnapshot,
         hasNext: transactionHasNext,
+        filters: requestedFilters,
         transactions: txns,
       });
       if (payload !== lastTransactionPayload) {
         lastTransactionPayload = payload;
-        renderTransactions(txns);
+        renderTransactions(txns, transactionFiltersActive(requestedFilters));
       }
     }
   }
@@ -909,6 +937,38 @@ $("#txn-prev").addEventListener("click", () => {
 $("#txn-next").addEventListener("click", () => {
   if (transactionLoadInFlight || !transactionHasNext) return;
   void loadTransactions({ offset: transactionOffset + TRANSACTION_PAGE_SIZE });
+});
+
+function applyTransactionFilters(filters) {
+  transactionFilters = filters;
+  transactionOffset = 0;
+  transactionSnapshot = null;
+  transactionHasNext = false;
+  transactionPageCount = 0;
+  lastTransactionPayload = null;
+  renderTransactions([], transactionFiltersActive(filters));
+  updateTransactionPagination(false);
+  void loadTransactions({ reset: true });
+}
+
+$("#txn-filter-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const nextFilters = normalizeTransactionFilters(
+    $("#txn-query").value,
+    $("#txn-status-filter").value,
+  );
+  if (nextFilters.query.length > TRANSACTION_QUERY_MAX_LENGTH) {
+    message("Transaction search is limited to 64 characters.", "error");
+    return;
+  }
+  applyTransactionFilters(nextFilters);
+});
+
+$("#txn-filter-clear").addEventListener("click", () => {
+  $("#txn-query").value = "";
+  $("#txn-status-filter").value = "";
+  applyTransactionFilters(normalizeTransactionFilters("", ""));
+  $("#txn-query").focus();
 });
 
 $("#sync-now").addEventListener("click", async () => {

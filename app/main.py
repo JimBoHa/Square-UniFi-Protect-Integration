@@ -12,8 +12,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -48,6 +49,7 @@ from .store import (
     SquareAccountSwitchRequired,
     Store,
     TransactionSnapshotExpired,
+    TransactionSnapshotFilterMismatch,
 )
 
 logger = logging.getLogger("spi")
@@ -166,6 +168,15 @@ class CameraMappingBody(BaseModel):
 
 class DeepLinkSettingsBody(BaseModel):
     template: str = Field(default="", max_length=2048)
+
+
+TransactionStatusFilter = Literal[
+    "APPROVED",
+    "PENDING",
+    "COMPLETED",
+    "CANCELED",
+    "FAILED",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -1392,16 +1403,33 @@ def create_app(
 
     @app.get("/api/transactions")
     def transactions(
-        limit: int = 50,
-        offset: int = 0,
-        snapshot: int | None = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 50,
+        offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
+        snapshot: Annotated[int | None, Query(ge=1, le=(1 << 63) - 1)] = None,
+        q: Annotated[str, Query(max_length=64)] = "",
+        status: TransactionStatusFilter | None = None,
         _=authed,
     ) -> JSONResponse:
+        if any(ord(character) < 32 or ord(character) == 127 for character in q):
+            raise HTTPException(
+                status_code=422,
+                detail="Search query cannot contain control characters",
+            )
+        q = q.strip()
         with store.integration_guard():
             try:
                 rows, transaction_snapshot = store.list_transactions_page(
-                    limit, offset, snapshot
+                    limit,
+                    offset,
+                    snapshot,
+                    query=q,
+                    status=status or "",
                 )
+            except TransactionSnapshotFilterMismatch as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Transaction filters changed; return to the newest page",
+                ) from exc
             except TransactionSnapshotExpired as exc:
                 raise HTTPException(
                     status_code=409,

@@ -19,6 +19,7 @@ from app.store import (
     ProtectSettingsConflict,
     Store,
     TransactionSnapshotExpired,
+    TransactionSnapshotFilterMismatch,
 )
 from app.sync import (
     ingest_payment,
@@ -1438,6 +1439,91 @@ def test_store_migrates_legacy_fields_and_scrubs_raw_payment(tmp_path):
         "transaction_feed_snapshots",
         "transaction_feed_state",
     }
+
+
+def test_store_migrates_unfiltered_snapshot_to_filter_bound_schema(tmp_path):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    store.upsert_transaction(
+        {
+            "id": "PAY_LEGACY_SNAPSHOT",
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "ts_ms": 100,
+            "amount": 100,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+        }
+    )
+    _page, legacy_snapshot = store.list_transactions_page(limit=1)
+    store.close()
+
+    # Recreate the immediately previous release's snapshot table exactly.
+    db = sqlite3.connect(data_dir / "spi.db")
+    db.executescript(
+        """
+        DROP TRIGGER invalidate_transaction_feed_after_delete;
+        DROP INDEX idx_transaction_feed_snapshots_access;
+        ALTER TABLE transaction_feed_snapshots
+            RENAME TO transaction_feed_snapshots_current;
+        CREATE TABLE transaction_feed_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_revision INTEGER NOT NULL,
+            rowid_boundary INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            last_accessed_at REAL NOT NULL,
+            UNIQUE (order_revision, rowid_boundary)
+        );
+        INSERT INTO transaction_feed_snapshots (
+            id, order_revision, rowid_boundary, created_at, last_accessed_at
+        )
+        SELECT id, order_revision, rowid_boundary, created_at, last_accessed_at
+        FROM transaction_feed_snapshots_current;
+        DROP TABLE transaction_feed_snapshots_current;
+        """
+    )
+    db.commit()
+    db.close()
+
+    reopened = Store(data_dir)
+    try:
+        durable, same_snapshot = reopened.list_transactions_page(
+            limit=1,
+            snapshot_id=legacy_snapshot,
+        )
+        filtered, filtered_snapshot = reopened.list_transactions_page(
+            limit=1,
+            query="legacy_snapshot",
+        )
+        signatures = [
+            row["filter_signature"]
+            for row in reopened._db.execute(
+                "SELECT filter_signature FROM transaction_feed_snapshots "
+                "ORDER BY id"
+            ).fetchall()
+        ]
+        with pytest.raises(TransactionSnapshotFilterMismatch):
+            reopened.list_transactions_page(
+                limit=1,
+                snapshot_id=filtered_snapshot,
+                query="different",
+            )
+        still_valid, _ = reopened.list_transactions_page(
+            limit=1,
+            snapshot_id=filtered_snapshot,
+            query="legacy_snapshot",
+        )
+    finally:
+        reopened.close()
+
+    assert [row["id"] for row in durable] == ["PAY_LEGACY_SNAPSHOT"]
+    assert same_snapshot == legacy_snapshot
+    assert filtered_snapshot != legacy_snapshot
+    assert [row["id"] for row in filtered] == ["PAY_LEGACY_SNAPSHOT"]
+    assert [row["id"] for row in still_valid] == ["PAY_LEGACY_SNAPSHOT"]
+    assert signatures[0] == ""
+    assert len(signatures[1]) == 64
+    assert "legacy_snapshot" not in signatures[1]
 
 
 def test_stale_event_with_old_timestamp_cannot_overwrite_thumbnail_file(tmp_path):

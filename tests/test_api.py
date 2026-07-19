@@ -1375,6 +1375,212 @@ def test_transaction_snapshot_keeps_offset_pages_stable_during_inserts(authed):
     assert all(not txn["id"].startswith("PAY_NEW_") for txn in next_page)
 
 
+def test_transaction_feed_searches_only_normalized_local_fields(authed):
+    store = authed.app.state.store
+    common = {
+        "created_at": "2026-07-16T15:30:00.000Z",
+        "amount": 100,
+        "currency": "USD",
+    }
+    store.upsert_transaction(
+        {
+            **common,
+            "id": "PAY_FIND_ID",
+            "ts_ms": 200,
+            "status": "PENDING",
+            "location_id": "LOC-WEST",
+            "device_id": "TERM-7",
+            "device_name": "Front Register",
+            "card_last4": "4242",
+        }
+    )
+    store.upsert_transaction(
+        {
+            **common,
+            "id": "PAY_DECOY",
+            "ts_ms": 100,
+            "status": "COMPLETED",
+            "location_id": "LOC-EAST",
+            "device_id": "TERM-8",
+            "device_name": "Warehouse POS",
+            "card_last4": "1111",
+        }
+    )
+    store.upsert_transaction(
+        {
+            **common,
+            "id": "PAY_100%_REAL",
+            "ts_ms": 50,
+            "status": "FAILED",
+            "location_id": "LOC-SPECIAL",
+        }
+    )
+    store.upsert_transaction(
+        {
+            **common,
+            "id": "PAY_100XXREAL",
+            "ts_ms": 40,
+            "status": "FAILED",
+            "location_id": "LOC-SPECIAL",
+        }
+    )
+
+    for query in (
+        "find_id",
+        "4242",
+        "term-7",
+        "front register",
+        "loc-west",
+        "pending",
+    ):
+        response = authed.get("/api/transactions", params={"q": query})
+        assert response.status_code == 200, response.text
+        assert [transaction["id"] for transaction in response.json()] == [
+            "PAY_FIND_ID"
+        ]
+
+    filtered = authed.get(
+        "/api/transactions",
+        params={"q": "register", "status": "PENDING"},
+    )
+    assert [transaction["id"] for transaction in filtered.json()] == [
+        "PAY_FIND_ID"
+    ]
+    assert authed.get(
+        "/api/transactions", params={"status": "APPROVED"}
+    ).json() == []
+
+    # LIKE metacharacters stay literal and injection-shaped input remains data.
+    literal = authed.get("/api/transactions", params={"q": "100%_"})
+    assert [transaction["id"] for transaction in literal.json()] == [
+        "PAY_100%_REAL"
+    ]
+    injected = authed.get(
+        "/api/transactions", params={"q": "%' OR 1=1 --"}
+    )
+    assert injected.status_code == 200
+    assert injected.json() == []
+    assert store.get_transaction("PAY_FIND_ID") is not None
+
+
+@pytest.mark.parametrize(
+    "params",
+    (
+        {"q": "x" * 65},
+        {"q": "front\nregister"},
+        {"status": "REFUNDED"},
+        {"limit": 0},
+        {"limit": 501},
+        {"offset": -1},
+        {"offset": 1_000_001},
+        {"snapshot": 0},
+    ),
+)
+def test_transaction_filters_reject_unbounded_or_invalid_queries(authed, params):
+    response = authed.get("/api/transactions", params=params)
+
+    assert response.status_code == 422
+
+
+def test_filtered_transaction_snapshot_cannot_mix_queries_or_new_rows(authed):
+    store = authed.app.state.store
+    created_at = "2026-07-16T15:30:00.000Z"
+
+    def transaction(txn_id: str, ts_ms: int, name: str = "Front Register") -> dict:
+        return {
+            "id": txn_id,
+            "created_at": created_at,
+            "ts_ms": ts_ms,
+            "amount": 100,
+            "currency": "USD",
+            "status": "COMPLETED",
+            "location_id": "LOC1",
+            "device_id": txn_id,
+            "device_name": name,
+        }
+
+    for txn_id, ts_ms in (("A", 500), ("B", 400), ("C", 300), ("D", 200)):
+        store.upsert_transaction(transaction(txn_id, ts_ms))
+
+    first = authed.get(
+        "/api/transactions",
+        params={"limit": 2, "q": "register", "status": "COMPLETED"},
+    )
+    snapshot = first.headers["x-transaction-snapshot"]
+    assert [row["id"] for row in first.json()] == ["A", "B"]
+
+    store.upsert_transaction(transaction("NEW", 600))
+    mismatch = authed.get(
+        "/api/transactions",
+        params={"limit": 2, "offset": 2, "snapshot": snapshot, "q": "warehouse"},
+    )
+    assert mismatch.status_code == 409
+    assert "filters changed" in mismatch.json()["detail"]
+
+    second = authed.get(
+        "/api/transactions",
+        params={
+            "limit": 2,
+            "offset": 2,
+            "snapshot": snapshot,
+            "q": "register",
+            "status": "COMPLETED",
+        },
+    )
+    assert second.status_code == 200, second.text
+    assert [row["id"] for row in second.json()] == ["C", "D"]
+    assert {row["id"] for row in first.json()}.isdisjoint(
+        row["id"] for row in second.json()
+    )
+
+    refreshed = authed.get(
+        "/api/transactions",
+        params={"limit": 2, "q": "register", "status": "COMPLETED"},
+    )
+    assert [row["id"] for row in refreshed.json()] == ["NEW", "A"]
+
+
+def test_filtered_snapshot_expires_when_existing_row_changes_membership(authed):
+    store = authed.app.state.store
+    transaction = {
+        "id": "PAY_STATUS_CHANGE",
+        "created_at": "2026-07-16T15:30:00.000Z",
+        "updated_at": "2026-07-16T15:30:00.000Z",
+        "updated_ts_ms": 1,
+        "ts_ms": 100,
+        "amount": 100,
+        "currency": "USD",
+        "status": "PENDING",
+        "location_id": "LOC1",
+        "device_name": "Front Register",
+    }
+    store.upsert_transaction(transaction)
+    first = authed.get(
+        "/api/transactions", params={"limit": 1, "status": "PENDING"}
+    )
+    snapshot = first.headers["x-transaction-snapshot"]
+
+    store.upsert_transaction(
+        {
+            **transaction,
+            "updated_ts_ms": 2,
+            "status": "COMPLETED",
+        }
+    )
+    stale = authed.get(
+        "/api/transactions",
+        params={
+            "limit": 1,
+            "offset": 1,
+            "snapshot": snapshot,
+            "status": "PENDING",
+        },
+    )
+
+    assert stale.status_code == 409
+    assert "return to the newest page" in stale.json()["detail"]
+
+
 def test_transaction_snapshot_keeps_timestamp_corrections_in_original_order(authed):
     store = authed.app.state.store
 

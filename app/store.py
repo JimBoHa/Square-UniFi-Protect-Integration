@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -32,6 +33,10 @@ SESSION_TTL_SECONDS = 12 * 3600
 TRANSACTION_SNAPSHOT_TTL_SECONDS = SESSION_TTL_SECONDS
 MAX_TRANSACTION_SNAPSHOTS = 8
 MAX_TRANSACTION_ORDER_HISTORY = 10_000
+MAX_TRANSACTION_SEARCH_LENGTH = 64
+TRANSACTION_FILTER_STATUSES = frozenset(
+    {"APPROVED", "PENDING", "COMPLETED", "CANCELED", "FAILED"}
+)
 ALARM_IDLE = "idle"
 ALARM_IN_PROGRESS = "in_progress"
 ALARM_SENT = "sent"
@@ -124,6 +129,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     alarm_claimed_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_transactions_ts ON transactions (ts_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_status_ts
+    ON transactions (status, ts_ms DESC, id DESC);
 CREATE TABLE IF NOT EXISTS square_poll_watermarks (
     location_id TEXT PRIMARY KEY,
     polled_through_ms INTEGER NOT NULL CHECK (polled_through_ms >= 0)
@@ -138,9 +145,10 @@ CREATE TABLE IF NOT EXISTS transaction_feed_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     order_revision INTEGER NOT NULL,
     rowid_boundary INTEGER NOT NULL,
+    filter_signature TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     last_accessed_at REAL NOT NULL,
-    UNIQUE (order_revision, rowid_boundary)
+    UNIQUE (order_revision, rowid_boundary, filter_signature)
 );
 CREATE INDEX IF NOT EXISTS idx_transaction_feed_snapshots_access
     ON transaction_feed_snapshots (last_accessed_at DESC, id DESC);
@@ -185,6 +193,57 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 class TransactionSnapshotExpired(Exception):
     """Requested transaction-feed ordering snapshot is no longer retained."""
+
+
+class TransactionSnapshotFilterMismatch(Exception):
+    """Requested transaction-feed snapshot belongs to different filters."""
+
+
+def _transaction_filter(
+    query: str,
+    status: str,
+) -> tuple[str, str, tuple[str, ...]]:
+    """Return filter signature, fixed SQL, and bound parameters."""
+    query = str(query)
+    status = str(status).strip().upper()
+    if len(query) > MAX_TRANSACTION_SEARCH_LENGTH or any(
+        ord(character) < 32 or ord(character) == 127 for character in query
+    ):
+        raise ValueError("Invalid transaction search query")
+    query = query.strip()
+    if status and status not in TRANSACTION_FILTER_STATUSES:
+        raise ValueError("Invalid transaction status filter")
+
+    if not query and not status:
+        return "", "", ()
+    signature = hashlib.sha256(
+        json.dumps([query, status], ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    clauses: list[str] = []
+    parameters: list[str] = []
+    if query:
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        fields = (
+            "t.id",
+            "t.card_last4",
+            "t.device_id",
+            "t.device_name",
+            "t.location_id",
+            "t.status",
+        )
+        clauses.append(
+            "(" + " OR ".join(
+                f"{field} LIKE ? ESCAPE '\\' COLLATE NOCASE" for field in fields
+            ) + ")"
+        )
+        parameters.extend(pattern for _field in fields)
+    if status:
+        clauses.append("t.status = ?")
+        parameters.append(status)
+    return signature, " AND " + " AND ".join(clauses), tuple(parameters)
 
 
 def _windows_try_lock_byte(fd: int, offset: int) -> bool:
@@ -306,6 +365,7 @@ class Store:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 self._migrate_transactions()
+                self._migrate_transaction_feed_snapshots()
                 self._migrate_schema()
                 # Legacy releases kept the complete Square Payment JSON so
                 # device metadata could be backfilled later. The schema
@@ -552,6 +612,68 @@ class Store:
                 "TEXT NOT NULL DEFAULT ''"
             )
         self._backfill_transaction_devices()
+
+    def _migrate_transaction_feed_snapshots(self) -> None:
+        """Bind upgraded paging snapshots to one canonical filter set."""
+        columns = {
+            row["name"]
+            for row in self._db.execute(
+                "PRAGMA table_info(transaction_feed_snapshots)"
+            ).fetchall()
+        }
+        if "filter_signature" in columns:
+            return
+
+        # SQLite cannot extend the existing UNIQUE constraint in place. Keep
+        # unfiltered snapshot ids valid while rebuilding the small bounded
+        # table with filter_signature included in its identity.
+        self._db.execute("DROP TRIGGER IF EXISTS invalidate_transaction_feed_after_delete")
+        self._db.execute("DROP INDEX IF EXISTS idx_transaction_feed_snapshots_access")
+        self._db.execute(
+            "ALTER TABLE transaction_feed_snapshots "
+            "RENAME TO transaction_feed_snapshots_legacy"
+        )
+        self._db.execute(
+            """
+            CREATE TABLE transaction_feed_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_revision INTEGER NOT NULL,
+                rowid_boundary INTEGER NOT NULL,
+                filter_signature TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                last_accessed_at REAL NOT NULL,
+                UNIQUE (order_revision, rowid_boundary, filter_signature)
+            )
+            """
+        )
+        self._db.execute(
+            """
+            INSERT INTO transaction_feed_snapshots (
+                id, order_revision, rowid_boundary, filter_signature,
+                created_at, last_accessed_at
+            )
+            SELECT id, order_revision, rowid_boundary, '', created_at, last_accessed_at
+            FROM transaction_feed_snapshots_legacy
+            """
+        )
+        self._db.execute("DROP TABLE transaction_feed_snapshots_legacy")
+        self._db.execute(
+            "CREATE INDEX idx_transaction_feed_snapshots_access "
+            "ON transaction_feed_snapshots (last_accessed_at DESC, id DESC)"
+        )
+        self._db.execute(
+            """
+            CREATE TRIGGER invalidate_transaction_feed_after_delete
+            AFTER DELETE ON transactions
+            BEGIN
+                DELETE FROM transaction_feed_snapshots;
+                DELETE FROM transaction_feed_order_history;
+                UPDATE transaction_feed_state
+                SET order_revision = order_revision + 1
+                WHERE singleton = 1;
+            END
+            """
+        )
 
     def _backfill_transaction_devices(self) -> None:
         rows = self._db.execute(
@@ -1570,8 +1692,8 @@ class Store:
                     values["thumbnail_path"] = None
                     values["replace_evidence"] = 0
                 existing = self._db.execute(
-                    "SELECT id, camera_id, ts_ms, updated_ts_ms, device_id, "
-                    "thumbnail_path, status "
+                    "SELECT id, camera_id, ts_ms, updated_ts_ms, status, "
+                    "location_id, device_id, device_name, card_last4, thumbnail_path "
                     "FROM transactions WHERE id = ?",
                     (txn["id"],),
                 ).fetchone()
@@ -1644,9 +1766,35 @@ class Store:
                         (txn["id"],),
                     )
                 current = self._db.execute(
-                    "SELECT camera_id, ts_ms, thumbnail_path FROM transactions WHERE id = ?",
+                    "SELECT camera_id, ts_ms, status, location_id, device_id, "
+                    "device_name, card_last4, thumbnail_path "
+                    "FROM transactions WHERE id = ?",
                     (txn["id"],),
                 ).fetchone()
+                filter_membership_changed = bool(
+                    existing
+                    and current
+                    and applied.rowcount == 1
+                    and any(
+                        existing[field] != current[field]
+                        for field in (
+                            "status",
+                            "location_id",
+                            "device_id",
+                            "device_name",
+                            "card_last4",
+                        )
+                    )
+                )
+                if filter_membership_changed:
+                    # Search membership changed inside an existing rowid
+                    # boundary. Expire filtered tokens instead of letting an
+                    # OFFSET page repeat or skip a row; unfiltered tokens are
+                    # unaffected because every retained row still belongs.
+                    self._db.execute(
+                        "DELETE FROM transaction_feed_snapshots "
+                        "WHERE filter_signature != ''"
+                    )
                 timestamp_changed = bool(
                     existing
                     and current
@@ -2173,11 +2321,18 @@ class Store:
         limit: int = 50,
         offset: int = 0,
         snapshot_id: int | None = None,
+        *,
+        query: str = "",
+        status: str = "",
     ) -> tuple[list[dict], int]:
-        """List a page in the durable chronological order of one snapshot."""
+        """List one filter-bound page in a durable chronological snapshot."""
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
+        filter_signature, filter_sql, filter_parameters = _transaction_filter(
+            query, status
+        )
         expired = False
+        filter_mismatch = False
         rows: list[sqlite3.Row] = []
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
@@ -2197,15 +2352,16 @@ class Store:
                     rowid_boundary = int(boundary["rowid"])
                     snapshot = self._db.execute(
                         "SELECT * FROM transaction_feed_snapshots "
-                        "WHERE order_revision = ? AND rowid_boundary = ?",
-                        (revision, rowid_boundary),
+                        "WHERE order_revision = ? AND rowid_boundary = ? "
+                        "AND filter_signature = ?",
+                        (revision, rowid_boundary, filter_signature),
                     ).fetchone()
                     if snapshot is None:
                         cursor = self._db.execute(
                             "INSERT INTO transaction_feed_snapshots "
-                            "(order_revision, rowid_boundary, created_at, "
-                            "last_accessed_at) VALUES (?, ?, ?, ?)",
-                            (revision, rowid_boundary, now, now),
+                            "(order_revision, rowid_boundary, filter_signature, "
+                            "created_at, last_accessed_at) VALUES (?, ?, ?, ?, ?)",
+                            (revision, rowid_boundary, filter_signature, now, now),
                         )
                         snapshot_id = int(cursor.lastrowid)
                         snapshot = self._db.execute(
@@ -2232,8 +2388,10 @@ class Store:
                             self._delete_transaction_snapshots_locked([snapshot_id])
                         self._prune_transaction_snapshots_locked(now)
                         expired = True
+                    elif snapshot["filter_signature"] != filter_signature:
+                        filter_mismatch = True
 
-                if not expired:
+                if not expired and not filter_mismatch:
                     self._db.execute(
                         "UPDATE transaction_feed_snapshots "
                         "SET last_accessed_at = ? WHERE id = ?",
@@ -2244,7 +2402,7 @@ class Store:
                     ):
                         expired = True
 
-                if not expired:
+                if not expired and not filter_mismatch:
                     has_later_timestamp_change = self._db.execute(
                         "SELECT 1 FROM transaction_feed_order_history "
                         "WHERE order_revision > ? LIMIT 1",
@@ -2255,7 +2413,7 @@ class Store:
                             "SELECT t.*, COALESCE(r.attempts, 0) AS thumbnail_retry_attempts "
                             "FROM transactions t LEFT JOIN thumbnail_retries r "
                             "ON r.transaction_id = t.id "
-                            "WHERE t.rowid <= ? "
+                            "WHERE t.rowid <= ? " + filter_sql + " "
                             "ORDER BY COALESCE((SELECT h.ts_ms "
                             "FROM transaction_feed_order_history h "
                             "WHERE h.transaction_id = t.id "
@@ -2264,6 +2422,7 @@ class Store:
                             "t.id DESC LIMIT ? OFFSET ?",
                             (
                                 snapshot["rowid_boundary"],
+                                *filter_parameters,
                                 snapshot["order_revision"],
                                 limit,
                                 offset,
@@ -2274,8 +2433,14 @@ class Store:
                             "SELECT t.*, COALESCE(r.attempts, 0) AS thumbnail_retry_attempts "
                             "FROM transactions t LEFT JOIN thumbnail_retries r "
                             "ON r.transaction_id = t.id WHERE t.rowid <= ? "
+                            + filter_sql + " "
                             "ORDER BY t.ts_ms DESC, t.id DESC LIMIT ? OFFSET ?",
-                            (snapshot["rowid_boundary"], limit, offset),
+                            (
+                                snapshot["rowid_boundary"],
+                                *filter_parameters,
+                                limit,
+                                offset,
+                            ),
                         ).fetchall()
                 self._db.commit()
             except Exception:
@@ -2283,6 +2448,10 @@ class Store:
                 raise
         if expired:
             raise TransactionSnapshotExpired("Transaction page snapshot expired")
+        if filter_mismatch:
+            raise TransactionSnapshotFilterMismatch(
+                "Transaction page snapshot belongs to different filters"
+            )
         return [dict(r) for r in rows], int(snapshot_id)
 
     def list_transactions(self, limit: int = 50, offset: int = 0) -> list[dict]:

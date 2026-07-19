@@ -72,8 +72,9 @@ async function api(path, options = {}) {
 
 async function boot() {
   const oauthOutcome = new URLSearchParams(window.location.search).get("square_oauth");
-  if (oauthOutcome === "connected") {
-    message("Square account connected via OAuth.", "ok");
+  const oauthFeedback = squareOAuthResultFeedback(window.location.search);
+  if (oauthFeedback) {
+    message(oauthFeedback.text, oauthFeedback.kind);
     window.history.replaceState({}, "", "/");
   } else if (oauthOutcome === "switch_required") {
     $("#square-oauth-switch-warning").hidden = false;

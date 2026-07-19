@@ -45,6 +45,17 @@ SQUARE_OAUTH_APP_SETTING_KEYS = (
     "square.oauth_client_secret",
     "square.oauth_environment",
 )
+SQUARE_OAUTH_TOKEN_SETTING_KEYS = (
+    "square.refresh_token",
+    "square.token_expires_at",
+)
+SQUARE_OAUTH_AUTHORIZATION_REVISION_SETTING = (
+    "square.oauth_authorization_revision"
+)
+SQUARE_OAUTH_PRESERVED_SETTING_KEYS = (
+    *SQUARE_OAUTH_APP_SETTING_KEYS,
+    SQUARE_OAUTH_AUTHORIZATION_REVISION_SETTING,
+)
 SQUARE_OAUTH_PENDING_SETTING_KEYS = (
     "square.oauth_pending_access_token",
     "square.oauth_pending_refresh_token",
@@ -53,9 +64,10 @@ SQUARE_OAUTH_PENDING_SETTING_KEYS = (
     "square.oauth_pending_environment",
     "square.oauth_pending_confirmation_token",
     "square.oauth_pending_created_at",
+    "square.oauth_pending_authorization_revision",
 )
 SQUARE_INSTALLATION_SETTING_KEYS = (
-    *SQUARE_OAUTH_APP_SETTING_KEYS,
+    *SQUARE_OAUTH_PRESERVED_SETTING_KEYS,
     *SQUARE_OAUTH_PENDING_SETTING_KEYS,
     "square.oauth_state",
     # Legacy releases saved this before a merchant was connected. By itself it
@@ -67,7 +79,10 @@ PROTECT_CONSOLE_GENERATION_SETTING = "protect.console_generation"
 PROTECT_CONSOLE_ID_SETTING = "protect.console_id"
 PROTECT_SWITCH_TOKEN_TTL_SECONDS = 5 * 60
 ORPHAN_THUMBNAIL_CLEANUP_SETTING = "maintenance.orphan_thumbnail_cleanup_pending"
+SQUARE_OAUTH_STATE_TTL_SECONDS = 10 * 60
+MAX_PENDING_SQUARE_OAUTH_STATES = 16
 _NO_EXPECTED_PROTECT_HOST = object()
+_NO_EXPECTED_SQUARE_OAUTH_AUTHORIZATION_REVISION = object()
 
 # Windows' msvcrt backend offers only exclusive byte-range locks. A short-lived
 # gate plus independent reader slots provides shared-reader/exclusive-writer
@@ -203,6 +218,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
     expires_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS square_oauth_states (
+    state_hash TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_square_oauth_states_expiry
+    ON square_oauth_states (expires_at);
 """
 
 
@@ -355,6 +377,11 @@ class Store:
                     "AND t.camera_id IS NOT NULL AND t.thumbnail_path IS NULL)"
                 )
                 self._release_expired_alarm_claims_locked()
+                # The former single plaintext state had no issue time. It
+                # cannot be migrated safely into the expiring, hashed store.
+                self._db.execute(
+                    "DELETE FROM settings WHERE key = 'square.oauth_state'"
+                )
                 if self._db.execute(
                     "SELECT 1 FROM settings WHERE key LIKE 'square.%' LIMIT 1"
                 ).fetchone() and not self._db.execute(
@@ -1090,6 +1117,93 @@ class Store:
             )
             self._db.commit()
 
+    def create_square_oauth_state(self, state: str) -> None:
+        """Retain one hashed, expiring OAuth state within a bounded set."""
+        if not state:
+            raise ValueError("OAuth state cannot be empty")
+        now = time.time()
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                self._db.execute(
+                    "DELETE FROM square_oauth_states WHERE expires_at <= ?",
+                    (now,),
+                )
+                self._db.execute(
+                    "INSERT INTO square_oauth_states "
+                    "(state_hash, created_at, expires_at) VALUES (?, ?, ?)",
+                    (
+                        hash_session_token(state),
+                        now,
+                        now + SQUARE_OAUTH_STATE_TTL_SECONDS,
+                    ),
+                )
+                self._db.execute(
+                    "DELETE FROM square_oauth_states WHERE state_hash IN ("
+                    "SELECT state_hash FROM square_oauth_states "
+                    "ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?)",
+                    (MAX_PENDING_SQUARE_OAUTH_STATES,),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def consume_square_oauth_state(self, state: str) -> bool:
+        """Atomically consume one unexpired OAuth state exactly once."""
+        if not state:
+            return False
+        now = time.time()
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                self._db.execute(
+                    "DELETE FROM square_oauth_states WHERE expires_at <= ?",
+                    (now,),
+                )
+                cursor = self._db.execute(
+                    "DELETE FROM square_oauth_states "
+                    "WHERE state_hash = ? AND expires_at > ?",
+                    (hash_session_token(state), now),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return cursor.rowcount == 1
+
+    def update_square_oauth_grant(
+        self,
+        expected_authorization_revision: str | None,
+        updates: dict[str, tuple[str, bool]],
+    ) -> bool:
+        """Persist an OAuth grant unless a manual token superseded its flow."""
+        stored_updates = [
+            (key, self.cipher.encrypt(value) if secret else value, int(secret))
+            for key, (value, secret) in updates.items()
+        ]
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                current_revision = self._setting_value_locked(
+                    SQUARE_OAUTH_AUTHORIZATION_REVISION_SETTING
+                )
+                if current_revision != expected_authorization_revision:
+                    self._db.commit()
+                    return False
+                self._db.executemany(
+                    "INSERT INTO settings (key, value, encrypted) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                    "encrypted=excluded.encrypted",
+                    stored_updates,
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return True
+
     def _setting_value_locked(self, key: str) -> str | None:
         row = self._db.execute(
             "SELECT value, encrypted FROM settings WHERE key = ?", (key,)
@@ -1219,6 +1333,10 @@ class Store:
         oauth_refresh_token: str | None = None,
         oauth_token_expires_at: str | None = None,
         clear_oauth_pending: bool = False,
+        clear_oauth_token_metadata: bool = False,
+        expected_oauth_authorization_revision: str | None | object = (
+            _NO_EXPECTED_SQUARE_OAUTH_AUTHORIZATION_REVISION
+        ),
     ) -> SquareAccountConfiguration:
         """Configure one merchant while excluding cross-process account work."""
         with self.integration_guard(exclusive=True):
@@ -1236,6 +1354,10 @@ class Store:
                 oauth_refresh_token=oauth_refresh_token,
                 oauth_token_expires_at=oauth_token_expires_at,
                 clear_oauth_pending=clear_oauth_pending,
+                clear_oauth_token_metadata=clear_oauth_token_metadata,
+                expected_oauth_authorization_revision=(
+                    expected_oauth_authorization_revision
+                ),
             )
             revision = self.square_account_revision()
             if revision is None:
@@ -1262,6 +1384,10 @@ class Store:
         oauth_refresh_token: str | None = None,
         oauth_token_expires_at: str | None = None,
         clear_oauth_pending: bool = False,
+        clear_oauth_token_metadata: bool = False,
+        expected_oauth_authorization_revision: str | None | object = (
+            _NO_EXPECTED_SQUARE_OAUTH_AUTHORIZATION_REVISION
+        ),
     ) -> bool:
         """Save Square credentials and atomically isolate a changed account.
 
@@ -1269,6 +1395,9 @@ class Store:
         account. Database evidence is removed in the same transaction as the
         credential change. Files cannot participate in SQLite transactions,
         so unreferenced thumbnails are removed only after a successful commit.
+        ``clear_oauth_token_metadata`` marks a pasted token as the active
+        authorization, invalidates pending OAuth callbacks, and retains
+        installation-wide OAuth app credentials.
         """
         if bool(webhook_signature_key) != bool(webhook_url):
             raise ValueError(
@@ -1295,6 +1424,16 @@ class Store:
             updates.append(
                 ("square.token_expires_at", oauth_token_expires_at, 0)
             )
+        if clear_oauth_token_metadata:
+            # Fence callbacks which already consumed their one-time state and
+            # are still exchanging a code while this token is being selected.
+            updates.append(
+                (
+                    SQUARE_OAUTH_AUTHORIZATION_REVISION_SETTING,
+                    secrets.token_urlsafe(24),
+                    0,
+                )
+            )
         if webhook_signature_key is not None and webhook_url is not None:
             updates.extend(
                 (
@@ -1311,6 +1450,17 @@ class Store:
         with self._lock:
             try:
                 self._db.execute("BEGIN IMMEDIATE")
+                if (
+                    expected_oauth_authorization_revision
+                    is not _NO_EXPECTED_SQUARE_OAUTH_AUTHORIZATION_REVISION
+                    and self._setting_value_locked(
+                        SQUARE_OAUTH_AUTHORIZATION_REVISION_SETTING
+                    )
+                    != expected_oauth_authorization_revision
+                ):
+                    raise SquareAccountChanged(
+                        "Square authorization changed while OAuth was in progress"
+                    )
                 current_merchant_id = self._setting_value_locked(
                     "square.merchant_id"
                 )
@@ -1373,13 +1523,13 @@ class Store:
                     # OAuth application credentials belong to this installation,
                     # not to one merchant. Keep them so an explicitly confirmed
                     # merchant switch does not disconnect the OAuth application.
-                    oauth_app_placeholders = ", ".join(
-                        "?" for _ in SQUARE_OAUTH_APP_SETTING_KEYS
+                    preserved_oauth_placeholders = ", ".join(
+                        "?" for _ in SQUARE_OAUTH_PRESERVED_SETTING_KEYS
                     )
                     self._db.execute(
                         "DELETE FROM settings WHERE key LIKE 'square.%' "
-                        f"AND key NOT IN ({oauth_app_placeholders})",
-                        SQUARE_OAUTH_APP_SETTING_KEYS,
+                        f"AND key NOT IN ({preserved_oauth_placeholders})",
+                        SQUARE_OAUTH_PRESERVED_SETTING_KEYS,
                     )
                     self._db.execute(
                         "INSERT INTO settings (key, value, encrypted) VALUES (?, '1', 0) "
@@ -1397,6 +1547,25 @@ class Store:
                         "DELETE FROM settings WHERE key = ?",
                         ((key,) for key in SQUARE_OAUTH_PENDING_SETTING_KEYS),
                     )
+                if clear_oauth_token_metadata:
+                    self._db.executemany(
+                        "DELETE FROM settings WHERE key = ?",
+                        (
+                            (key,)
+                            for key in (
+                                *SQUARE_OAUTH_TOKEN_SETTING_KEYS,
+                                *SQUARE_OAUTH_PENDING_SETTING_KEYS,
+                            )
+                        ),
+                    )
+                    # A pasted token is an explicit authorization choice. Stop
+                    # callbacks which have not consumed their state; the
+                    # revision written below fences those already in flight.
+                    # Keep the legacy key for databases opened by old workers.
+                    self._db.execute(
+                        "DELETE FROM settings WHERE key = 'square.oauth_state'"
+                    )
+                    self._db.execute("DELETE FROM square_oauth_states")
 
                 if switched or self._setting_value_locked(
                     SQUARE_ACCOUNT_REVISION_SETTING
@@ -1461,6 +1630,58 @@ class Store:
 
     def square_account_revision(self) -> str | None:
         return self.get_setting(SQUARE_ACCOUNT_REVISION_SETTING)
+
+    def update_square_webhook_settings(
+        self,
+        signature_key: str,
+        notification_url: str,
+        *,
+        expected_merchant_id: str | None,
+        expected_environment: str,
+        expected_account_revision: str | None,
+        expected_access_token: str,
+    ) -> None:
+        """Save a webhook only if its Square credential snapshot is current."""
+        stored_signature_key = self.cipher.encrypt(signature_key)
+        with self.integration_guard(exclusive=True):
+            with self._lock:
+                try:
+                    self._db.execute("BEGIN IMMEDIATE")
+                    current_environment = self._setting_value_locked(
+                        "square.environment"
+                    ) or "production"
+                    if (
+                        self._setting_value_locked("square.merchant_id")
+                        != expected_merchant_id
+                        or current_environment != expected_environment
+                        or self._setting_value_locked(
+                            SQUARE_ACCOUNT_REVISION_SETTING
+                        )
+                        != expected_account_revision
+                        or self._setting_value_locked("square.access_token")
+                        != expected_access_token
+                    ):
+                        raise SquareAccountChanged(
+                            "Square account or credentials changed while work "
+                            "was in progress"
+                        )
+                    self._db.executemany(
+                        "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                        "encrypted=excluded.encrypted",
+                        (
+                            (
+                                "square.webhook_signature_key",
+                                stored_signature_key,
+                                1,
+                            ),
+                            ("square.webhook_url", notification_url, 0),
+                        ),
+                    )
+                    self._db.commit()
+                except Exception:
+                    self._db.rollback()
+                    raise
 
     # -- camera mapping ----------------------------------------------------
 

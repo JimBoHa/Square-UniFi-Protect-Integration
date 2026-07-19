@@ -17,8 +17,23 @@ import uvicorn
 
 from .tls import uvicorn_tls_kwargs
 
+PORT_ERROR = "SPI_PORT must be a whole number from 1 to 65535"
+
+
+def _parse_listen_port(value: str) -> int:
+    if not value or not value.isascii() or not value.isdigit():
+        raise ValueError(PORT_ERROR)
+    port = int(value, 10)
+    if not 1 <= port <= 65535:
+        raise ValueError(PORT_ERROR)
+    return port
+
 
 def main() -> None:
+    try:
+        port = _parse_listen_port(os.environ.get("SPI_PORT", "8000"))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
     data_dir = Path(os.environ.get("SPI_DATA_DIR", "./data"))
     tls_enabled = os.environ.get("SPI_TLS", "0") == "1"
     if tls_enabled:
@@ -31,7 +46,7 @@ def main() -> None:
     uvicorn.run(
         create_app(data_dir=data_dir),
         host=os.environ.get("SPI_HOST", "0.0.0.0"),
-        port=int(os.environ.get("SPI_PORT", "8000")),
+        port=port,
         log_level="info",
         **uvicorn_tls_kwargs(data_dir, tls_enabled),
     )

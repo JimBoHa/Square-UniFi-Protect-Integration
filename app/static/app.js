@@ -19,9 +19,14 @@ let squareAccountSwitchConfirmationToken = "";
 let squareAccountRevision = "";
 let cameraMappingGeneration = "";
 
-function show(viewId) {
-  for (const sec of document.querySelectorAll("main > section")) sec.hidden = true;
-  $(viewId).hidden = false;
+function show(viewId, focusHeading = true) {
+  const view = $(viewId);
+  activateViewState(
+    document.querySelectorAll("main > section"),
+    view,
+    document.querySelectorAll("nav button[data-view]"),
+  );
+  if (focusHeading) focusViewHeading(view);
 }
 
 function message(text, kind) {
@@ -147,8 +152,6 @@ $("#logout-btn").addEventListener("click", async () => {
 
 for (const btn of document.querySelectorAll("nav button[data-view]")) {
   btn.addEventListener("click", () => {
-    for (const b of document.querySelectorAll("nav button[data-view]"))
-      b.classList.toggle("active", b === btn);
     show(`#view-${btn.dataset.view}`);
     if (btn.dataset.view === "transactions") loadTransactions();
     if (btn.dataset.view === "settings") loadSettingsView();
@@ -927,15 +930,20 @@ $("#sync-now").addEventListener("click", async () => {
 const WIZARD_SKIP_KEY = "spi-wizard-skipped";
 
 function showWizardStep(step) {
-  show("#view-wizard");
+  show("#view-wizard", false);
   $("#nav").hidden = false;
-  for (const el of document.querySelectorAll(".wiz-step"))
-    el.hidden = el.dataset.step !== String(step);
+  let activeStep = null;
+  for (const el of document.querySelectorAll(".wiz-step")) {
+    const active = el.dataset.step === String(step);
+    el.hidden = !active;
+    if (active) activeStep = el;
+  }
   for (const dot of document.querySelectorAll(".wiz-dot")) {
     const dotStep = Number(dot.dataset.step);
     dot.className = "wiz-dot" +
       (dotStep < step ? " done" : dotStep === step ? " active" : "");
   }
+  focusViewHeading(activeStep);
 }
 
 async function maybeStartWizard() {

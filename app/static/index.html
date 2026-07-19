@@ -23,6 +23,14 @@
       <p>This password protects the integration's settings and transaction feed.</p>
       <form id="setup-form">
         <label>Password (min 8 chars) <input type="password" id="setup-password" minlength="8" required></label>
+        <label>One-time bootstrap secret
+          <input type="password" id="setup-bootstrap-secret" minlength="32"
+                 maxlength="4096" required autocomplete="off"
+                 aria-describedby="setup-bootstrap-help">
+        </label>
+        <p id="setup-bootstrap-help" class="hint">Enter the secret printed once in the
+          server console at startup, or the <code>SPI_BOOTSTRAP_SECRET</code> value configured
+          before the server starts. Setup from another device also requires built-in HTTPS.</p>
         <button type="submit">Create</button>
       </form>
     </section>
@@ -209,6 +217,7 @@
     <p id="message" role="status"></p>
   </main>
 
+  <script src="/bootstrap-form.js"></script>
   <script src="/protect-console-switch.js"></script>
   <script src="/format.js"></script>
   <script src="/square-form.js"></script>

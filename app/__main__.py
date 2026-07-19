@@ -2,8 +2,11 @@
 
 Environment:
   SPI_PORT       listen port (default 8000)
-  SPI_HOST       bind address (default 0.0.0.0)
+  SPI_HOST       bind address (default 127.0.0.1)
   SPI_DATA_DIR   data directory (default ./data)
+  SPI_BOOTSTRAP_SECRET
+                 optional random secret (32+ characters) for first setup;
+                 otherwise one is generated and printed once at startup
   SPI_TLS        "1" serves HTTPS with an auto-generated self-signed
                  certificate and enables Secure session cookies
 """
@@ -35,6 +38,7 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
     data_dir = Path(os.environ.get("SPI_DATA_DIR", "./data"))
+    host = os.environ.get("SPI_HOST", "127.0.0.1")
     tls_enabled = os.environ.get("SPI_TLS", "0") == "1"
     if tls_enabled:
         # HTTPS makes Secure session cookies safe to require.
@@ -44,8 +48,8 @@ def main() -> None:
     from .main import create_app  # after env adjustments
 
     uvicorn.run(
-        create_app(data_dir=data_dir),
-        host=os.environ.get("SPI_HOST", "0.0.0.0"),
+        create_app(data_dir=data_dir, bind_host=host, tls_enabled=tls_enabled),
+        host=host,
         port=port,
         log_level="info",
         **uvicorn_tls_kwargs(data_dir, tls_enabled),

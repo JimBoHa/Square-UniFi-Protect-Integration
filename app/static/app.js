@@ -111,11 +111,22 @@ async function enterAppOrWizard() {
 
 $("#setup-form").addEventListener("submit", async (e) => {
   e.preventDefault();
+  const bootstrapSecret = $("#setup-bootstrap-secret").value;
+  const transportError = bootstrapTransportError(window.location);
+  if (transportError) {
+    message(transportError, "error");
+    return;
+  }
   try {
     await api("/api/setup", {
       method: "POST",
-      body: JSON.stringify({ password: $("#setup-password").value }),
+      body: JSON.stringify({
+        password: $("#setup-password").value,
+        bootstrap_secret: bootstrapSecret,
+      }),
     });
+    $("#setup-password").value = "";
+    $("#setup-bootstrap-secret").value = "";
     message("Admin password created. Please log in.", "ok");
     show("#view-login");
   } catch (err) {

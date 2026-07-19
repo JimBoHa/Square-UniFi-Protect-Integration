@@ -34,6 +34,7 @@ from .conftest import (
     SQUARE_MERCHANT_ID,
     WEBHOOK_KEY,
     WEBHOOK_URL,
+    bootstrap_setup_body,
     protect_handler,
     square_handler,
 )
@@ -95,20 +96,20 @@ def test_status_reports_setup_state(client):
     }
 
 def test_setup_then_login(client):
-    assert client.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+    assert client.post("/api/setup", json=bootstrap_setup_body()).status_code == 200
     assert client.get("/api/status").json()["setup_complete"] is True
     resp = client.post("/api/login", json={"password": ADMIN_PASSWORD})
     assert resp.status_code == 200
     assert client.get("/api/camera-mapping").status_code == 200
 
 def test_setup_rejects_short_password(client):
-    assert client.post("/api/setup", json={"password": "short"}).status_code == 422
+    assert client.post("/api/setup", json=bootstrap_setup_body("short")).status_code == 422
 
 def test_concurrent_setup_has_single_winner(client):
     passwords = ("first-admin-password", "second-admin-password")
 
     def setup(password: str):
-        return password, client.post("/api/setup", json={"password": password})
+        return password, client.post("/api/setup", json=bootstrap_setup_body(password))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(setup, passwords))
@@ -120,7 +121,7 @@ def test_concurrent_setup_has_single_winner(client):
     assert client.post("/api/login", json={"password": loser}).status_code == 401
 
 def test_login_wrong_password(client):
-    client.post("/api/setup", json={"password": ADMIN_PASSWORD})
+    client.post("/api/setup", json=bootstrap_setup_body())
     assert client.post("/api/login", json={"password": "wrong-password"}).status_code == 401
 
 def test_logout_invalidates_session(authed):
@@ -252,9 +253,13 @@ def test_console_switch_token_rejects_source_change_during_target_probe(tmp_path
         enable_poller=False,
     )
     try:
-        with TestClient(app) as client:
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as client:
             assert client.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=bootstrap_setup_body()
             ).status_code == 200
             assert client.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}
@@ -312,9 +317,13 @@ def test_same_host_console_identity_change_requires_target_bound_consent(tmp_pat
         enable_poller=False,
     )
     try:
-        with TestClient(app) as client:
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as client:
             assert client.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=bootstrap_setup_body()
             ).status_code == 200
             assert client.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}
@@ -373,9 +382,13 @@ def test_missing_previously_bound_console_identity_requires_confirmed_reset(tmp_
         enable_poller=False,
     )
     try:
-        with TestClient(app) as client:
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as client:
             assert client.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=bootstrap_setup_body()
             ).status_code == 200
             assert client.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}
@@ -865,8 +878,12 @@ def test_protect_settings_transport_error_returns_502(tmp_path):
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
-            assert isolated.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
+            assert isolated.post("/api/setup", json=bootstrap_setup_body()).status_code == 200
             assert isolated.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
             resp = isolated.put(
                 "/api/settings/protect",
@@ -896,8 +913,12 @@ def test_square_settings_transport_error_returns_502(tmp_path):
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
-            assert isolated.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
+            assert isolated.post("/api/setup", json=bootstrap_setup_body()).status_code == 200
             assert isolated.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
             resp = isolated.put(
                 "/api/settings/square",
@@ -936,9 +957,13 @@ def test_protect_settings_malformed_camera_response_returns_502(tmp_path, malfor
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
             assert isolated.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=bootstrap_setup_body()
             ).status_code == 200
             assert isolated.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}
@@ -998,9 +1023,13 @@ def test_square_settings_malformed_response_returns_502(tmp_path, malformed):
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
             assert isolated.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=bootstrap_setup_body()
             ).status_code == 200
             assert isolated.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}
@@ -1046,9 +1075,13 @@ def test_square_settings_malformed_nested_payment_returns_502(tmp_path):
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
             assert isolated.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=bootstrap_setup_body()
             ).status_code == 200
             assert isolated.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}
@@ -1478,8 +1511,12 @@ def test_snapshot_transport_error_stores_transaction_without_thumbnail(tmp_path)
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
-            assert isolated.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
+            assert isolated.post("/api/setup", json=bootstrap_setup_body()).status_code == 200
             assert isolated.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
             assert isolated.put(
                 "/api/settings/protect",
@@ -1786,8 +1823,12 @@ def test_webhook_ack_and_transaction_listing_do_not_wait_for_snapshot(tmp_path):
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
-            assert isolated.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
+            assert isolated.post("/api/setup", json=bootstrap_setup_body()).status_code == 200
             assert isolated.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
             assert isolated.put(
                 "/api/settings/protect",
@@ -1873,9 +1914,13 @@ def test_webhook_ack_does_not_wait_for_alarm_delivery(tmp_path):
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
             assert isolated.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=bootstrap_setup_body()
             ).status_code == 200
             assert isolated.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}
@@ -1971,9 +2016,13 @@ def test_same_host_alarm_rotation_waits_for_inflight_delivery(tmp_path):
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
             assert isolated.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=bootstrap_setup_body()
             ).status_code == 200
             assert isolated.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}
@@ -2074,9 +2123,13 @@ def test_alarm_disable_waits_for_same_host_settings_probe(tmp_path):
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
             assert isolated.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=bootstrap_setup_body()
             ).status_code == 200
             assert isolated.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}
@@ -2175,9 +2228,13 @@ def test_console_switch_waits_for_inflight_old_console_alarm(tmp_path):
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
             assert isolated.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=bootstrap_setup_body()
             ).status_code == 200
             assert isolated.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}
@@ -2304,9 +2361,13 @@ def test_webhook_burst_acks_immediately_and_queue_drains_all(tmp_path):
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
             assert isolated.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=bootstrap_setup_body()
             ).status_code == 200
             assert isolated.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}
@@ -2385,9 +2446,13 @@ def test_single_coalesced_webhook_drain_exhausts_due_batches(tmp_path):
         assert release_executor.wait(timeout=10)
 
     try:
-        with TestClient(app) as isolated:
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
             assert isolated.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=bootstrap_setup_body()
             ).status_code == 200
             assert isolated.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}
@@ -2903,8 +2968,12 @@ def test_protect_health_reports_outage(tmp_path):
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
-            assert isolated.post("/api/setup", json={"password": ADMIN_PASSWORD}).status_code == 200
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
+            assert isolated.post("/api/setup", json=bootstrap_setup_body()).status_code == 200
             assert isolated.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
             assert isolated.put(
                 "/api/settings/protect",
@@ -3006,9 +3075,13 @@ def test_sync_ingests_square_facts_when_protect_console_unreachable(tmp_path):
         enable_poller=False,
     )
     try:
-        with TestClient(app) as isolated:
+        with TestClient(
+            app,
+            base_url="http://localhost",
+            client=("127.0.0.1", 50000),
+        ) as isolated:
             assert isolated.post(
-                "/api/setup", json={"password": ADMIN_PASSWORD}
+                "/api/setup", json=bootstrap_setup_body()
             ).status_code == 200
             assert isolated.post(
                 "/api/login", json={"password": ADMIN_PASSWORD}

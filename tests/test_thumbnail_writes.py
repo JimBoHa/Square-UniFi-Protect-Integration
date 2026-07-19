@@ -10,6 +10,16 @@ import pytest
 from app.sync import write_thumbnail
 
 
+def test_thumbnail_write_without_fchmod(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.sync._fchmod", None)
+    target = tmp_path / "evidence.jpg"
+
+    write_thumbnail(target, b"windows-compatible-camera-evidence")
+
+    assert target.read_bytes() == b"windows-compatible-camera-evidence"
+    assert list(tmp_path.glob(f".{target.name}.*.tmp")) == []
+
+
 def test_concurrent_thumbnail_writes_never_publish_mixed_bytes(
     tmp_path, monkeypatch
 ):

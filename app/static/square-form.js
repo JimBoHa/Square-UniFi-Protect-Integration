@@ -1,5 +1,22 @@
 "use strict";
 
+function squareOAuthResultFeedback(search) {
+  const result = new URLSearchParams(search).get("square_oauth");
+  if (result === "connected") {
+    return {
+      text: "Square account connected via OAuth.",
+      kind: "ok",
+    };
+  }
+  if (result === "denied") {
+    return {
+      text: "Square connection was canceled. Open Settings and press “Connect with Square” to try again.",
+      kind: "",
+    };
+  }
+  return null;
+}
+
 function squareWebhookRequestFields(keyInput, urlInput, clearInput) {
   const clearWebhook = clearInput.checked;
   return {
@@ -16,5 +33,9 @@ function resetSquareWebhookFields(keyInput, urlInput, clearInput) {
 }
 
 if (typeof module !== "undefined") {
-  module.exports = { squareWebhookRequestFields, resetSquareWebhookFields };
+  module.exports = {
+    resetSquareWebhookFields,
+    squareOAuthResultFeedback,
+    squareWebhookRequestFields,
+  };
 }

@@ -76,6 +76,30 @@ def test_cert_generated_once_with_private_key_permissions(tmp_path):
     assert again_cert.read_bytes() == cert_path.read_bytes()
 
 
+def test_cert_covers_explicit_bind_ip_instead_of_default_route(
+    tmp_path, monkeypatch
+):
+    import app.tls as tls
+    import ipaddress
+
+    monkeypatch.setenv("SPI_HOST", "10.0.7.215")
+    monkeypatch.setattr(
+        tls.socket,
+        "socket",
+        lambda *_args, **_kwargs: pytest.fail("default route must not be probed"),
+    )
+
+    cert_path, _ = tls.ensure_self_signed_cert(tmp_path)
+    cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    sans = cert.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName
+    ).value
+
+    assert ipaddress.ip_address("10.0.7.215") in sans.get_values_for_type(
+        x509.IPAddress
+    )
+
+
 def test_uvicorn_kwargs_disabled_and_enabled(tmp_path):
     assert uvicorn_tls_kwargs(tmp_path, False) == {}
     kwargs = uvicorn_tls_kwargs(tmp_path, True)

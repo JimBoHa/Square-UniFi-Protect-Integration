@@ -909,6 +909,7 @@ def test_store_migrates_alarm_state_without_replaying_completed_rows(tmp_path):
     store = Store(data_dir)
     try:
         assert store.get_transaction("OLD")["alarm_state"] == "sent"
+        assert store.get_transaction("OLD")["alarm_delivered_at_ms"] is None
         assert store.claim_alarm_trigger("OLD") is None
         store.upsert_transaction(_transaction("NEW"))
         assert store.claim_alarm_trigger("NEW") is not None

@@ -198,7 +198,10 @@ CREATE TABLE IF NOT EXISTS transactions (
     raw TEXT NOT NULL DEFAULT '{}',
     alarm_state TEXT NOT NULL DEFAULT 'idle',
     alarm_claim_token TEXT,
-    alarm_claimed_at REAL
+    alarm_claimed_at REAL,
+    alarm_delivered_at_ms INTEGER CHECK (
+        alarm_delivered_at_ms IS NULL OR alarm_delivered_at_ms >= 0
+    )
 );
 CREATE INDEX IF NOT EXISTS idx_transactions_ts ON transactions (ts_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_transactions_status_ts
@@ -723,6 +726,12 @@ class Store:
         if "alarm_claimed_at" not in columns:
             self._db.execute(
                 "ALTER TABLE transactions ADD COLUMN alarm_claimed_at REAL"
+            )
+        if "alarm_delivered_at_ms" not in columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN alarm_delivered_at_ms INTEGER "
+                "CHECK (alarm_delivered_at_ms IS NULL OR "
+                "alarm_delivered_at_ms >= 0)"
             )
         configured_alarm_keys = {
             row["key"]
@@ -3657,13 +3666,33 @@ class Store:
             self._db.commit()
         return claim_token if cursor.rowcount == 1 else None
 
-    def mark_alarm_sent(self, txn_id: str, claim_token: str) -> bool:
+    def mark_alarm_sent(
+        self,
+        txn_id: str,
+        claim_token: str,
+        *,
+        delivered_at_ms: int | None = None,
+    ) -> bool:
+        delivered_at_ms = (
+            int(time.time() * 1000)
+            if delivered_at_ms is None
+            else int(delivered_at_ms)
+        )
+        if delivered_at_ms < 0:
+            raise ValueError("Alarm delivery timestamp cannot be negative")
         with self._lock:
             cursor = self._db.execute(
                 "UPDATE transactions SET alarm_state = ?, alarm_claim_token = NULL, "
-                "alarm_claimed_at = NULL WHERE id = ? AND alarm_state = ? "
+                "alarm_claimed_at = NULL, alarm_delivered_at_ms = ? "
+                "WHERE id = ? AND alarm_state = ? "
                 "AND alarm_claim_token = ?",
-                (ALARM_SENT, txn_id, ALARM_IN_PROGRESS, claim_token),
+                (
+                    ALARM_SENT,
+                    delivered_at_ms,
+                    txn_id,
+                    ALARM_IN_PROGRESS,
+                    claim_token,
+                ),
             )
             self._db.commit()
         return cursor.rowcount == 1
@@ -3678,6 +3707,34 @@ class Store:
             )
             self._db.commit()
         return cursor.rowcount == 1
+
+    def alarm_delivery_summary(self) -> dict:
+        """Return actual Protect accepts separately from suppressed history."""
+        with self._lock:
+            self._release_expired_alarm_claims_locked()
+            row = self._db.execute(
+                "SELECT "
+                "COALESCE(SUM(CASE WHEN UPPER(status) = 'COMPLETED' "
+                "AND alarm_state = ? THEN 1 ELSE 0 END), 0) AS pending, "
+                "COALESCE(SUM(CASE WHEN UPPER(status) = 'COMPLETED' "
+                "AND alarm_state = ? THEN 1 ELSE 0 END), 0) AS in_progress, "
+                "COALESCE(SUM(CASE WHEN alarm_delivered_at_ms IS NOT NULL "
+                "THEN 1 ELSE 0 END), 0) AS delivered, "
+                "MAX(alarm_delivered_at_ms) AS last_delivered_at_ms "
+                "FROM transactions",
+                (ALARM_IDLE, ALARM_IN_PROGRESS),
+            ).fetchone()
+            self._db.commit()
+        return {
+            "pending": int(row["pending"]),
+            "in_progress": int(row["in_progress"]),
+            "delivered": int(row["delivered"]),
+            "last_delivered_at_ms": (
+                int(row["last_delivered_at_ms"])
+                if row["last_delivered_at_ms"] is not None
+                else None
+            ),
+        }
 
     # -- sessions ----------------------------------------------------------
 

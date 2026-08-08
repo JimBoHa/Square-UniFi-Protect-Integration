@@ -1025,6 +1025,86 @@ def create_app(
 
     # -- settings --------------------------------------------------------------
 
+    def protect_alarm_settings_response(
+        response: Response,
+        *,
+        accepted_at_ms: int | None = None,
+    ) -> dict:
+        settings = store.get_settings(
+            (
+                "protect.api_key",
+                "protect.alarm_trigger_id",
+                PROTECT_CONSOLE_GENERATION_SETTING,
+            )
+        )
+        response.headers["Cache-Control"] = PRIVATE_NO_STORE
+        response.headers["X-Protect-Console-Generation"] = (
+            settings[PROTECT_CONSOLE_GENERATION_SETTING] or ""
+        )
+        result = {
+            "configured": bool(
+                settings["protect.api_key"]
+                and settings["protect.alarm_trigger_id"]
+            ),
+            "trigger_id": settings["protect.alarm_trigger_id"] or "",
+            **store.alarm_delivery_summary(),
+        }
+        if accepted_at_ms is not None:
+            result["test_accepted_at_ms"] = accepted_at_ms
+        return result
+
+    @app.get("/api/settings/protect/alarm")
+    def get_protect_alarm_settings(
+        response: Response,
+        _=admin_only,
+    ) -> dict:
+        with store.integration_guard():
+            return protect_alarm_settings_response(response)
+
+    @app.post("/api/settings/protect/alarm/test")
+    def test_protect_alarm(
+        response: Response,
+        _=admin_only,
+    ) -> dict:
+        with store.protect_settings_guard():
+            with store.integration_guard():
+                settings = store.get_settings(PROTECT_SETTING_KEYS)
+                if not (
+                    settings["protect.api_key"]
+                    and settings["protect.alarm_trigger_id"]
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Protect transaction flags are not configured",
+                    )
+                protect = build_protect(settings)
+                if protect is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="UniFi Protect is not configured",
+                    )
+                try:
+                    verify_protect_console_identity(protect, settings)
+                    protect.trigger_alarm(
+                        settings["protect.alarm_trigger_id"],
+                        timeout=sync.ALARM_RETRY_NETWORK_TIMEOUT_SECONDS,
+                    )
+                except ProtectConsoleIdentityMismatch as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                except ProtectAuthError as exc:
+                    raise HTTPException(status_code=401, detail=str(exc)) from exc
+                except (ProtectError, OSError) as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Protect rejected the test transaction flag: {exc}",
+                    ) from exc
+                finally:
+                    protect.close()
+                return protect_alarm_settings_response(
+                    response,
+                    accepted_at_ms=int(time.time() * 1000),
+                )
+
     def clear_protect_alarm_settings() -> dict:
         with store.protect_settings_guard():
             # Wait for any claimed delivery to finish before reporting the
@@ -2110,6 +2190,16 @@ def create_app(
             ),
             "note": txn.get("note", ""),
             "note_revision": int(txn.get("note_revision", 0)),
+            "protect_flag_delivered_at_ms": (
+                int(txn["alarm_delivered_at_ms"])
+                if txn.get("alarm_delivered_at_ms") is not None
+                else None
+            ),
+            "protect_flag_offset_ms": (
+                int(txn["alarm_delivered_at_ms"]) - int(txn["ts_ms"])
+                if txn.get("alarm_delivered_at_ms") is not None
+                else None
+            ),
         }
 
     @app.get("/api/dashboard")
@@ -2172,6 +2262,17 @@ def create_app(
             **store.motion_alert_summary(),
         }
 
+        alarm_settings = store.get_settings(
+            ("protect.api_key", "protect.alarm_trigger_id")
+        )
+        transaction_flags = {
+            "configured": bool(
+                alarm_settings["protect.api_key"]
+                and alarm_settings["protect.alarm_trigger_id"]
+            ),
+            **store.alarm_delivery_summary(),
+        }
+
         queues = store.queue_depths()
         if not store.get_setting("protect.alarm_trigger_id"):
             # Idle alarm states are meaningless while the feature is off.
@@ -2181,6 +2282,7 @@ def create_app(
             "square": square,
             "webhook": webhook,
             "motion": motion,
+            "transaction_flags": transaction_flags,
             "queues": queues,
         }
 

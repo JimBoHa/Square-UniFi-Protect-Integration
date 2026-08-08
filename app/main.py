@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -890,6 +890,11 @@ def create_app(
     def client_key(request: Request) -> str:
         return request.client.host if request.client else "unknown"
 
+    def login_client_ip(request: Request) -> str:
+        raw_host = client_key(request).split("%", 1)[0]
+        address = _normalized_ip_address(raw_host)
+        return str(address) if address is not None else "unknown"
+
     def prune_login_failures_locked(now: float) -> None:
         """Discard expired attempts and empty client keys while holding the lock."""
         for key, attempts in list(app.state.login_failures.items()):
@@ -1026,6 +1031,7 @@ def create_app(
                 token,
                 account["id"],
                 account["auth_revision"],
+                login_client_ip(request),
             )
         except ValueError:
             # A concurrent account disable must look exactly like any other
@@ -1113,6 +1119,18 @@ def create_app(
             "sessions_revoked": user["sessions_revoked"],
             "current_session_revoked": user_id == current_admin["id"],
         }
+
+    @app.get("/api/login-audit")
+    def login_audit(
+        limit: int = Query(default=100, ge=1, le=250),
+        before_id: int | None = Query(default=None, ge=1),
+        _=admin_only,
+    ) -> dict:
+        events, next_before_id = store.list_login_audit(
+            limit=limit,
+            before_id=before_id,
+        )
+        return {"events": events, "next_before_id": next_before_id}
 
     # -- settings --------------------------------------------------------------
 

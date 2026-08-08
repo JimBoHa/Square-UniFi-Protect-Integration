@@ -29,6 +29,7 @@ PROTECTED_ENDPOINTS = [
     ("GET", "/api/users"),
     ("POST", "/api/users"),
     ("PUT", "/api/users/1/password"),
+    ("GET", "/api/login-audit"),
     ("GET", "/api/cameras"),
     ("GET", "/api/locations"),
     ("GET", "/api/pos-devices"),

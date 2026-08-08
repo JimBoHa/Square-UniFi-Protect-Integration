@@ -33,8 +33,9 @@ timeline near that timestamp.
 - **Click through to footage** — clicking a thumbnail uses the configured URL
   template to open the Protect timeline near the transaction timestamp.
 - **Fast retail lookup** — search the local feed by transaction ID, card last-4,
-  POS device/name, location ID, or status, and narrow it to a Square payment
-  status. Searches use normalized local fields, do not retain new buyer data,
+  locally authored clip note, POS device/name, location ID, or status, and
+  narrow it to a Square payment status. Searches use normalized local fields,
+  do not retain new buyer data,
   and send lookup terms in an authenticated JSON body rather than a URL that
   ordinary web-server or proxy access logs may record.
 - **Real-time + backfill** — a Square webhook receiver acknowledges deliveries
@@ -51,6 +52,9 @@ timeline near that timestamp.
 - **Login history** — every successful login appends the username, role,
   server-observed client IP, and timestamp to an administrator-only audit log.
   Older entries remain available through cursor-based pagination.
+- **Searchable clip notes** — administrators can add or clear a note on each
+  transaction/footage card. View-only accounts can read notes, and the existing
+  local search and CSV export include them.
 
 ## Protect integration boundary
 
@@ -156,6 +160,9 @@ Then:
    existing sessions; resetting your own password returns you to login.
    The **Login history** below the account list shows successful sign-ins and
    can load the complete append-only history in bounded pages.
+7. Administrators can enter a **Clip note** directly on any transaction card.
+   Saved note text becomes searchable immediately; concurrent stale edits are
+   rejected instead of silently overwriting another administrator's work.
 
 ## Configuration
 
@@ -236,6 +243,9 @@ default (verified on Protect 7.1.87):
   the same SQLite transaction. Audit rows snapshot the username and role and
   application-level triggers reject updates or deletes; only administrators can
   read the paginated history.
+- **Note edit fencing** — notes are limited to 2,000 characters and use an
+  optimistic revision. Changing a note invalidates filtered paging snapshots,
+  preventing a continuing search page from silently repeating or skipping rows.
 - **Webhooks verified** — Square's `x-square-hmacsha256-signature` is checked
   with a constant-time comparison; unsigned or forged deliveries are rejected,
   and the endpoint is disabled until a signature key is configured.

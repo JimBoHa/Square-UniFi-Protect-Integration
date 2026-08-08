@@ -59,6 +59,7 @@ from .store import (
     SquareAccountSwitchRequired,
     SQUARE_OAUTH_PENDING_SETTING_KEYS,
     Store,
+    TransactionNoteConflict,
     TransactionSnapshotExpired,
     TransactionSnapshotFilterMismatch,
     UserAlreadyExists,
@@ -319,6 +320,7 @@ TRANSACTION_EXPORT_HEADERS = (
     "card_last4",
     "receipt_url",
     "protect_timeline_url",
+    "note",
 )
 CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
 
@@ -456,6 +458,10 @@ class TransactionQueryBody(BaseModel):
     snapshot: int | None = Field(default=None, ge=1, le=(1 << 63) - 1)
     q: str = Field(default="", max_length=64)
     status: TransactionStatusFilter | None = None
+
+class TransactionNoteBody(BaseModel):
+    note: str = Field(default="", max_length=2000)
+    revision: int = Field(ge=0)
 
 
 # ---------------------------------------------------------------------------
@@ -1954,6 +1960,8 @@ def create_app(
             "thumbnail_retry_attempts": int(
                 txn.get("thumbnail_retry_attempts", 0)
             ),
+            "note": txn.get("note", ""),
+            "note_revision": int(txn.get("note_revision", 0)),
         }
 
     @app.get("/api/dashboard")
@@ -2056,6 +2064,7 @@ def create_app(
                         _safe_csv_cell(transaction["card_last4"]),
                         _safe_csv_cell(transaction["receipt_url"]),
                         _safe_csv_cell(timeline_url),
+                        _safe_csv_cell(transaction["note"]),
                     )
                 )
             # Build the complete body before releasing the provider-state guard;
@@ -2184,6 +2193,38 @@ def create_app(
     ) -> JSONResponse:
         body = await read_transaction_query_body(request)
         return await run_in_threadpool(transaction_listing, body)
+
+    @app.put("/api/transactions/{txn_id}/note")
+    def set_transaction_note(
+        txn_id: str,
+        body: TransactionNoteBody,
+        _=admin_only,
+    ) -> dict:
+        if (
+            not 1 <= len(txn_id) <= 255
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in txn_id
+            )
+        ):
+            raise HTTPException(status_code=422, detail="Invalid transaction ID")
+        with store.integration_guard():
+            try:
+                result = store.set_transaction_note(
+                    txn_id,
+                    body.note,
+                    body.revision,
+                )
+            except TransactionNoteConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Note changed in another session; reload and try again",
+                ) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+        return {"ok": True, "id": txn_id, **result}
 
     @app.get("/api/thumbnails/{txn_id}")
     def thumbnail(txn_id: str, _=authed) -> Response:

@@ -37,6 +37,7 @@ TRANSACTION_SNAPSHOT_TTL_SECONDS = SESSION_TTL_SECONDS
 MAX_TRANSACTION_SNAPSHOTS = 8
 MAX_TRANSACTION_ORDER_HISTORY = 10_000
 MAX_TRANSACTION_SEARCH_LENGTH = 64
+MAX_TRANSACTION_NOTE_LENGTH = 2000
 TRANSACTION_FILTER_SIGNATURE_PREFIX = "hmac-sha256-v2:"
 _TRANSACTION_FILTER_SIGNATURE_DOMAIN = (
     b"square-unifi-protect:transaction-filter-signature:v2"
@@ -174,6 +175,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     receipt_url TEXT NOT NULL DEFAULT '',
     camera_id TEXT,
     thumbnail_path TEXT,
+    note TEXT NOT NULL DEFAULT '' CHECK (length(note) <= 2000),
+    note_revision INTEGER NOT NULL DEFAULT 0 CHECK (note_revision >= 0),
     raw TEXT NOT NULL DEFAULT '{}',
     alarm_state TEXT NOT NULL DEFAULT 'idle',
     alarm_claim_token TEXT,
@@ -290,6 +293,10 @@ class TransactionSnapshotFilterMismatch(Exception):
     """Requested transaction-feed snapshot belongs to different filters."""
 
 
+class TransactionNoteConflict(Exception):
+    """A clip note changed after the editor loaded it."""
+
+
 def normalize_username(value: str) -> str:
     """Return a bounded app username or raise without Unicode confusables."""
     username = str(value).strip()
@@ -345,6 +352,7 @@ def _transaction_filter(
             "t.device_name",
             "t.location_id",
             "t.status",
+            "t.note",
         )
         clauses.append(
             "(" + " OR ".join(
@@ -994,6 +1002,16 @@ class Store:
                 "ON CONFLICT(location_id) DO UPDATE SET polled_through_ms = "
                 "MIN(square_poll_watermarks.polled_through_ms, "
                 "excluded.polled_through_ms)"
+            )
+        if "note" not in columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN note TEXT NOT NULL DEFAULT '' "
+                f"CHECK (length(note) <= {MAX_TRANSACTION_NOTE_LENGTH})"
+            )
+        if "note_revision" not in columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN note_revision "
+                "INTEGER NOT NULL DEFAULT 0 CHECK (note_revision >= 0)"
             )
 
     def close(self) -> None:
@@ -2823,6 +2841,63 @@ class Store:
             ).fetchone()
         return dict(row) if row else None
 
+    def set_transaction_note(
+        self,
+        txn_id: str,
+        note: str,
+        expected_revision: int,
+    ) -> dict | None:
+        """Set one clip note with optimistic concurrency and search fencing."""
+        note = str(note)
+        if len(note) > MAX_TRANSACTION_NOTE_LENGTH:
+            raise ValueError("Transaction note is too long")
+        if any(
+            (ord(character) < 32 and character not in "\r\n\t")
+            or ord(character) == 127
+            for character in note
+        ):
+            raise ValueError("Transaction note contains unsupported control characters")
+        expected_revision = int(expected_revision)
+        if expected_revision < 0:
+            raise ValueError("Invalid transaction note revision")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                current = self._db.execute(
+                    "SELECT note, note_revision FROM transactions WHERE id = ?",
+                    (str(txn_id),),
+                ).fetchone()
+                if current is None:
+                    self._db.commit()
+                    return None
+                if int(current["note_revision"]) != expected_revision:
+                    raise TransactionNoteConflict(
+                        "Transaction note changed while it was being edited"
+                    )
+                if current["note"] == note:
+                    self._db.commit()
+                    return {
+                        "note": current["note"],
+                        "note_revision": int(current["note_revision"]),
+                    }
+                next_revision = expected_revision + 1
+                self._db.execute(
+                    "UPDATE transactions SET note = ?, note_revision = ? "
+                    "WHERE id = ?",
+                    (note, next_revision, str(txn_id)),
+                )
+                # Notes participate in search membership. Expire only filtered
+                # snapshots; unfiltered chronological pages remain coherent.
+                self._db.execute(
+                    "DELETE FROM transaction_feed_snapshots "
+                    "WHERE filter_signature != ''"
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return {"note": note, "note_revision": next_revision}
+
     def _delete_transaction_snapshots_locked(self, snapshot_ids: list[int]) -> None:
         if not snapshot_ids:
             return
@@ -3046,7 +3121,7 @@ class Store:
             rows = self._db.execute(
                 "SELECT id, created_at, ts_ms, amount, currency, status, "
                 "location_id, device_id, device_name, card_last4, receipt_url, "
-                "camera_id FROM transactions ORDER BY ts_ms DESC, id DESC"
+                "camera_id, note FROM transactions ORDER BY ts_ms DESC, id DESC"
             ).fetchall()
         return [dict(row) for row in rows]
 

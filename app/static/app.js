@@ -21,6 +21,17 @@ let squareAccountRevision = "";
 let cameraMappingGeneration = "";
 let wizardSquareAccountRevision = "";
 let wizardProtectConsoleGeneration = "";
+let currentUser = null;
+
+function setCurrentUser(payload) {
+  currentUser = sessionUser(payload);
+  applyRoleInterface(
+    currentUser,
+    document.querySelectorAll("[data-admin-only]"),
+    $("#session-identity"),
+  );
+  return currentUser;
+}
 
 function show(viewId, focusHeading = true) {
   const view = $(viewId);
@@ -55,6 +66,7 @@ async function api(path, options = {}) {
     path !== "/api/login" &&
     data.detail === "Authentication required";
   if (sessionExpired) {
+    setCurrentUser(null);
     show("#view-login");
     $("#nav").hidden = true;
     throw sessionExpiredError();
@@ -110,9 +122,10 @@ async function boot() {
     show("#view-setup");
     return;
   }
-  // Probe an authed endpoint to see if we already have a session.
+  // Resolve the live account role before choosing any application view.
   try {
-    await api("/api/camera-mapping");
+    const session = await api("/api/session");
+    if (!setCurrentUser(session)) throw new Error("Invalid session response");
     await enterAppOrWizard();
   } catch (err) {
     if (isSessionExpiredError(err)) return;
@@ -130,13 +143,13 @@ function enterApp() {
   $("#nav").hidden = false;
   show("#view-transactions");
   loadTransactions({ reset: true });
-  loadSettingsView();
+  if (isAdmin(currentUser)) loadSettingsView();
   startTransactionRefresh();
   startDashboardRefresh();
 }
 
 async function enterAppOrWizard() {
-  if (await maybeStartWizard()) {
+  if (isAdmin(currentUser) && await maybeStartWizard()) {
     startTransactionRefresh();
     void loadTransactions({ reset: true });
     return;
@@ -164,7 +177,8 @@ $("#setup-form").addEventListener("submit", async (e) => {
     });
     $("#setup-password").value = "";
     $("#setup-bootstrap-secret").value = "";
-    message("Admin password created. Please log in.", "ok");
+    $("#login-username").value = "admin";
+    message("Administrator account created. Log in as admin.", "ok");
     show("#view-login");
   } catch (err) {
     message(err.message, "error");
@@ -174,10 +188,14 @@ $("#setup-form").addEventListener("submit", async (e) => {
 $("#login-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {
-    await api("/api/login", {
+    const result = await api("/api/login", {
       method: "POST",
-      body: JSON.stringify({ password: $("#login-password").value }),
+      body: JSON.stringify({
+        username: $("#login-username").value.trim(),
+        password: $("#login-password").value,
+      }),
     });
+    if (!setCurrentUser(result)) throw new Error("Invalid session response");
     $("#login-password").value = "";
     message("", "");
     await enterAppOrWizard();
@@ -189,12 +207,14 @@ $("#login-form").addEventListener("submit", async (e) => {
 $("#logout-btn").addEventListener("click", async () => {
   try { await api("/api/logout", { method: "POST" }); } catch { /* session gone */ }
   stopTransactionRefresh();
+  setCurrentUser(null);
   $("#nav").hidden = true;
   show("#view-login");
 });
 
 for (const btn of document.querySelectorAll("nav button[data-view]")) {
   btn.addEventListener("click", () => {
+    if (btn.dataset.view === "settings" && !isAdmin(currentUser)) return;
     show(`#view-${btn.dataset.view}`);
     if (btn.dataset.view === "transactions") loadTransactions();
     if (btn.dataset.view === "settings") loadSettingsView();
@@ -1111,6 +1131,7 @@ function showWizardStep(step) {
 }
 
 async function maybeStartWizard() {
+  if (!isAdmin(currentUser)) return false;
   if (localStorage.getItem(WIZARD_SKIP_KEY) === "1") return false;
   let status;
   try {

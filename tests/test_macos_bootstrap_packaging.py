@@ -73,7 +73,7 @@ def menubar_module(monkeypatch):
 
 def _fake_web_app(password_hash=None):
     store = SimpleNamespace(
-        get_setting=lambda key: password_hash if key == "admin.password_hash" else None
+        setup_complete=lambda: password_hash is not None,
     )
     return SimpleNamespace(state=SimpleNamespace(store=store))
 
@@ -154,8 +154,8 @@ def test_secret_reveal_is_user_initiated_and_cleared_after_setup(
 ):
     secret_text = "visible-only-on-request-secret-0123456789"
     secret_buffer = bytearray(secret_text.encode("utf-8"))
-    settings = {"admin.password_hash": None}
-    store = SimpleNamespace(get_setting=settings.get)
+    setup_state = {"complete": False}
+    store = SimpleNamespace(setup_complete=lambda: setup_state["complete"])
     app = object.__new__(menubar_module.SquareProtectApp)
     app.web_app = SimpleNamespace(state=SimpleNamespace(store=store))
     app._bootstrap_secret = secret_buffer
@@ -171,7 +171,7 @@ def test_secret_reveal_is_user_initiated_and_cleared_after_setup(
     assert len(_FakeWindow.calls) == 1
     assert _FakeWindow.calls[0]["default_text"] == secret_text
 
-    settings["admin.password_hash"] = "configured"
+    setup_state["complete"] = True
     app._refresh_setup_state()
 
     assert app._bootstrap_secret is None

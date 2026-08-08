@@ -29,6 +29,10 @@ except ImportError:  # pragma: no cover - unavailable on POSIX
 logger = logging.getLogger("spi.store")
 
 SESSION_TTL_SECONDS = 12 * 3600
+ROLE_ADMIN = "admin"
+ROLE_VIEWER = "viewer"
+USER_ROLES = frozenset((ROLE_ADMIN, ROLE_VIEWER))
+DEFAULT_ADMIN_USERNAME = "admin"
 TRANSACTION_SNAPSHOT_TTL_SECONDS = SESSION_TTL_SECONDS
 MAX_TRANSACTION_SNAPSHOTS = 8
 MAX_TRANSACTION_ORDER_HISTORY = 10_000
@@ -226,9 +230,21 @@ CREATE TABLE IF NOT EXISTS protect_evidence_retired (
     transaction_id TEXT PRIMARY KEY,
     FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK (
+        length(username) BETWEEN 1 AND 64 AND username = trim(username)
+    ),
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'viewer')),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
-    expires_at REAL NOT NULL
+    user_id INTEGER NOT NULL,
+    expires_at REAL NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS square_oauth_states (
     state_hash TEXT PRIMARY KEY,
@@ -246,6 +262,24 @@ class TransactionSnapshotExpired(Exception):
 
 class TransactionSnapshotFilterMismatch(Exception):
     """Requested transaction-feed snapshot belongs to different filters."""
+
+
+def normalize_username(value: str) -> str:
+    """Return a bounded app username or raise without Unicode confusables."""
+    username = str(value).strip()
+    if not 1 <= len(username) <= 64:
+        raise ValueError("Username must be 1 to 64 characters")
+    if not username[0].isascii() or not username[0].isalnum():
+        raise ValueError("Username must start with an ASCII letter or number")
+    if any(
+        not character.isascii()
+        or not (character.isalnum() or character in "._-")
+        for character in username
+    ):
+        raise ValueError(
+            "Username can contain only ASCII letters, numbers, dot, dash, and underscore"
+        )
+    return username
 
 
 def _transaction_filter(
@@ -434,6 +468,7 @@ class Store:
                 self._migrate_transactions()
                 self._migrate_transaction_feed_snapshots()
                 self._migrate_schema()
+                self._migrate_auth()
                 # Legacy releases kept the complete Square Payment JSON so
                 # device metadata could be backfilled later. The schema
                 # migration above has consumed that one needed field; discard
@@ -698,6 +733,65 @@ class Store:
                 "TEXT NOT NULL DEFAULT ''"
             )
         self._backfill_transaction_devices()
+
+    def _migrate_auth(self) -> None:
+        """Move the legacy single admin hash and sessions into named users."""
+        legacy_password_hash = self._setting_value_locked("admin.password_hash")
+        user_count = self._db.execute(
+            "SELECT COUNT(*) AS count FROM users"
+        ).fetchone()["count"]
+        if legacy_password_hash and not user_count:
+            self._db.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, enabled, created_at) "
+                "VALUES (?, ?, ?, 1, ?)",
+                (
+                    DEFAULT_ADMIN_USERNAME,
+                    legacy_password_hash,
+                    ROLE_ADMIN,
+                    time.time(),
+                ),
+            )
+
+        admin = self._db.execute(
+            "SELECT id, role FROM users WHERE username = ? COLLATE NOCASE",
+            (DEFAULT_ADMIN_USERNAME,),
+        ).fetchone()
+        session_columns = {
+            row["name"]
+            for row in self._db.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "user_id" not in session_columns:
+            self._db.execute("ALTER TABLE sessions RENAME TO sessions_legacy")
+            self._db.execute(
+                """
+                CREATE TABLE sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    expires_at REAL NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            if admin is not None and admin["role"] == ROLE_ADMIN:
+                self._db.execute(
+                    "INSERT INTO sessions (token_hash, user_id, expires_at) "
+                    "SELECT token_hash, ?, expires_at FROM sessions_legacy",
+                    (admin["id"],),
+                )
+            self._db.execute("DROP TABLE sessions_legacy")
+        self._db.execute(
+            "DELETE FROM sessions WHERE NOT EXISTS ("
+            "SELECT 1 FROM users WHERE users.id = sessions.user_id "
+            "AND users.enabled = 1)"
+        )
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id)"
+        )
+        if legacy_password_hash and admin is not None and admin["role"] == ROLE_ADMIN:
+            self._db.execute(
+                "DELETE FROM settings WHERE key = 'admin.password_hash'"
+            )
 
     def _migrate_transaction_feed_snapshots(self) -> None:
         """Bind upgraded paging snapshots to one canonical filter set."""
@@ -3052,24 +3146,126 @@ class Store:
 
     # -- sessions ----------------------------------------------------------
 
-    def create_session(self, token: str) -> None:
+    def setup_complete(self) -> bool:
         with self._lock:
-            self._db.execute(
-                "INSERT INTO sessions (token_hash, expires_at) VALUES (?, ?)",
-                (hash_session_token(token), time.time() + SESSION_TTL_SECONDS),
-            )
-            self._db.commit()
+            row = self._db.execute(
+                "SELECT 1 FROM users WHERE role = ? AND enabled = 1 LIMIT 1",
+                (ROLE_ADMIN,),
+            ).fetchone()
+        return row is not None
 
-    def session_valid(self, token: str) -> bool:
+    def create_initial_admin(self, password_hash: str) -> bool:
+        if not password_hash or len(password_hash) > 1024:
+            raise ValueError("Invalid password hash")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                if self._db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+                    self._db.commit()
+                    return False
+                self._db.execute(
+                    "INSERT INTO users "
+                    "(username, password_hash, role, enabled, created_at) "
+                    "VALUES (?, ?, ?, 1, ?)",
+                    (
+                        DEFAULT_ADMIN_USERNAME,
+                        password_hash,
+                        ROLE_ADMIN,
+                        time.time(),
+                    ),
+                )
+                self._db.execute(
+                    "DELETE FROM settings WHERE key = 'admin.password_hash'"
+                )
+                self._db.commit()
+                return True
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def create_user(self, username: str, password_hash: str, role: str) -> dict:
+        """Create one role-bound identity; admin API wiring lives separately."""
+        username = normalize_username(username)
+        if role not in USER_ROLES:
+            raise ValueError("Invalid user role")
+        if not password_hash or len(password_hash) > 1024:
+            raise ValueError("Invalid password hash")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    "INSERT INTO users "
+                    "(username, password_hash, role, enabled, created_at) "
+                    "VALUES (?, ?, ?, 1, ?)",
+                    (username, password_hash, role, time.time()),
+                )
+                user_id = int(cursor.lastrowid)
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return {"id": user_id, "username": username, "role": role}
+
+    def user_for_login(self, username: str) -> dict | None:
+        try:
+            username = normalize_username(username)
+        except ValueError:
+            return None
+        with self._lock:
+            row = self._db.execute(
+                "SELECT id, username, password_hash, role FROM users "
+                "WHERE username = ? COLLATE NOCASE AND enabled = 1",
+                (username,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_session(self, token: str, user_id: int) -> dict:
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                user = self._db.execute(
+                    "SELECT id, username, role FROM users "
+                    "WHERE id = ? AND enabled = 1",
+                    (int(user_id),),
+                ).fetchone()
+                if user is None:
+                    raise ValueError("User is not available")
+                self._db.execute(
+                    "INSERT INTO sessions (token_hash, user_id, expires_at) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        hash_session_token(token),
+                        int(user_id),
+                        time.time() + SESSION_TTL_SECONDS,
+                    ),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return dict(user)
+
+    def session_user(self, token: str) -> dict | None:
         now = time.time()
         with self._lock:
-            self._db.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+            self._db.execute(
+                "DELETE FROM sessions WHERE expires_at < ? OR NOT EXISTS ("
+                "SELECT 1 FROM users WHERE users.id = sessions.user_id "
+                "AND users.enabled = 1)",
+                (now,),
+            )
             row = self._db.execute(
-                "SELECT 1 FROM sessions WHERE token_hash = ? AND expires_at >= ?",
+                "SELECT u.id, u.username, u.role FROM sessions s "
+                "JOIN users u ON u.id = s.user_id "
+                "WHERE s.token_hash = ? AND s.expires_at >= ? AND u.enabled = 1",
                 (hash_session_token(token), now),
             ).fetchone()
             self._db.commit()
-        return row is not None
+        return dict(row) if row else None
+
+    def session_valid(self, token: str) -> bool:
+        """Compatibility wrapper for embedders using the former boolean API."""
+        return self.session_user(token) is not None
 
     def delete_session(self, token: str) -> None:
         with self._lock:

@@ -69,7 +69,7 @@ def _create_menu_web_app(app_module, data_dir: Path):
         # adapter fail-closed if app construction exits before that point.
         os.environ.pop("SPI_BOOTSTRAP_SECRET", None)
 
-    if web_app.state.store.get_setting("admin.password_hash") is not None:
+    if web_app.state.store.setup_complete():
         _wipe_secret(retained_secret)
         return web_app, None
     return web_app, retained_secret
@@ -146,7 +146,7 @@ class SquareProtectApp(rumps.App):
     def _refresh_setup_state(self, _timer=None) -> None:
         if (
             self._bootstrap_secret is not None
-            and self.web_app.state.store.get_setting("admin.password_hash") is not None
+            and self.web_app.state.store.setup_complete()
         ):
             self._clear_setup_secret()
 

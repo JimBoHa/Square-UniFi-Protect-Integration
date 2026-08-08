@@ -14,9 +14,10 @@ from pathlib import Path
 
 import httpx
 
+from . import frame_time
 from .protect_client import ProtectClient, ProtectError
 from .square_client import SquareClient, payment_from_api
-from .store import Store
+from .store import FRAME_OFFSET_MEASURED, FRAME_OFFSET_PENDING, Store
 from .thumbnail_storage import prepare_thumbnail_for_store
 
 logger = logging.getLogger("spi.sync")
@@ -31,6 +32,46 @@ THUMBNAIL_RETRY_MAX_DELAY_SECONDS = 60 * 60
 _THUMBNAIL_ERRORS = (ProtectError, httpx.RequestError, ValueError, OSError)
 ALARM_RETRY_BATCH_SIZE = 10
 ALARM_RETRY_NETWORK_TIMEOUT_SECONDS = 5
+
+
+def _analyze_frame_time(
+    store: Store,
+    camera_id: str,
+    ts_ms: int,
+    image: bytes,
+) -> frame_time.FrameTimeAnalysis:
+    try:
+        templates = store.get_frame_digit_templates(camera_id)
+        return frame_time.analyze_frame_time(image, ts_ms, templates)
+    except Exception as exc:
+        logger.warning("Frame timestamp measurement failed: %s", exc)
+        return frame_time.FrameTimeAnalysis({}, None, str(exc))
+
+
+def _apply_frame_analysis(txn: dict, analysis: frame_time.FrameTimeAnalysis) -> None:
+    measurement = analysis.measurement
+    if measurement is None:
+        txn.update(
+            {
+                "frame_ts_ms": None,
+                "frame_offset_ms": None,
+                "frame_offset_confidence": None,
+                "frame_offset_status": FRAME_OFFSET_PENDING,
+                "frame_offset_attempts": 0,
+                "frame_offset_error": analysis.error[:500],
+            }
+        )
+        return
+    txn.update(
+        {
+            "frame_ts_ms": measurement.frame_ts_ms,
+            "frame_offset_ms": measurement.offset_ms,
+            "frame_offset_confidence": measurement.confidence,
+            "frame_offset_status": FRAME_OFFSET_MEASURED,
+            "frame_offset_attempts": 0,
+            "frame_offset_error": "",
+        }
+    )
 
 
 def _current_time_ms() -> int:
@@ -222,6 +263,7 @@ def _ingest_payment_with_status(
     ts_unchanged = bool(existing and existing["ts_ms"] == txn["ts_ms"])
 
     captured_path = None
+    captured_frame_templates: dict[str, tuple[bytes, ...]] = {}
     if (
         existing
         and existing.get("camera_id")
@@ -236,6 +278,15 @@ def _ingest_payment_with_status(
         txn["thumbnail_policy_revision"] = existing.get(
             "thumbnail_policy_revision", 0
         )
+        for field in (
+            "frame_ts_ms",
+            "frame_offset_ms",
+            "frame_offset_confidence",
+            "frame_offset_status",
+            "frame_offset_attempts",
+            "frame_offset_error",
+        ):
+            txn[field] = existing.get(field)
     elif (
         protect is not None
         and protect_host == evidence_host
@@ -249,6 +300,14 @@ def _ingest_payment_with_status(
         # on every Square overlap page.
         try:
             image = protect.get_snapshot(txn["camera_id"], ts_ms=txn["ts_ms"])
+            frame_analysis = _analyze_frame_time(
+                store,
+                txn["camera_id"],
+                txn["ts_ms"],
+                image,
+            )
+            _apply_frame_analysis(txn, frame_analysis)
+            captured_frame_templates = frame_analysis.learned_templates
             prepared = prepare_thumbnail_for_store(store, image)
             if prepared.error:
                 logger.warning(
@@ -305,6 +364,18 @@ def _ingest_payment_with_status(
                     captured_path,
                     exc,
                 )
+        elif captured_frame_templates:
+            try:
+                store.add_frame_digit_templates(
+                    txn["camera_id"],
+                    captured_frame_templates,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not learn frame timestamp glyphs for %s: %s",
+                    txn["id"],
+                    exc,
+                )
 
     return txn, is_new
 
@@ -352,6 +423,14 @@ def retry_missing_thumbnails(
         path = None
         try:
             image = protect.get_snapshot(job["camera_id"], ts_ms=job["ts_ms"])
+            frame_analysis = _analyze_frame_time(
+                store,
+                job["camera_id"],
+                job["ts_ms"],
+                image,
+            )
+            frame_fields: dict = {}
+            _apply_frame_analysis(frame_fields, frame_analysis)
             prepared = prepare_thumbnail_for_store(store, image)
             if prepared.error:
                 logger.warning(
@@ -375,9 +454,28 @@ def retry_missing_thumbnails(
                 name,
                 thumbnail_bytes=len(prepared.data),
                 thumbnail_policy_revision=prepared.policy_revision,
+                frame_ts_ms=frame_fields["frame_ts_ms"],
+                frame_offset_ms=frame_fields["frame_offset_ms"],
+                frame_offset_confidence=frame_fields[
+                    "frame_offset_confidence"
+                ],
+                frame_offset_status=frame_fields["frame_offset_status"],
+                frame_offset_error=frame_fields["frame_offset_error"],
             )
             if attached:
                 completed += 1
+                if frame_analysis.learned_templates:
+                    try:
+                        store.add_frame_digit_templates(
+                            job["camera_id"],
+                            frame_analysis.learned_templates,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not learn frame timestamp glyphs for %s: %s",
+                            job["transaction_id"],
+                            exc,
+                        )
             else:
                 path.unlink(missing_ok=True)
         except _THUMBNAIL_ERRORS as exc:

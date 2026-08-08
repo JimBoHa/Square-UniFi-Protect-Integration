@@ -921,10 +921,18 @@ function renderDashboard(data) {
   if (!data.webhook.configured) {
     setTile("webhook", "idle", "Not configured",
       "Optional: real-time sales via Settings; polling still syncs every minute");
-  } else if (data.webhook.last_event_ms) {
-    const minutes = Math.round((Date.now() - data.webhook.last_event_ms) / 60000);
+  } else if (data.webhook.last_payment_ms || data.webhook.last_event_ms) {
+    const lastPayment = Boolean(data.webhook.last_payment_ms);
+    const eventTime = data.webhook.last_payment_ms || data.webhook.last_event_ms;
+    const minutes = Math.max(0, Math.round((Date.now() - eventTime) / 60000));
     const age = minutes < 1 ? "just now" : `${minutes} min ago`;
-    setTile("webhook", "ok", `Last event ${age}`, "");
+    const eventLabel = lastPayment ? "Last payment" : "Last event";
+    setTile(
+      "webhook",
+      "ok",
+      `${eventLabel} ${age}`,
+      webhookDeliveryHint(data.webhook),
+    );
   } else {
     setTile("webhook", "idle", "Waiting for first event",
       "Check the Square webhook subscription if sales are not arriving");

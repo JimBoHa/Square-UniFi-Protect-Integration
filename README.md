@@ -40,8 +40,9 @@ timeline near that timestamp.
 - **Real-time + backfill** — a Square webhook receiver acknowledges deliveries
   immediately (HMAC-SHA256 signature verified) and captures footage
   asynchronously, while a background poller reconciles every Square location
-  by update time. Missed thumbnails persist in a durable retry queue with
-  backoff, so a Protect outage never permanently loses evidence.
+  by update time. The dashboard reports measured Square-to-app delivery lag and
+  safely ignores duplicate event IDs. Missed thumbnails persist in a durable
+  retry queue with backoff, so a Protect outage never permanently loses evidence.
 
 ## Protect integration boundary
 
@@ -212,7 +213,9 @@ default (verified on Protect 7.1.87):
   failures; sessions are random 256-bit tokens in `HttpOnly`/`SameSite` cookies.
 - **Webhooks verified** — Square's `x-square-hmacsha256-signature` is checked
   with a constant-time comparison; unsigned or forged deliveries are rejected,
-  and the endpoint is disabled until a signature key is configured.
+  the endpoint accepts only payment-created/payment-updated envelopes, and it is
+  disabled until a signature key is configured. Duplicate detection retains at
+  most 4,096 SHA-256 receipt keys; raw event IDs and payloads are not retained.
 - **Request bodies bounded** — general HTTP requests are capped at 1 MiB before
   routing, authentication, or JSON parsing, including streamed/chunked bodies;
   this leaves ample room for the maximum 500-entry camera mapping. Square

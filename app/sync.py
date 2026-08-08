@@ -17,6 +17,7 @@ import httpx
 from .protect_client import ProtectClient, ProtectError
 from .square_client import SquareClient, payment_from_api
 from .store import Store
+from .thumbnail_storage import prepare_thumbnail_for_store
 
 logger = logging.getLogger("spi.sync")
 
@@ -231,6 +232,10 @@ def _ingest_payment_with_status(
         # historical evidence. Missing evidence can still adopt a remap.
         txn["camera_id"] = existing["camera_id"]
         txn["thumbnail_path"] = existing["thumbnail_path"]
+        txn["thumbnail_bytes"] = existing.get("thumbnail_bytes")
+        txn["thumbnail_policy_revision"] = existing.get(
+            "thumbnail_policy_revision", 0
+        )
     elif (
         protect is not None
         and protect_host == evidence_host
@@ -244,6 +249,13 @@ def _ingest_payment_with_status(
         # on every Square overlap page.
         try:
             image = protect.get_snapshot(txn["camera_id"], ts_ms=txn["ts_ms"])
+            prepared = prepare_thumbnail_for_store(store, image)
+            if prepared.error:
+                logger.warning(
+                    "Thumbnail compression failed for %s; kept original: %s",
+                    txn["id"],
+                    prepared.error,
+                )
             name = versioned_thumbnail_name(
                 txn["id"],
                 txn["camera_id"],
@@ -252,8 +264,10 @@ def _ingest_payment_with_status(
                 evidence_generation or evidence_host or "",
             )
             captured_path = store.thumbnail_dir / name
-            write_thumbnail(captured_path, image)
+            write_thumbnail(captured_path, prepared.data)
             txn["thumbnail_path"] = name
+            txn["thumbnail_bytes"] = len(prepared.data)
+            txn["thumbnail_policy_revision"] = prepared.policy_revision
         except _THUMBNAIL_ERRORS as exc:
             logger.warning("Thumbnail capture failed for %s: %s", txn["id"], exc)
 
@@ -338,6 +352,13 @@ def retry_missing_thumbnails(
         path = None
         try:
             image = protect.get_snapshot(job["camera_id"], ts_ms=job["ts_ms"])
+            prepared = prepare_thumbnail_for_store(store, image)
+            if prepared.error:
+                logger.warning(
+                    "Thumbnail compression failed for %s; kept original: %s",
+                    job["transaction_id"],
+                    prepared.error,
+                )
             name = retry_thumbnail_name(
                 job["transaction_id"],
                 job["camera_id"],
@@ -345,13 +366,15 @@ def retry_missing_thumbnails(
                 job["lease_token"],
             )
             path = store.thumbnail_dir / name
-            write_thumbnail(path, image)
+            write_thumbnail(path, prepared.data)
             attached = store.complete_thumbnail_retry(
                 job["transaction_id"],
                 job["lease_token"],
                 job["camera_id"],
                 job["ts_ms"],
                 name,
+                thumbnail_bytes=len(prepared.data),
+                thumbnail_policy_revision=prepared.policy_revision,
             )
             if attached:
                 completed += 1

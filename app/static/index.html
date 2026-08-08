@@ -269,7 +269,7 @@
       <p class="hint">UniFi frame offset compares the camera's burned-in whole-second timestamp with Square's transaction timestamp.</p>
       <form id="txn-filter-form" class="transaction-filters" role="search">
         <label for="txn-query">Search transactions
-          <input id="txn-query" type="search" maxlength="64" autocomplete="off" spellcheck="false" aria-describedby="txn-filter-help" placeholder="Transaction ID, card last 4, POS, or location">
+          <input id="txn-query" type="search" maxlength="64" autocomplete="off" spellcheck="false" aria-describedby="txn-filter-help" placeholder="Transaction ID, note, card last 4, POS, or location">
         </label>
         <label for="txn-status-filter">Status
           <select id="txn-status-filter">
@@ -286,7 +286,7 @@
           <button type="button" id="txn-filter-clear">Clear</button>
         </div>
       </form>
-      <p id="txn-filter-help" class="hint">Search uses only locally stored transaction ID, card last 4, POS device/name, location ID, and status.</p>
+      <p id="txn-filter-help" class="hint">Search uses only locally stored clip notes, transaction ID, card last 4, POS device/name, location ID, and status.</p>
       <p id="txn-last-updated" class="hint" role="status"></p>
       <div id="txn-list"></div>
       <div class="pagination" role="navigation" aria-label="Transaction pages">
@@ -311,6 +311,7 @@
   <script src="/transaction-filters.js"></script>
   <script src="/frame-offset.js"></script>
   <script src="/webhook-delivery.js"></script>
+  <script src="/transaction-note.js"></script>
   <script src="/roles.js"></script>
   <script src="/user-management.js"></script>
   <script src="/login-audit.js"></script>

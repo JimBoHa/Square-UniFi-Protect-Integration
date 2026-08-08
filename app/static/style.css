@@ -113,6 +113,19 @@ button[type="submit"], #save-mapping, #sync-now, #export-csv {
   border: 1px solid currentColor; border-radius: 999px;
   font-size: 0.8rem; font-weight: 600;
 }
+.clip-note { margin-top: 0.45rem; }
+.clip-note p { margin: 0.2rem 0 0; white-space: pre-wrap; }
+.clip-note-editor { margin-top: 0.35rem; }
+.clip-note-editor summary { cursor: pointer; font-size: 0.85rem; }
+.clip-note-form {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end; gap: 0.5rem; max-width: none; margin: 0.5rem 0 0;
+}
+.clip-note-form textarea {
+  width: 100%; min-height: 4.5rem; resize: vertical; padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: transparent; color: inherit; font: inherit;
+}
 .pagination {
   display: flex; align-items: center; justify-content: center; gap: 0.75rem;
   flex-wrap: wrap; margin-top: 1rem;
@@ -161,6 +174,7 @@ button[type="submit"], #save-mapping, #sync-now, #export-csv {
   .txn .thumb { width: 100%; height: auto; aspect-ratio: 16 / 9; }
   .txn .amount { min-width: 0; }
   .txn .meta { min-width: 0; overflow-wrap: anywhere; }
+  .clip-note-form { grid-template-columns: 1fr; }
   .conn-status { margin-left: 0; max-width: 100%; }
   .conn-text { min-width: 0; overflow-wrap: anywhere; }
   .pagination .hint { order: -1; flex-basis: 100%; max-width: none; }

@@ -1436,6 +1436,8 @@ def test_store_migrates_legacy_fields_and_scrubs_raw_payment(tmp_path):
         "frame_offset_status": "pending",
         "frame_offset_attempts": 0,
         "frame_offset_error": "",
+        "note": "",
+        "note_revision": 0,
         "raw": "{}",
         "updated_at": created_at,
         "updated_ts_ms": ts_ms,

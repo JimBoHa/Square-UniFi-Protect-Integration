@@ -238,8 +238,55 @@ def _local_ip() -> str | None:
         probe.close()
 
 
+def _local_ips() -> tuple[str, ...]:
+    """Return concrete addresses the configured listener can serve.
+
+    A concrete IP bind has exactly one address. Wildcard and hostname binds
+    resolve the machine name on every startup, so a DHCP change rotates the
+    generated certificate without requiring a configuration edit.
+    """
+    configured_host = os.environ.get("SPI_HOST", "").strip().strip("[]")
+    try:
+        configured_ip = ipaddress.ip_address(configured_host)
+    except ValueError:
+        configured_ip = None
+    if configured_ip is not None and not configured_ip.is_unspecified:
+        local_ip = _local_ip()
+        return (local_ip,) if local_ip else ()
+
+    resolution_target = configured_host or socket.gethostname()
+    if configured_ip is not None and configured_ip.is_unspecified:
+        resolution_target = socket.gethostname()
+    addresses: set[str] = set()
+    try:
+        resolved = socket.getaddrinfo(
+            resolution_target,
+            None,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError:
+        resolved = ()
+    for family, _socket_type, _protocol, _canonical_name, sockaddr in resolved:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        address_text = str(sockaddr[0]).partition("%")[0]
+        try:
+            address = ipaddress.ip_address(address_text)
+        except ValueError:
+            continue
+        if address.is_unspecified or address.is_loopback or address.is_multicast:
+            continue
+        addresses.add(str(address))
+    if not addresses:
+        local_ip = _local_ip()
+        if local_ip:
+            addresses.add(local_ip)
+    return tuple(sorted(addresses))
+
+
 def _existing_pair_is_reusable(
-    cert_path: Path, key_path: Path, local_ip: str | None
+    cert_path: Path, key_path: Path, local_ips: tuple[str, ...]
 ) -> bool:
     """Return whether existing material is safe to reuse for this startup."""
     try:
@@ -253,12 +300,15 @@ def _existing_pair_is_reusable(
             return False
         if cert.not_valid_after_utc <= now + _RENEWAL_MARGIN:
             return False
-        if local_ip is not None:
+        if local_ips:
             sans = cert.extensions.get_extension_for_class(
                 x509.SubjectAlternativeName
             ).value
             addresses = sans.get_values_for_type(x509.IPAddress)
-            if ipaddress.ip_address(local_ip) not in addresses:
+            if any(
+                ipaddress.ip_address(local_ip) not in addresses
+                for local_ip in local_ips
+            ):
                 return False
         public_format = serialization.PublicFormat.SubjectPublicKeyInfo
         cert_public_key = cert.public_key().public_bytes(
@@ -295,11 +345,11 @@ def ensure_self_signed_cert(data_dir: Path) -> tuple[Path, Path]:
     with _generation_lock(data_dir):
         _remove_incomplete_publications(data_dir)
         cert_path, key_path = _current_pair(data_dir)
-        local_ip = _local_ip()
+        local_ips = _local_ips()
         if (
             cert_path.is_file()
             and key_path.is_file()
-            and _existing_pair_is_reusable(cert_path, key_path, local_ip)
+            and _existing_pair_is_reusable(cert_path, key_path, local_ips)
         ):
             return cert_path, key_path
 
@@ -312,8 +362,11 @@ def ensure_self_signed_cert(data_dir: Path) -> tuple[Path, Path]:
             x509.DNSName("square-unifi-protect.local"),
             x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
         ]
-        if local_ip:
-            alt_names.append(x509.IPAddress(ipaddress.ip_address(local_ip)))
+        alt_names.extend(
+            x509.IPAddress(ipaddress.ip_address(local_ip))
+            for local_ip in local_ips
+            if local_ip != "127.0.0.1"
+        )
         now = datetime.datetime.now(datetime.timezone.utc)
         cert = (
             x509.CertificateBuilder()

@@ -35,6 +35,9 @@ ADMIN_ENDPOINTS = frozenset(
         ("PUT", "/api/settings/square"),
         ("GET", "/api/settings/deep-link"),
         ("PUT", "/api/settings/deep-link"),
+        ("GET", "/api/settings/thumbnail-storage"),
+        ("PUT", "/api/settings/thumbnail-storage"),
+        ("POST", "/api/settings/thumbnail-storage/maintenance"),
         ("GET", "/api/settings/protect/motion-webhook"),
         ("PUT", "/api/settings/protect/motion-webhook"),
         ("DELETE", "/api/settings/protect/motion-webhook"),
@@ -71,9 +74,6 @@ VIEWER_ENDPOINTS = frozenset(
         ("GET", "/api/transactions"),
         ("POST", "/api/transactions"),
         ("GET", "/api/thumbnails/{txn_id}"),
-        ("GET", "/api/settings/thumbnail-storage"),
-        ("PUT", "/api/settings/thumbnail-storage"),
-        ("POST", "/api/settings/thumbnail-storage/maintenance"),
     }
 )
 
@@ -230,6 +230,19 @@ def test_every_application_route_has_an_explicit_authorization_class(client):
         ),
         ("GET", "/api/settings/deep-link", None),
         ("PUT", "/api/settings/deep-link", {"template": ""}),
+        ("GET", "/api/settings/thumbnail-storage", None),
+        (
+            "PUT",
+            "/api/settings/thumbnail-storage",
+            {
+                "compression_enabled": False,
+                "jpeg_quality": 72,
+                "max_dimension": 960,
+                "retention_days": 0,
+                "max_storage_mib": 0,
+            },
+        ),
+        ("POST", "/api/settings/thumbnail-storage/maintenance", None),
         ("GET", "/api/settings/protect/motion-webhook", None),
         (
             "PUT",

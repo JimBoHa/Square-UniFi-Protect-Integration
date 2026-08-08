@@ -33,6 +33,14 @@ function setCurrentUser(payload) {
   return currentUser;
 }
 
+function leaveAppForLogin(username = "admin") {
+  stopTransactionRefresh();
+  setCurrentUser(null);
+  $("#nav").hidden = true;
+  $("#login-username").value = username;
+  show("#view-login");
+}
+
 function show(viewId, focusHeading = true) {
   const view = $(viewId);
   activateViewState(
@@ -66,9 +74,7 @@ async function api(path, options = {}) {
     path !== "/api/login" &&
     data.detail === "Authentication required";
   if (sessionExpired) {
-    setCurrentUser(null);
-    show("#view-login");
-    $("#nav").hidden = true;
+    leaveAppForLogin(currentUser ? currentUser.username : "admin");
     throw sessionExpiredError();
   }
   if (!resp.ok) {
@@ -143,7 +149,10 @@ function enterApp() {
   $("#nav").hidden = false;
   show("#view-transactions");
   loadTransactions({ reset: true });
-  if (isAdmin(currentUser)) loadSettingsView();
+  if (isAdmin(currentUser)) {
+    loadSettingsView();
+    void loadUsers();
+  }
   startTransactionRefresh();
   startDashboardRefresh();
 }
@@ -205,11 +214,9 @@ $("#login-form").addEventListener("submit", async (e) => {
 });
 
 $("#logout-btn").addEventListener("click", async () => {
+  const username = currentUser ? currentUser.username : "admin";
   try { await api("/api/logout", { method: "POST" }); } catch { /* session gone */ }
-  stopTransactionRefresh();
-  setCurrentUser(null);
-  $("#nav").hidden = true;
-  show("#view-login");
+  leaveAppForLogin(username);
 });
 
 for (const btn of document.querySelectorAll("nav button[data-view]")) {
@@ -217,11 +224,143 @@ for (const btn of document.querySelectorAll("nav button[data-view]")) {
     if (btn.dataset.view === "settings" && !isAdmin(currentUser)) return;
     show(`#view-${btn.dataset.view}`);
     if (btn.dataset.view === "transactions") loadTransactions();
-    if (btn.dataset.view === "settings") loadSettingsView();
+    if (btn.dataset.view === "settings") {
+      loadSettingsView();
+      void loadUsers();
+    }
   });
 }
 
 // ---------------------------------------------------------------- settings
+
+let userLoadGeneration = 0;
+
+function renderUsers(payload) {
+  const container = $("#user-list");
+  container.textContent = "";
+  const accounts = userAccounts(payload);
+  if (!accounts.length) {
+    container.textContent = "No user accounts found.";
+    return;
+  }
+  for (const account of accounts) {
+    const row = document.createElement("article");
+    row.className = "user-row";
+    const heading = document.createElement("div");
+    heading.className = "user-heading";
+    const username = document.createElement("strong");
+    username.textContent = account.username;
+    const detail = document.createElement("span");
+    detail.className = "hint";
+    const current = account.current ? " · current account" : "";
+    const disabled = account.enabled ? "" : " · disabled";
+    const created = new Date(account.createdAt * 1000).toLocaleString();
+    detail.textContent = `${accountRoleLabel(account.role)}${current}${disabled} · added ${created}`;
+    heading.append(username, detail);
+
+    const form = document.createElement("form");
+    form.className = "user-reset-form";
+    const passwordLabel = document.createElement("label");
+    passwordLabel.textContent = "New password";
+    const password = document.createElement("input");
+    password.type = "password";
+    password.minLength = 8;
+    password.maxLength = 256;
+    password.autocomplete = "new-password";
+    password.required = true;
+    passwordLabel.appendChild(password);
+    const confirmLabel = document.createElement("label");
+    confirmLabel.textContent = "Confirm password";
+    const confirmation = document.createElement("input");
+    confirmation.type = "password";
+    confirmation.minLength = 8;
+    confirmation.maxLength = 256;
+    confirmation.autocomplete = "new-password";
+    confirmation.required = true;
+    confirmLabel.appendChild(confirmation);
+    const submit = document.createElement("button");
+    submit.type = "submit";
+    submit.textContent = "Reset password";
+    form.append(passwordLabel, confirmLabel, submit);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const validationError = passwordPairError(
+        password.value,
+        confirmation.value,
+      );
+      if (validationError) {
+        message(validationError, "error");
+        return;
+      }
+      submit.disabled = true;
+      try {
+        const result = await api(`/api/users/${account.id}/password`, {
+          method: "PUT",
+          body: JSON.stringify({ password: password.value }),
+        });
+        password.value = "";
+        confirmation.value = "";
+        if (result.current_session_revoked) {
+          leaveAppForLogin(account.username);
+          message("Your password was reset. Log in with the new password.", "ok");
+          return;
+        }
+        message(`Password reset for ${account.username}; existing sessions were signed out.`, "ok");
+        void loadUsers();
+      } catch (error) {
+        message(error.message, "error");
+      } finally {
+        submit.disabled = false;
+      }
+    });
+
+    row.append(heading, form);
+    container.appendChild(row);
+  }
+}
+
+async function loadUsers() {
+  if (!isAdmin(currentUser)) return;
+  const generation = ++userLoadGeneration;
+  try {
+    const payload = await api("/api/users");
+    if (generation === userLoadGeneration) renderUsers(payload);
+  } catch (error) {
+    if (generation === userLoadGeneration) message(error.message, "error");
+  }
+}
+
+$("#user-create-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const submit = $("#user-create-form button[type='submit']");
+  const password = $("#user-create-password").value;
+  const confirmation = $("#user-create-password-confirm").value;
+  const validationError = passwordPairError(password, confirmation);
+  if (validationError) {
+    message(validationError, "error");
+    return;
+  }
+  submit.disabled = true;
+  try {
+    const result = await api("/api/users", {
+      method: "POST",
+      body: JSON.stringify({
+        username: $("#user-create-username").value.trim(),
+        password,
+        role: $("#user-create-role").value,
+      }),
+    });
+    $("#user-create-username").value = "";
+    $("#user-create-password").value = "";
+    $("#user-create-password-confirm").value = "";
+    message(`User ${result.user.username} added.`, "ok");
+    void loadUsers();
+  } catch (error) {
+    message(error.message, "error");
+  } finally {
+    submit.disabled = false;
+  }
+});
 
 const loadDeepLinkSettings = createLatestDeepLinkSettingsLoader(
   () => api("/api/settings/deep-link"),

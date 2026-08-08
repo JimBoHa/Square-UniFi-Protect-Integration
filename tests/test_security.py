@@ -26,6 +26,9 @@ from .test_api import make_webhook_event
 
 PROTECTED_ENDPOINTS = [
     ("GET", "/api/session"),
+    ("GET", "/api/users"),
+    ("POST", "/api/users"),
+    ("PUT", "/api/users/1/password"),
     ("GET", "/api/cameras"),
     ("GET", "/api/locations"),
     ("GET", "/api/pos-devices"),

@@ -49,6 +49,9 @@ timeline near that timestamp.
 - **Bounded thumbnail storage** — optionally resize/re-encode new or existing
   JPEGs, expire thumbnails by age, and cap total thumbnail storage. Expiration
   removes only image bytes; transaction facts and Protect timeline links remain.
+- **Role-bound sessions** — administrators can configure integrations and run
+  manual syncs; view-only accounts can use the dashboard, transaction feed,
+  CSV export, thumbnails, and footage links without changing configuration.
 
 ## Protect integration boundary
 
@@ -117,7 +120,8 @@ claims that the original request used HTTPS.
 
 Then:
 
-1. **Create the admin password** (first run only).
+1. **Create the administrator account** (first run only). Its username is
+   `admin`; upgraded installations keep their existing password and sessions.
 2. **Settings → UniFi Protect console** — host/IP of your console plus a local
    Protect user's credentials (a dedicated view-only local user is recommended).
    To trigger an alarm for completed sales, also create a key under UniFi Site
@@ -250,8 +254,11 @@ the wrong frame instead of being displayed.
 - **Secrets encrypted at rest** — the Square access token, webhook signature
   key, Protect password, and Protect API key are Fernet-encrypted in SQLite;
   the key file is created `0600`.
-- **Admin password** hashed with scrypt; login is throttled after repeated
-  failures; sessions are random 256-bit tokens in `HttpOnly`/`SameSite` cookies.
+- **Account passwords** are hashed with scrypt; login is throttled after
+  repeated failures; sessions are random 256-bit tokens in
+  `HttpOnly`/`SameSite` cookies and resolve the account's live role on every
+  request. Provider configuration, discovery, health checks, OAuth, camera
+  mappings, and manual sync are enforced as administrator-only by the server.
 - **Webhooks verified** — Square's `x-square-hmacsha256-signature` is checked
   with a constant-time comparison; unsigned or forged deliveries are rejected,
   the endpoint accepts only payment-created/payment-updated envelopes, and it is

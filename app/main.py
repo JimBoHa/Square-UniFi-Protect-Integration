@@ -55,9 +55,11 @@ from .square_client import (
 )
 from .store import (
     ALARM_ENABLED_AFTER_SETTING,
+    DEFAULT_ADMIN_USERNAME,
     FRAME_OFFSET_UNAVAILABLE,
     PROTECT_CONSOLE_ID_SETTING,
     PROTECT_CONSOLE_GENERATION_SETTING,
+    ROLE_ADMIN,
     SQUARE_OAUTH_AUTHORIZATION_REVISION_SETTING,
     ProtectConsoleSwitchConfirmationRequired,
     ProtectSettingsConflict,
@@ -72,6 +74,7 @@ from .store import (
 logger = logging.getLogger("spi")
 
 SESSION_COOKIE = "spi_session"
+DUMMY_PASSWORD_HASH = f"scrypt${'00' * 16}${'00' * 64}"
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
 # One bounded request can hold the maximum 500-entry camera mapping plus ample
@@ -383,6 +386,7 @@ class SetupBody(BaseModel):
     )
 
 class LoginBody(BaseModel):
+    username: str = Field(default=DEFAULT_ADMIN_USERNAME, max_length=64)
     password: str = Field(max_length=256)
 
 class ProtectSettingsBody(BaseModel):
@@ -528,7 +532,7 @@ def create_app(
     # Only the bundled runner may assert this after installing its TLS kwargs.
     # Never infer transport security from environment or request headers here.
     configured_tls = tls_enabled
-    setup_pending = store.get_setting("admin.password_hash") is None
+    setup_pending = not store.setup_complete()
     bootstrap_secret_verifier = _BootstrapSecretVerifier.from_environment(
         generate_if_missing=setup_pending
     )
@@ -854,12 +858,24 @@ def create_app(
 
     # -- auth ----------------------------------------------------------------
 
-    def require_session(request: Request) -> None:
+    def require_session(request: Request) -> dict:
         token = request.cookies.get(SESSION_COOKIE)
-        if not token or not store.session_valid(token):
+        user = store.session_user(token) if token else None
+        if user is None:
             raise HTTPException(status_code=401, detail="Authentication required")
+        return user
 
     authed = Depends(require_session)
+
+    def require_admin(user: dict = authed) -> dict:
+        if user["role"] != ROLE_ADMIN:
+            raise HTTPException(
+                status_code=403,
+                detail="Administrator access required",
+            )
+        return user
+
+    admin_only = Depends(require_admin)
 
     def client_key(request: Request) -> str:
         return request.client.host if request.client else "unknown"
@@ -931,7 +947,7 @@ def create_app(
     @app.get("/api/status")
     def status() -> dict:
         return {
-            "setup_complete": store.get_setting("admin.password_hash") is not None,
+            "setup_complete": store.setup_complete(),
             "protect_configured": store.get_setting("protect.host") is not None,
             "square_configured": store.get_setting("square.access_token") is not None,
             "cameras_mapped": len(store.get_camera_mappings()) > 0,
@@ -939,7 +955,7 @@ def create_app(
 
     @app.post("/api/setup")
     def setup(body: SetupBody, request: Request) -> dict:
-        if store.get_setting("admin.password_hash") is not None:
+        if store.setup_complete():
             bootstrap_secret_verifier.clear()
             raise HTTPException(status_code=409, detail="Setup already completed")
         direct_request = _is_explicit_local_setup_request(
@@ -974,23 +990,37 @@ def create_app(
                 },
             )
         password_hash = hash_password(body.password)
-        if not store.set_setting_if_absent("admin.password_hash", password_hash):
+        if not store.create_initial_admin(password_hash):
             bootstrap_secret_verifier.clear()
             raise HTTPException(status_code=409, detail="Setup already completed")
         bootstrap_secret_verifier.clear()
-        return {"ok": True}
+        return {"ok": True, "username": DEFAULT_ADMIN_USERNAME}
 
     @app.post("/api/login")
     def login(body: LoginBody, request: Request, response: Response) -> dict:
         check_login_throttle(request)
-        stored = store.get_setting("admin.password_hash")
-        if stored is None:
+        if not store.setup_complete():
             raise HTTPException(status_code=409, detail="Run setup first")
-        if not verify_password(body.password, stored):
+        account = store.user_for_login(body.username)
+        stored_hash = account["password_hash"] if account else DUMMY_PASSWORD_HASH
+        password_valid = verify_password(body.password, stored_hash)
+        if account is None or not password_valid:
             record_login_failure(request)
-            raise HTTPException(status_code=401, detail="Invalid password")
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid username or password",
+            )
         token = new_session_token()
-        store.create_session(token)
+        try:
+            session_user = store.create_session(token, account["id"])
+        except ValueError:
+            # A concurrent account disable must look exactly like any other
+            # failed login; never disclose that the username was valid.
+            record_login_failure(request)
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid username or password",
+            ) from None
         clear_login_failures(request)
         response.set_cookie(
             SESSION_COOKIE,
@@ -1000,7 +1030,22 @@ def create_app(
             secure=cookie_secure,
             max_age=12 * 3600,
         )
-        return {"ok": True}
+        return {
+            "ok": True,
+            "user": {
+                "username": session_user["username"],
+                "role": session_user["role"],
+            },
+        }
+
+    @app.get("/api/session")
+    def session(user: dict = authed) -> dict:
+        return {
+            "user": {
+                "username": user["username"],
+                "role": user["role"],
+            }
+        }
 
     @app.post("/api/logout")
     def logout(request: Request, response: Response, _=authed) -> dict:
@@ -1030,14 +1075,14 @@ def create_app(
         return {"ok": True, "alarm_configured": False}
 
     @app.delete("/api/settings/protect/alarm")
-    def delete_protect_alarm(_=authed) -> dict:
+    def delete_protect_alarm(_=admin_only) -> dict:
         """Disable alarms locally even when the Protect console is offline."""
         return clear_protect_alarm_settings()
 
     discovery_scan_lock = threading.Lock()
 
     @app.post("/api/discover/protect")
-    def discover_protect(body: DiscoverProtectBody, _=authed) -> list[dict]:
+    def discover_protect(body: DiscoverProtectBody, _=admin_only) -> list[dict]:
         """Scan the LAN for UniFi consoles; optionally probe one address.
 
         Broadcast/subnet discovery finds consoles on this network; consoles
@@ -1064,7 +1109,7 @@ def create_app(
     def protect_console_switch_token(
         body: ProtectConsoleSwitchTokenBody,
         response: Response,
-        _=authed,
+        _=admin_only,
     ) -> dict:
         """Verify the target console, then issue short-lived destructive consent."""
         try:
@@ -1117,7 +1162,7 @@ def create_app(
         return {"token": token or ""}
 
     @app.put("/api/settings/protect")
-    def set_protect(body: ProtectSettingsBody, _=authed) -> dict:
+    def set_protect(body: ProtectSettingsBody, _=admin_only) -> dict:
         if body.disable_alarm:
             return {
                 **clear_protect_alarm_settings(),
@@ -1292,7 +1337,7 @@ def create_app(
         }
 
     @app.put("/api/settings/square")
-    def set_square(body: SquareSettingsBody, _=authed) -> dict:
+    def set_square(body: SquareSettingsBody, _=admin_only) -> dict:
         if body.environment not in ("production", "sandbox"):
             raise HTTPException(status_code=422, detail="Invalid environment")
         if bool(body.webhook_signature_key) != bool(body.webhook_url):
@@ -1402,12 +1447,12 @@ def create_app(
         }
 
     @app.get("/api/settings/deep-link")
-    def get_deep_link_settings(_=authed) -> dict[str, str]:
+    def get_deep_link_settings(_=admin_only) -> dict[str, str]:
         """Return only the non-secret Protect timeline-link configuration."""
         return deep_link_settings_response()
 
     @app.put("/api/settings/deep-link")
-    def set_deep_link_settings(body: DeepLinkSettingsBody, _=authed) -> dict:
+    def set_deep_link_settings(body: DeepLinkSettingsBody, _=admin_only) -> dict:
         try:
             template = deeplink.validate_deep_link_template(body.template)
         except ValueError as exc:
@@ -1466,7 +1511,7 @@ def create_app(
     WEBHOOK_SUBSCRIPTION_NAME = "square-unifi-protect"
 
     @app.post("/api/settings/square/webhook/register")
-    def register_webhook(body: WebhookRegisterBody, _=authed) -> dict:
+    def register_webhook(body: WebhookRegisterBody, _=admin_only) -> dict:
         """Create (or retarget) our Square webhook subscription automatically.
 
         Uses Square's Webhook Subscriptions API so the operator never has to
@@ -1549,7 +1594,7 @@ def create_app(
         return {"ok": True, "notification_url": url, "updated": existing is not None}
 
     @app.put("/api/settings/square/oauth-app")
-    def set_square_oauth_app(body: SquareOAuthAppBody, _=authed) -> dict:
+    def set_square_oauth_app(body: SquareOAuthAppBody, _=admin_only) -> dict:
         """Store the Square application's OAuth client credentials."""
         if body.environment not in ("production", "sandbox"):
             raise HTTPException(status_code=422, detail="Invalid environment")
@@ -1565,7 +1610,7 @@ def create_app(
         return {"ok": True}
 
     @app.get("/oauth/square/start")
-    def square_oauth_start(_=authed) -> RedirectResponse:
+    def square_oauth_start(_=admin_only) -> RedirectResponse:
         oauth = store.get_settings(
             (
                 "square.oauth_client_id",
@@ -1595,7 +1640,7 @@ def create_app(
 
     @app.get("/oauth/square/callback")
     def square_oauth_callback(
-        code: str = "", state: str = "", error: str = "", _=authed
+        code: str = "", state: str = "", error: str = "", _=admin_only
     ) -> RedirectResponse:
         # Read the manual-authorization fence before consuming the one-time
         # state. A manual save racing either step will delete the state or
@@ -1691,7 +1736,7 @@ def create_app(
         return RedirectResponse("/?square_oauth=connected", status_code=302)
 
     @app.post("/api/settings/square/oauth-switch/confirm")
-    def confirm_square_oauth_switch(_=authed) -> dict:
+    def confirm_square_oauth_switch(_=admin_only) -> dict:
         """Activate a pending OAuth grant after explicit destructive consent."""
         with square_account_lock:
             pending = store.get_settings(SQUARE_OAUTH_PENDING_SETTING_KEYS)
@@ -1759,14 +1804,14 @@ def create_app(
         }
 
     @app.delete("/api/settings/square/oauth-switch")
-    def cancel_square_oauth_switch(_=authed) -> dict:
+    def cancel_square_oauth_switch(_=admin_only) -> dict:
         store.delete_settings(*SQUARE_OAUTH_PENDING_SETTING_KEYS)
         return {"ok": True}
 
     # -- cameras & mapping ------------------------------------------------------
 
     @app.get("/api/health/protect")
-    def protect_health(_=authed) -> dict:
+    def protect_health(_=admin_only) -> dict:
         """Live connectivity check so the UI can show a trustworthy indicator."""
         client = build_protect()
         if client is None:
@@ -1787,7 +1832,7 @@ def create_app(
         }
 
     @app.get("/api/cameras")
-    def cameras(response: Response, _=authed) -> list[dict]:
+    def cameras(response: Response, _=admin_only) -> list[dict]:
         with store.integration_guard():
             return _cameras_locked(response)
 
@@ -1835,7 +1880,7 @@ def create_app(
         return camera_rows
 
     @app.get("/api/health/square")
-    def square_health(_=authed) -> dict:
+    def square_health(_=admin_only) -> dict:
         """Live connectivity check so the UI can show a trustworthy indicator."""
         client = build_square()
         if client is None:
@@ -1856,7 +1901,7 @@ def create_app(
         }
 
     @app.get("/api/locations")
-    def locations(response: Response, _=authed) -> list[dict]:
+    def locations(response: Response, _=admin_only) -> list[dict]:
         with square_account_lock, store.integration_guard():
             client = require_square()
             try:
@@ -1874,7 +1919,7 @@ def create_app(
                 client.close()
 
     @app.get("/api/pos-devices")
-    def pos_devices(_=authed) -> JSONResponse:
+    def pos_devices(_=admin_only) -> JSONResponse:
         with store.integration_guard():
             return JSONResponse(
                 store.get_observed_devices(),
@@ -1882,7 +1927,7 @@ def create_app(
             )
 
     @app.get("/api/camera-preview/{camera_id}")
-    def camera_preview(camera_id: str, _=authed) -> Response:
+    def camera_preview(camera_id: str, _=admin_only) -> Response:
         try:
             camera_id = validate_camera_id(camera_id)
         except ValueError as exc:
@@ -1909,7 +1954,7 @@ def create_app(
         )
 
     @app.get("/api/camera-mapping")
-    def get_mapping(_=authed) -> JSONResponse:
+    def get_mapping(_=admin_only) -> JSONResponse:
         with store.integration_guard():
             protect_generation = store.get_setting(
                 PROTECT_CONSOLE_GENERATION_SETTING
@@ -1925,7 +1970,7 @@ def create_app(
             )
 
     @app.put("/api/camera-mapping")
-    def set_mapping(request: Request, body: CameraMappingBody, _=authed) -> dict:
+    def set_mapping(request: Request, body: CameraMappingBody, _=admin_only) -> dict:
         account_revision = request.headers.get("x-square-account-revision")
         if not account_revision:
             raise HTTPException(
@@ -2368,7 +2413,7 @@ def create_app(
             sync_execution_lock.release()
 
     @app.post("/api/sync")
-    def manual_sync(_=authed) -> dict:
+    def manual_sync(_=admin_only) -> dict:
         try:
             ingested = try_run_sync()
             if ingested is None:

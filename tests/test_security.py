@@ -25,6 +25,7 @@ from .conftest import (
 from .test_api import make_webhook_event
 
 PROTECTED_ENDPOINTS = [
+    ("GET", "/api/session"),
     ("GET", "/api/cameras"),
     ("GET", "/api/locations"),
     ("GET", "/api/pos-devices"),

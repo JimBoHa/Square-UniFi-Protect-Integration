@@ -470,6 +470,7 @@ def create_app(
     app.state.login_failures: dict[str, list[float]] = {}
     app.state.login_lock = threading.Lock()
     square_account_lock = threading.RLock()
+    sync_execution_lock = threading.Lock()
     # Single worker draining the durable thumbnail-retry queue: webhooks ack
     # before any Protect I/O and just nudge this drain, which the queue's
     # leases and backoff keep bounded and evidence-safe.
@@ -2096,7 +2097,7 @@ def create_app(
                 headers={"Cache-Control": PRIVATE_NO_STORE},
             )
 
-    def run_sync() -> int:
+    def _run_sync() -> int:
         with square_account_lock:
             # Sync passes an account-fenced settings snapshot to build_square,
             # so refresh the OAuth grant before taking that snapshot. Otherwise
@@ -2150,10 +2151,24 @@ def create_app(
                     if protect:
                         protect.close()
 
+    def try_run_sync() -> int | None:
+        if not sync_execution_lock.acquire(blocking=False):
+            return None
+        try:
+            return _run_sync()
+        finally:
+            sync_execution_lock.release()
+
     @app.post("/api/sync")
     def manual_sync(_=authed) -> dict:
         try:
-            return {"ok": True, "ingested": run_sync()}
+            ingested = try_run_sync()
+            if ingested is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A sync is already in progress",
+                )
+            return {"ok": True, "ingested": ingested}
         except (SquareError, ProtectError) as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         except SquareAccountChanged as exc:
@@ -2292,7 +2307,7 @@ def create_app(
 
     poller: sync.Poller | None = None
     if poll_interval is not None:
-        poller = sync.Poller(run_sync, interval_seconds=poll_interval)
+        poller = sync.Poller(try_run_sync, interval_seconds=poll_interval)
         app.state.poller = poller
 
         @app.on_event("startup")

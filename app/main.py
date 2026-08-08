@@ -69,6 +69,8 @@ from .store import (
     Store,
     TransactionSnapshotExpired,
     TransactionSnapshotFilterMismatch,
+    UserAlreadyExists,
+    normalize_username,
 )
 
 logger = logging.getLogger("spi")
@@ -388,6 +390,14 @@ class SetupBody(BaseModel):
 class LoginBody(BaseModel):
     username: str = Field(default=DEFAULT_ADMIN_USERNAME, max_length=64)
     password: str = Field(max_length=256)
+
+class CreateUserBody(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=8, max_length=256)
+    role: Literal["admin", "viewer"]
+
+class ResetUserPasswordBody(BaseModel):
+    password: str = Field(min_length=8, max_length=256)
 
 class ProtectSettingsBody(BaseModel):
     host: str
@@ -1012,7 +1022,11 @@ def create_app(
             )
         token = new_session_token()
         try:
-            session_user = store.create_session(token, account["id"])
+            session_user = store.create_session(
+                token,
+                account["id"],
+                account["auth_revision"],
+            )
         except ValueError:
             # A concurrent account disable must look exactly like any other
             # failed login; never disclose that the username was valid.
@@ -1054,6 +1068,51 @@ def create_app(
             store.delete_session(token)
         response.delete_cookie(SESSION_COOKIE)
         return {"ok": True}
+
+    @app.get("/api/users")
+    def users(current_admin: dict = admin_only) -> dict:
+        return {
+            "users": [
+                {
+                    **user,
+                    "current": user["id"] == current_admin["id"],
+                }
+                for user in store.list_users()
+            ]
+        }
+
+    @app.post("/api/users", status_code=201)
+    def create_user(body: CreateUserBody, _=admin_only) -> dict:
+        try:
+            username = normalize_username(body.username)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        password_hash = hash_password(body.password)
+        try:
+            user = store.create_user(username, password_hash, body.role)
+        except UserAlreadyExists as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True, "user": {**user, "current": False}}
+
+    @app.put("/api/users/{user_id}/password")
+    def reset_user_password(
+        user_id: int,
+        body: ResetUserPasswordBody,
+        current_admin: dict = admin_only,
+    ) -> dict:
+        user = store.reset_user_password(user_id, hash_password(body.password))
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {
+            "ok": True,
+            "user": {
+                key: value
+                for key, value in user.items()
+                if key != "sessions_revoked"
+            },
+            "sessions_revoked": user["sessions_revoked"],
+            "current_session_revoked": user_id == current_admin["id"],
+        }
 
     # -- settings --------------------------------------------------------------
 

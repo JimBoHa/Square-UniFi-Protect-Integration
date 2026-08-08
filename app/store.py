@@ -171,6 +171,11 @@ class ProtectConsoleSwitchConfirmationRequired(RuntimeError):
 class ProtectSettingsConflict(RuntimeError):
     """Protect settings changed after a caller took its validation snapshot."""
 
+
+class UserAlreadyExists(ValueError):
+    """A case-insensitive local username is already registered."""
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -307,6 +312,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('admin', 'viewer')),
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    auth_revision INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -896,6 +902,15 @@ class Store:
 
     def _migrate_auth(self) -> None:
         """Move the legacy single admin hash and sessions into named users."""
+        user_columns = {
+            row["name"]
+            for row in self._db.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "auth_revision" not in user_columns:
+            self._db.execute(
+                "ALTER TABLE users ADD COLUMN auth_revision "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
         legacy_password_hash = self._setting_value_locked("admin.password_hash")
         user_count = self._db.execute(
             "SELECT COUNT(*) AS count FROM users"
@@ -4059,12 +4074,13 @@ class Store:
                 raise
 
     def create_user(self, username: str, password_hash: str, role: str) -> dict:
-        """Create one role-bound identity; admin API wiring lives separately."""
+        """Create one role-bound local identity."""
         username = normalize_username(username)
         if role not in USER_ROLES:
             raise ValueError("Invalid user role")
         if not password_hash or len(password_hash) > 1024:
             raise ValueError("Invalid password hash")
+        created_at = time.time()
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -4072,14 +4088,77 @@ class Store:
                     "INSERT INTO users "
                     "(username, password_hash, role, enabled, created_at) "
                     "VALUES (?, ?, ?, 1, ?)",
-                    (username, password_hash, role, time.time()),
+                    (username, password_hash, role, created_at),
                 )
                 user_id = int(cursor.lastrowid)
+                self._db.commit()
+            except sqlite3.IntegrityError as exc:
+                self._db.rollback()
+                raise UserAlreadyExists("Username already exists") from exc
+            except Exception:
+                self._db.rollback()
+                raise
+        return {
+            "id": user_id,
+            "username": username,
+            "role": role,
+            "enabled": True,
+            "created_at": created_at,
+        }
+
+    def list_users(self) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, username, role, enabled, created_at FROM users "
+                "ORDER BY username COLLATE NOCASE, id"
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "username": row["username"],
+                "role": row["role"],
+                "enabled": bool(row["enabled"]),
+                "created_at": float(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def reset_user_password(self, user_id: int, password_hash: str) -> dict | None:
+        """Replace a password and atomically revoke every target session."""
+        if not password_hash or len(password_hash) > 1024:
+            raise ValueError("Invalid password hash")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(
+                    "SELECT id, username, role, enabled, created_at FROM users "
+                    "WHERE id = ?",
+                    (int(user_id),),
+                ).fetchone()
+                if row is None:
+                    self._db.commit()
+                    return None
+                self._db.execute(
+                    "UPDATE users SET password_hash = ?, "
+                    "auth_revision = auth_revision + 1 WHERE id = ?",
+                    (password_hash, int(user_id)),
+                )
+                revoked = self._db.execute(
+                    "DELETE FROM sessions WHERE user_id = ?",
+                    (int(user_id),),
+                ).rowcount
                 self._db.commit()
             except Exception:
                 self._db.rollback()
                 raise
-        return {"id": user_id, "username": username, "role": role}
+        return {
+            "id": int(row["id"]),
+            "username": row["username"],
+            "role": row["role"],
+            "enabled": bool(row["enabled"]),
+            "created_at": float(row["created_at"]),
+            "sessions_revoked": int(revoked),
+        }
 
     def user_for_login(self, username: str) -> dict | None:
         try:
@@ -4088,20 +4167,25 @@ class Store:
             return None
         with self._lock:
             row = self._db.execute(
-                "SELECT id, username, password_hash, role FROM users "
+                "SELECT id, username, password_hash, role, auth_revision FROM users "
                 "WHERE username = ? COLLATE NOCASE AND enabled = 1",
                 (username,),
             ).fetchone()
         return dict(row) if row else None
 
-    def create_session(self, token: str, user_id: int) -> dict:
+    def create_session(
+        self,
+        token: str,
+        user_id: int,
+        expected_auth_revision: int,
+    ) -> dict:
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 user = self._db.execute(
                     "SELECT id, username, role FROM users "
-                    "WHERE id = ? AND enabled = 1",
-                    (int(user_id),),
+                    "WHERE id = ? AND enabled = 1 AND auth_revision = ?",
+                    (int(user_id), int(expected_auth_revision)),
                 ).fetchone()
                 if user is None:
                     raise ValueError("User is not available")

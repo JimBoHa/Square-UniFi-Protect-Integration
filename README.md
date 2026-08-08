@@ -52,6 +52,9 @@ timeline near that timestamp.
 - **Role-bound sessions** — administrators can configure integrations and run
   manual syncs; view-only accounts can use the dashboard, transaction feed,
   CSV export, thumbnails, and footage links without changing configuration.
+- **Local account management** — administrators can add administrator or
+  view-only users and reset passwords from Settings. A reset atomically signs
+  out every session belonging to that account.
 
 ## Protect integration boundary
 
@@ -155,6 +158,9 @@ Then:
    once to apply the active compression policy to already-captured files.
 6. Open **Transactions** — press *Sync now* for an immediate backfill; the
    poller (`SPI_POLL_INTERVAL`, default 60 s) keeps it current thereafter.
+6. Optional: use **Settings → App users** to add view-only staff accounts or
+   another administrator. Password resets immediately revoke that user's
+   existing sessions; resetting your own password returns you to login.
 
 ## Configuration
 
@@ -259,6 +265,10 @@ the wrong frame instead of being displayed.
   `HttpOnly`/`SameSite` cookies and resolve the account's live role on every
   request. Provider configuration, discovery, health checks, OAuth, camera
   mappings, and manual sync are enforced as administrator-only by the server.
+- **Password-reset race protection** — each account has an authentication
+  revision. A reset increments it and deletes all of the account's sessions in
+  one transaction, so a concurrent login that verified the old password cannot
+  publish a session after the reset.
 - **Webhooks verified** — Square's `x-square-hmacsha256-signature` is checked
   with a constant-time comparison; unsigned or forged deliveries are rejected,
   the endpoint accepts only payment-created/payment-updated envelopes, and it is

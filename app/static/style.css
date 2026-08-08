@@ -69,6 +69,15 @@ button[type="submit"], #save-mapping, #sync-now, #export-csv {
 .mapping-row { display: flex; gap: 0.75rem; align-items: center; margin: 0.4rem 0; }
 .mapping-row .loc { min-width: 280px; font-weight: 600; }
 #camera-preview { max-width: 480px; width: 100%; border-radius: 8px; border: 1px solid var(--border); }
+.user-list { display: grid; gap: 0.75rem; margin-bottom: 2rem; }
+.user-row { border: 1px solid var(--border); border-radius: 8px; padding: 0.75rem; }
+.user-heading { display: flex; gap: 0.5rem; align-items: baseline; flex-wrap: wrap; }
+.user-heading .hint { margin: 0; }
+.user-reset-form {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+  align-items: end; gap: 0.5rem; max-width: none; margin: 0.75rem 0 0;
+}
+.user-reset-form button { min-height: 2.35rem; }
 
 .txn {
   display: flex; gap: 1rem; align-items: center;
@@ -137,6 +146,7 @@ button[type="submit"], #save-mapping, #sync-now, #export-csv {
   }
   .mapping-row .loc { min-width: 0; width: 100%; }
   .mapping-row select { width: 100%; }
+  .user-reset-form { grid-template-columns: 1fr; }
   .txn {
     display: grid; grid-template-columns: minmax(0, 1fr); align-items: stretch;
   }

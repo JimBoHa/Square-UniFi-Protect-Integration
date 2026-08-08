@@ -54,7 +54,10 @@ test("frontend resolves session role before loading privileged views", () => {
   assert.match(html, /id="sync-now" data-admin-only hidden/);
   assert.match(app, /const session = await api\("\/api\/session"\)/);
   assert.doesNotMatch(app, /Probe an authed endpoint[\s\S]*api\("\/api\/camera-mapping"\)/);
-  assert.match(app, /if \(isAdmin\(currentUser\)\) loadSettingsView\(\)/);
+  assert.match(
+    app,
+    /if \(isAdmin\(currentUser\)\) \{[\s\S]*loadSettingsView\(\);[\s\S]*loadUsers\(\);[\s\S]*\}/,
+  );
   assert.match(
     app,
     /if \(isAdmin\(currentUser\) && await maybeStartWizard\(\)\)/,

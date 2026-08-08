@@ -226,6 +226,22 @@
         <h3>Preview</h3>
         <img id="camera-preview" alt="Camera preview">
       </div>
+
+      <h2>App users</h2>
+      <p class="hint">Administrators can change integrations and run manual syncs. View-only users can search, export, and open transaction evidence.</p>
+      <form id="user-create-form">
+        <label>Username <input id="user-create-username" minlength="1" maxlength="64" autocomplete="off" required></label>
+        <label>Role
+          <select id="user-create-role">
+            <option value="viewer">View only</option>
+            <option value="admin">Administrator</option>
+          </select>
+        </label>
+        <label>Password <input type="password" id="user-create-password" minlength="8" maxlength="256" autocomplete="new-password" required></label>
+        <label>Confirm password <input type="password" id="user-create-password-confirm" minlength="8" maxlength="256" autocomplete="new-password" required></label>
+        <button type="submit">Add user</button>
+      </form>
+      <div id="user-list" class="user-list" aria-live="polite"></div>
     </section>
 
     <!-- Transactions -->
@@ -291,6 +307,7 @@
   <script src="/frame-offset.js"></script>
   <script src="/webhook-delivery.js"></script>
   <script src="/roles.js"></script>
+  <script src="/user-management.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

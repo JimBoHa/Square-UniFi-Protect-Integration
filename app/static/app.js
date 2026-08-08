@@ -1078,7 +1078,10 @@ $("#txn-filter-clear").addEventListener("click", () => {
   $("#txn-query").focus();
 });
 
-$("#sync-now").addEventListener("click", async () => {
+const syncNowButton = $("#sync-now");
+syncNowButton.addEventListener("click", async () => {
+  if (syncNowButton.disabled) return;
+  syncNowButton.disabled = true;
   message("Syncing…", "");
   try {
     const result = await api("/api/sync", { method: "POST" });
@@ -1086,6 +1089,8 @@ $("#sync-now").addEventListener("click", async () => {
     await loadTransactions({ reset: true });
   } catch (err) {
     message(err.message, "error");
+  } finally {
+    syncNowButton.disabled = false;
   }
 });
 

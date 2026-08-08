@@ -216,6 +216,18 @@ def _publish_pair(
 
 
 def _local_ip() -> str | None:
+    # A host with multiple interfaces (or a VPN) can route the UDP probe over
+    # a different address than the one Uvicorn is configured to serve.  Prefer
+    # an explicit IP bind so the generated certificate always covers the URL
+    # clients actually use.  Wildcard and hostname binds still need discovery.
+    configured_host = os.environ.get("SPI_HOST", "").strip().strip("[]")
+    try:
+        configured_ip = ipaddress.ip_address(configured_host)
+    except ValueError:
+        configured_ip = None
+    if configured_ip is not None and not configured_ip.is_unspecified:
+        return str(configured_ip)
+
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         probe.connect(("198.51.100.1", 9))  # no packets are sent

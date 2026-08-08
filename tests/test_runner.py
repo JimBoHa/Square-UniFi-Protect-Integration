@@ -74,6 +74,22 @@ def test_runner_rejects_invalid_port_before_starting_uvicorn(tmp_path, monkeypat
     assert not data_dir.exists()
 
 
+def test_runner_rejects_custom_tls_files_before_creating_app(tmp_path, monkeypatch):
+    monkeypatch.setenv("SPI_TLS", "0")
+    monkeypatch.setenv("SPI_TLS_CERTFILE", "/tmp/cert.pem")
+    monkeypatch.setenv("SPI_TLS_KEYFILE", "/tmp/key.pem")
+    monkeypatch.setenv("SPI_DATA_DIR", str(tmp_path / "data"))
+
+    def unexpected_create_app(**_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("Application created with invalid TLS configuration")
+
+    monkeypatch.setattr(main_module, "create_app", unexpected_create_app)
+
+    with pytest.raises(ValueError, match="SPI_TLS must be 1"):
+        runner.main()
+    assert not (tmp_path / "data").exists()
+
+
 def test_runner_passes_normalized_port_to_uvicorn(tmp_path, monkeypatch):
     application = object()
     captured = {}

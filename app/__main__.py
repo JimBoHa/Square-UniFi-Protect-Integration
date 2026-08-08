@@ -9,6 +9,9 @@ Environment:
                  otherwise one is generated and printed once at startup
   SPI_TLS        "1" serves HTTPS with an auto-generated self-signed
                  certificate and enables Secure session cookies
+  SPI_TLS_CERTFILE / SPI_TLS_KEYFILE
+                 optional absolute paths to an administrator-managed PEM
+                 certificate chain and unencrypted private key
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ def main() -> None:
         # Do not let a stale launcher/service environment explicitly override
         # the transport guarantee selected by SPI_TLS.
         os.environ["SPI_COOKIE_SECURE"] = "1"
+    tls_kwargs = uvicorn_tls_kwargs(data_dir, tls_enabled)
     from .main import create_app  # after env adjustments
 
     uvicorn.run(
@@ -52,7 +56,7 @@ def main() -> None:
         host=host,
         port=port,
         log_level="info",
-        **uvicorn_tls_kwargs(data_dir, tls_enabled),
+        **tls_kwargs,
     )
 
 

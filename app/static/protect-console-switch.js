@@ -31,6 +31,7 @@ function publishLatestSettingsLoad(loadGeneration, latestGeneration, publish) {
 
 function settingsSnapshotsMatch({
   cameraGeneration,
+  alarmGeneration = null,
   motionGeneration = null,
   locationRevision,
   mappingGeneration,
@@ -38,6 +39,7 @@ function settingsSnapshotsMatch({
 }) {
   return (
     (cameraGeneration === null || cameraGeneration === mappingGeneration) &&
+    (alarmGeneration === null || alarmGeneration === mappingGeneration) &&
     (motionGeneration === null || motionGeneration === mappingGeneration) &&
     (locationRevision === null || locationRevision === mappingRevision)
   );

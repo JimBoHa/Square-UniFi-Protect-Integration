@@ -152,6 +152,7 @@ function enterApp() {
   if (isAdmin(currentUser)) {
     loadSettingsView();
     void loadUsers();
+    void loadLoginAudit({ reset: true });
   }
   startTransactionRefresh();
   startDashboardRefresh();
@@ -227,6 +228,7 @@ for (const btn of document.querySelectorAll("nav button[data-view]")) {
     if (btn.dataset.view === "settings") {
       loadSettingsView();
       void loadUsers();
+      void loadLoginAudit({ reset: true });
     }
   });
 }
@@ -234,6 +236,64 @@ for (const btn of document.querySelectorAll("nav button[data-view]")) {
 // ---------------------------------------------------------------- settings
 
 let userLoadGeneration = 0;
+let loginAuditGeneration = 0;
+let loginAuditCursor = null;
+let loginAuditEvents = [];
+
+function renderLoginAudit() {
+  const container = $("#login-audit-list");
+  container.textContent = "";
+  if (!loginAuditEvents.length) {
+    container.textContent = "No successful logins recorded yet.";
+    return;
+  }
+  for (const event of loginAuditEvents) {
+    const row = document.createElement("div");
+    row.className = "login-audit-row";
+    const identity = document.createElement("div");
+    const username = document.createElement("strong");
+    username.textContent = event.username;
+    const role = document.createElement("span");
+    role.className = "hint";
+    role.textContent = ` · ${accountRoleLabel(event.role)}`;
+    identity.append(username, role);
+    const detail = document.createElement("p");
+    detail.className = "hint";
+    const when = new Date(event.loggedInAt * 1000).toLocaleString();
+    detail.textContent = `${when} · ${event.clientIp}`;
+    row.append(identity, detail);
+    container.appendChild(row);
+  }
+}
+
+async function loadLoginAudit({ reset = false } = {}) {
+  if (!isAdmin(currentUser)) return;
+  const generation = ++loginAuditGeneration;
+  const beforeId = reset ? null : loginAuditCursor;
+  if (!reset && beforeId === null) return;
+  const button = $("#login-audit-more");
+  button.disabled = true;
+  try {
+    const cursor = beforeId === null ? "" : `&before_id=${beforeId}`;
+    const payload = await api(`/api/login-audit?limit=100${cursor}`);
+    if (generation !== loginAuditGeneration) return;
+    const page = loginAuditPage(payload);
+    loginAuditEvents = reset
+      ? page.events
+      : [...loginAuditEvents, ...page.events];
+    loginAuditCursor = page.nextBeforeId;
+    renderLoginAudit();
+    button.hidden = loginAuditCursor === null;
+  } catch (error) {
+    if (generation === loginAuditGeneration) message(error.message, "error");
+  } finally {
+    if (generation === loginAuditGeneration) button.disabled = false;
+  }
+}
+
+$("#login-audit-more").addEventListener("click", () => {
+  void loadLoginAudit();
+});
 
 function renderUsers(payload) {
   const container = $("#user-list");

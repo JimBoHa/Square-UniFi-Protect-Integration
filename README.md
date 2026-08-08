@@ -48,6 +48,9 @@ timeline near that timestamp.
 - **Local account management** — administrators can add administrator or
   view-only users and reset passwords from Settings. A reset atomically signs
   out every session belonging to that account.
+- **Login history** — every successful login appends the username, role,
+  server-observed client IP, and timestamp to an administrator-only audit log.
+  Older entries remain available through cursor-based pagination.
 
 ## Protect integration boundary
 
@@ -151,6 +154,8 @@ Then:
 6. Optional: use **Settings → App users** to add view-only staff accounts or
    another administrator. Password resets immediately revoke that user's
    existing sessions; resetting your own password returns you to login.
+   The **Login history** below the account list shows successful sign-ins and
+   can load the complete append-only history in bounded pages.
 
 ## Configuration
 
@@ -227,6 +232,10 @@ default (verified on Protect 7.1.87):
   revision. A reset increments it and deletes all of the account's sessions in
   one transaction, so a concurrent login that verified the old password cannot
   publish a session after the reset.
+- **Atomic login auditing** — a successful session and its audit row commit in
+  the same SQLite transaction. Audit rows snapshot the username and role and
+  application-level triggers reject updates or deletes; only administrators can
+  read the paginated history.
 - **Webhooks verified** — Square's `x-square-hmacsha256-signature` is checked
   with a constant-time comparison; unsigned or forged deliveries are rejected,
   and the endpoint is disabled until a signature key is configured.

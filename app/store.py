@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from .security import CredentialCipher, hash_session_token
+from .webhook_delivery import SUPPORTED_PAYMENT_EVENT_TYPES
 
 try:  # POSIX advisory locks.
     import fcntl as _fcntl
@@ -46,6 +47,16 @@ ALARM_SENT = "sent"
 ALARM_CLAIM_LEASE_SECONDS = 60
 ALARM_ENABLED_AFTER_SETTING = "protect.alarm_enabled_after_ms"
 SQUARE_POLL_WATERMARK_TABLE = "square_poll_watermarks"
+SQUARE_WEBHOOK_RECEIPTS_TABLE = "square_webhook_receipts"
+MAX_SQUARE_WEBHOOK_RECEIPTS = 4096
+SQUARE_WEBHOOK_METRIC_SETTING_KEYS = (
+    "webhook.last_event_ms",
+    "webhook.delivery_count",
+    "webhook.last_payment_ms",
+    "webhook.last_delivery_lag_ms",
+    "webhook.accepted_payment_count",
+    "webhook.duplicate_count",
+)
 PROTECT_EVIDENCE_RETIRED_TABLE = "protect_evidence_retired"
 SQUARE_ACCOUNT_REVISION_SETTING = "square.account_revision"
 SQUARE_OAUTH_APP_SETTING_KEYS = (
@@ -214,6 +225,18 @@ CREATE TABLE IF NOT EXISTS square_poll_watermarks (
     location_id TEXT PRIMARY KEY,
     polled_through_ms INTEGER NOT NULL CHECK (polled_through_ms >= 0)
 );
+CREATE TABLE IF NOT EXISTS square_webhook_receipts (
+    event_key TEXT PRIMARY KEY CHECK (length(event_key) = 64),
+    event_type TEXT NOT NULL CHECK (
+        event_type IN ('payment.created', 'payment.updated')
+    ),
+    received_at_ms INTEGER NOT NULL CHECK (received_at_ms >= 0),
+    event_created_at_ms INTEGER CHECK (
+        event_created_at_ms IS NULL OR event_created_at_ms >= 0
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_square_webhook_receipts_received
+    ON square_webhook_receipts (received_at_ms DESC);
 CREATE TABLE IF NOT EXISTS transaction_feed_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     order_revision INTEGER NOT NULL DEFAULT 0
@@ -1605,6 +1628,14 @@ class Store:
         ).fetchone()
         return row is not None
 
+    def _clear_square_webhook_state_locked(self) -> None:
+        if self._table_exists_locked(SQUARE_WEBHOOK_RECEIPTS_TABLE):
+            self._db.execute(f"DELETE FROM {SQUARE_WEBHOOK_RECEIPTS_TABLE}")
+        self._db.executemany(
+            "DELETE FROM settings WHERE key = ?",
+            ((key,) for key in SQUARE_WEBHOOK_METRIC_SETTING_KEYS),
+        )
+
     def _has_square_account_data_locked(self) -> bool:
         """Detect legacy account data that has no merchant identity setting."""
         placeholders = ", ".join("?" for _ in SQUARE_INSTALLATION_SETTING_KEYS)
@@ -1619,6 +1650,7 @@ class Store:
                 return True
         for table_name in (
             SQUARE_POLL_WATERMARK_TABLE,
+            SQUARE_WEBHOOK_RECEIPTS_TABLE,
             PROTECT_EVIDENCE_RETIRED_TABLE,
         ):
             if self._table_exists_locked(table_name) and self._db.execute(
@@ -1915,6 +1947,7 @@ class Store:
                         self._db.execute(
                             f"DELETE FROM {SQUARE_POLL_WATERMARK_TABLE}"
                         )
+                    self._clear_square_webhook_state_locked()
                     # Webhook signatures and any future Square-owned state
                     # must never cross merchant boundaries. Submitted webhook
                     # credentials below are inserted for the new account.
@@ -1939,6 +1972,7 @@ class Store:
                         "DELETE FROM settings WHERE key IN (?, ?)",
                         ("square.webhook_signature_key", "square.webhook_url"),
                     )
+                    self._clear_square_webhook_state_locked()
 
                 if clear_oauth_pending:
                     self._db.executemany(
@@ -2080,6 +2114,176 @@ class Store:
                 except Exception:
                     self._db.rollback()
                     raise
+
+    def _set_plain_setting_locked(self, key: str, value: int) -> None:
+        self._db.execute(
+            "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, 0) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=0",
+            (key, str(int(value))),
+        )
+
+    def _increment_plain_setting_locked(self, key: str) -> None:
+        self._db.execute(
+            "INSERT INTO settings (key, value, encrypted) VALUES (?, '1', 0) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value=CAST(settings.value AS INTEGER) + 1, encrypted=0",
+            (key,),
+        )
+
+    def _set_max_plain_setting_locked(self, key: str, value: int) -> None:
+        self._db.execute(
+            "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, 0) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value=MAX(CAST(settings.value AS INTEGER), "
+            "CAST(excluded.value AS INTEGER)), encrypted=0",
+            (key, str(int(value))),
+        )
+
+    def record_square_webhook_delivery(self, received_at_ms: int) -> None:
+        """Record one validly signed delivery without retaining its payload."""
+        received_at_ms = int(received_at_ms)
+        if received_at_ms < 0:
+            raise ValueError("Invalid webhook receipt time")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._set_max_plain_setting_locked(
+                    "webhook.last_event_ms",
+                    received_at_ms,
+                )
+                self._increment_plain_setting_locked("webhook.delivery_count")
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def square_webhook_receipt_exists(self, event_key: str) -> bool:
+        if len(event_key) != 64 or any(
+            character not in "0123456789abcdef" for character in event_key
+        ):
+            raise ValueError("Invalid webhook receipt key")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM square_webhook_receipts WHERE event_key = ?",
+                (event_key,),
+            ).fetchone()
+        return row is not None
+
+    def record_square_webhook_receipt(
+        self,
+        event_key: str,
+        event_type: str,
+        received_at_ms: int,
+        event_created_at_ms: int | None,
+    ) -> bool:
+        """Record accepted payment event; return False for a duplicate."""
+        if len(event_key) != 64 or any(
+            character not in "0123456789abcdef" for character in event_key
+        ):
+            raise ValueError("Invalid webhook receipt key")
+        if event_type not in SUPPORTED_PAYMENT_EVENT_TYPES:
+            raise ValueError("Invalid Square payment webhook type")
+        received_at_ms = int(received_at_ms)
+        if received_at_ms < 0:
+            raise ValueError("Invalid webhook receipt time")
+        if event_created_at_ms is not None:
+            event_created_at_ms = int(event_created_at_ms)
+            if event_created_at_ms < 0:
+                raise ValueError("Invalid Square event time")
+
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                inserted = self._db.execute(
+                    "INSERT OR IGNORE INTO square_webhook_receipts "
+                    "(event_key, event_type, received_at_ms, event_created_at_ms) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        event_key,
+                        event_type,
+                        received_at_ms,
+                        event_created_at_ms,
+                    ),
+                ).rowcount == 1
+                if inserted:
+                    current_last_payment = self._setting_value_locked(
+                        "webhook.last_payment_ms"
+                    )
+                    try:
+                        is_latest = (
+                            current_last_payment is None
+                            or received_at_ms >= int(current_last_payment)
+                        )
+                    except ValueError:
+                        is_latest = True
+                    if is_latest:
+                        self._set_plain_setting_locked(
+                            "webhook.last_payment_ms",
+                            received_at_ms,
+                        )
+                        if event_created_at_ms is not None:
+                            self._set_plain_setting_locked(
+                                "webhook.last_delivery_lag_ms",
+                                received_at_ms - event_created_at_ms,
+                            )
+                        else:
+                            self._db.execute(
+                                "DELETE FROM settings WHERE key = ?",
+                                ("webhook.last_delivery_lag_ms",),
+                            )
+                    self._increment_plain_setting_locked(
+                        "webhook.accepted_payment_count"
+                    )
+                    self._db.execute(
+                        "DELETE FROM square_webhook_receipts WHERE rowid IN ("
+                        "SELECT rowid FROM square_webhook_receipts "
+                        "ORDER BY received_at_ms DESC, rowid DESC "
+                        "LIMIT -1 OFFSET ?)",
+                        (MAX_SQUARE_WEBHOOK_RECEIPTS,),
+                    )
+                else:
+                    self._increment_plain_setting_locked(
+                        "webhook.duplicate_count"
+                    )
+                self._db.commit()
+                return inserted
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def square_webhook_metrics(self) -> dict[str, int | None]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT key, value, encrypted FROM settings WHERE key IN "
+                f"({', '.join('?' for _ in SQUARE_WEBHOOK_METRIC_SETTING_KEYS)})",
+                SQUARE_WEBHOOK_METRIC_SETTING_KEYS,
+            ).fetchall()
+            retained_receipts = self._db.execute(
+                "SELECT COUNT(*) AS count FROM square_webhook_receipts"
+            ).fetchone()["count"]
+        values = {
+            row["key"]: row["value"]
+            for row in rows
+            if not row["encrypted"]
+        }
+
+        def parsed(key: str, default: int | None = None) -> int | None:
+            try:
+                return int(values[key])
+            except (KeyError, TypeError, ValueError):
+                return default
+
+        return {
+            "last_event_ms": parsed("webhook.last_event_ms"),
+            "delivery_count": parsed("webhook.delivery_count", 0),
+            "last_payment_ms": parsed("webhook.last_payment_ms"),
+            "last_delivery_lag_ms": parsed("webhook.last_delivery_lag_ms"),
+            "accepted_payment_count": parsed(
+                "webhook.accepted_payment_count", 0
+            ),
+            "duplicate_count": parsed("webhook.duplicate_count", 0),
+            "retained_receipts": int(retained_receipts),
+        }
 
     # -- camera mapping ----------------------------------------------------
 

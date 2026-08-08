@@ -26,7 +26,14 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
-from . import deeplink, discovery, frame_time, sync, thumbnail_storage
+from . import (
+    deeplink,
+    discovery,
+    frame_time,
+    sync,
+    thumbnail_storage,
+    webhook_delivery,
+)
 from .body_limit import RequestBodyLimitMiddleware
 from .protect_client import (
     ProtectAuthError,
@@ -2072,19 +2079,15 @@ def create_app(
             finally:
                 square_client.close()
 
-        webhook_settings = store.get_settings(
-            ("square.webhook_signature_key", "webhook.last_event_ms")
-        )
-        last_event_ms = None
-        raw_last = webhook_settings["webhook.last_event_ms"]
-        if raw_last:
-            try:
-                last_event_ms = int(raw_last)
-            except ValueError:
-                last_event_ms = None
+        webhook_settings = store.get_settings(("square.webhook_signature_key",))
+        webhook_metrics = store.square_webhook_metrics()
         webhook = {
             "configured": bool(webhook_settings["square.webhook_signature_key"]),
-            "last_event_ms": last_event_ms,
+            **{
+                key: value
+                for key, value in webhook_metrics.items()
+                if key != "retained_receipts"
+            },
         }
 
         queues = store.queue_depths()
@@ -2421,7 +2424,11 @@ def create_app(
             received += len(chunk)
         return bytes(body)
 
-    def process_square_webhook(body: bytes, signature: str) -> dict | None:
+    def process_square_webhook(
+        body: bytes,
+        signature: str,
+        received_at_ms: int,
+    ) -> tuple[dict | None, bool]:
         """Verify and ingest against one current account/settings snapshot."""
         with store.integration_guard():
             square_settings = store.get_settings(
@@ -2443,7 +2450,7 @@ def create_app(
                 raise HTTPException(status_code=401, detail="Invalid webhook signature")
             # Every validly signed delivery counts as webhook liveness for the
             # dashboard tile, including events ignored below.
-            store.set_setting("webhook.last_event_ms", str(int(time.time() * 1000)))
+            store.record_square_webhook_delivery(received_at_ms)
             try:
                 event = json.loads(body)
             except ValueError as exc:
@@ -2456,7 +2463,20 @@ def create_app(
                 or event.get("merchant_id")
                 != square_settings["square.merchant_id"]
             ):
-                return None
+                return None, False
+            event_type = event.get("type")
+            if event_type not in webhook_delivery.SUPPORTED_PAYMENT_EVENT_TYPES:
+                return None, False
+            event_key = webhook_delivery.receipt_key(event.get("event_id"), body)
+            event_created_at_ms = webhook_delivery.event_created_at_ms(event)
+            if store.square_webhook_receipt_exists(event_key):
+                store.record_square_webhook_receipt(
+                    event_key,
+                    event_type,
+                    received_at_ms,
+                    event_created_at_ms,
+                )
+                return None, True
             event_data = event.get("data")
             event_object = (
                 event_data.get("object")
@@ -2469,8 +2489,8 @@ def create_app(
                 else None
             )
             if not isinstance(payment, dict) or not payment:
-                return None
-            return sync.ingest_payment(
+                return None, False
+            transaction = sync.ingest_payment(
                 store,
                 payment,
                 None,
@@ -2482,14 +2502,25 @@ def create_app(
                     square_settings["square.account_revision"]
                 ),
             )
+            store.record_square_webhook_receipt(
+                event_key,
+                event_type,
+                received_at_ms,
+                event_created_at_ms,
+            )
+            return transaction, False
 
     @app.post("/webhooks/square")
     async def square_webhook(request: Request) -> JSONResponse:
+        received_at_ms = int(time.time() * 1000)
         body = await read_square_webhook_body(request)
         signature = request.headers.get("x-square-hmacsha256-signature", "")
         try:
-            txn = await run_in_threadpool(
-                process_square_webhook, body, signature
+            txn, duplicate = await run_in_threadpool(
+                process_square_webhook,
+                body,
+                signature,
+                received_at_ms,
             )
         except SquareAccountChanged:
             # A verified event can race an explicitly confirmed account
@@ -2498,6 +2529,11 @@ def create_app(
             return JSONResponse({"ok": True, "ignored": True})
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
+        if duplicate:
+            # A replayed Square delivery can be the earliest signal that a
+            # previous Protect snapshot/alarm failure is ready to retry.
+            nudge_protect_work_queue()
+            return JSONResponse({"ok": True, "ignored": True})
         if txn is None:
             return JSONResponse({"ok": True, "ignored": True})
         # Both alarm delivery and thumbnail capture are durable queue work;

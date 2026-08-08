@@ -143,6 +143,48 @@
         <button type="submit">Save timeline link</button>
       </form>
 
+      <h3>Motion without a transaction</h3>
+      <p class="hint">Use Protect's camera-native detection zone for the box,
+        then send its Alarm Manager motion action here. The app waits for Square
+        before flagging motion with no nearby transaction.</p>
+      <form id="protect-motion-form">
+        <label>Camera
+          <select id="protect-motion-camera" required>
+            <option value="">— choose camera —</option>
+          </select>
+        </label>
+        <label>Transaction match window (seconds)
+          <input id="protect-motion-match-window" type="number" min="1" max="300" value="15" required>
+        </label>
+        <label>Wait for Square before flagging (seconds)
+          <input id="protect-motion-grace" type="number" min="0" max="600" value="90" required>
+        </label>
+        <label>Motion event retention (days)
+          <input id="protect-motion-retention" type="number" min="1" max="365" value="30" required>
+        </label>
+        <label class="check"><input type="checkbox" id="protect-motion-rotate-token"> Rotate the webhook token (automatic when changing camera)</label>
+        <button type="submit">Save motion webhook</button>
+        <button type="button" id="protect-motion-disable">Disable motion webhook</button>
+      </form>
+      <div id="protect-motion-setup" class="webhook-setup" hidden aria-live="polite">
+        <p><strong>Webhook URL</strong><br><code id="protect-motion-url"></code></p>
+        <p><strong>Custom header</strong><br><code id="protect-motion-header"></code></p>
+        <p><strong>Header value</strong><br><code id="protect-motion-token"></code></p>
+        <p id="protect-motion-token-hint" class="hint"></p>
+        <ol class="hint">
+          <li>In Protect, draw the camera's Motion Zone under Detection &amp; Privacy Zones.</li>
+          <li>In Alarm Manager, create an Activity → Motion alarm scoped only to that camera.</li>
+          <li>Add a Custom Webhook action using GET, the URL above, and the custom header above.</li>
+          <li>Enable Ignore Repeated Actions, save, then walk through the zone to test it.</li>
+        </ol>
+        <p class="hint">The Protect console must trust this app's HTTPS certificate.
+          Install an administrator-supplied LAN certificate if Protect rejects the
+          generated self-signed certificate. If POST retains the custom header on
+          your Protect version, POST supplies the NVR event timestamp; GET uses the
+          app's LAN receipt time.</p>
+        <p id="protect-motion-last-event" class="hint"></p>
+      </div>
+
       <h2>Square account
         <span id="square-status" class="conn-status" role="status" hidden>
           <span class="conn-dot"></span><span class="conn-text"></span>
@@ -234,7 +276,16 @@
         <div class="tile" data-tile="protect"><div class="tile-title">UniFi Protect</div><div class="tile-value"></div><div class="tile-hint"></div></div>
         <div class="tile" data-tile="square"><div class="tile-title">Square</div><div class="tile-value"></div><div class="tile-hint"></div></div>
         <div class="tile" data-tile="webhook"><div class="tile-title">Webhook</div><div class="tile-value"></div><div class="tile-hint"></div></div>
+        <div class="tile" data-tile="motion"><div class="tile-title">Motion alerts</div><div class="tile-value"></div><div class="tile-hint"></div></div>
         <div class="tile" data-tile="queues"><div class="tile-title">Capture queue</div><div class="tile-value"></div><div class="tile-hint"></div></div>
+      </div>
+      <div id="motion-alerts-panel" class="motion-alerts-panel" hidden>
+        <div class="toolbar">
+          <h2>Motion without a transaction</h2>
+          <span id="motion-alert-summary" class="hint"></span>
+        </div>
+        <p class="hint">Pending events are still waiting for Square. Flagged events had no transaction on the same camera inside the configured match window.</p>
+        <div id="motion-alert-list" aria-live="polite"></div>
       </div>
       <div class="toolbar">
         <h2>Transactions</h2>
@@ -283,6 +334,7 @@
   <script src="/format.js"></script>
   <script src="/square-form.js"></script>
   <script src="/deep-link-form.js"></script>
+  <script src="/protect-motion.js"></script>
   <script src="/view-focus.js"></script>
   <script src="/settings-loader.js"></script>
   <script src="/nav-view.js"></script>

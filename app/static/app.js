@@ -22,6 +22,8 @@ let cameraMappingGeneration = "";
 let wizardSquareAccountRevision = "";
 let wizardProtectConsoleGeneration = "";
 let currentUser = null;
+let motionSettingsCameras = [];
+let motionAlertLoadGeneration = 0;
 
 function setCurrentUser(payload) {
   currentUser = sessionUser(payload);
@@ -149,6 +151,7 @@ function enterApp() {
   $("#nav").hidden = false;
   show("#view-transactions");
   loadTransactions({ reset: true });
+  void loadMotionAlerts();
   if (isAdmin(currentUser)) {
     loadSettingsView();
     void loadUsers();
@@ -224,7 +227,10 @@ for (const btn of document.querySelectorAll("nav button[data-view]")) {
   btn.addEventListener("click", () => {
     if (btn.dataset.view === "settings" && !isAdmin(currentUser)) return;
     show(`#view-${btn.dataset.view}`);
-    if (btn.dataset.view === "transactions") loadTransactions();
+    if (btn.dataset.view === "transactions") {
+      loadTransactions();
+      void loadMotionAlerts();
+    }
     if (btn.dataset.view === "settings") {
       loadSettingsView();
       void loadUsers();
@@ -518,6 +524,7 @@ $("#protect-form").addEventListener("submit", async (e) => {
         $("#camera-preview-wrap"),
         $("#camera-preview"),
       );
+      clearProtectMotionSettingsView();
       lastTransactionPayload = null;
       renderTransactions([]);
       settingsReload = loadSettingsView();
@@ -568,6 +575,108 @@ $("#deep-link-form").addEventListener("submit", async (e) => {
     );
   } catch (err) {
     message(err.message, "error");
+  }
+});
+
+function clearProtectMotionSettingsView() {
+  motionSettingsCameras = [];
+  const select = $("#protect-motion-camera");
+  select.textContent = "";
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "— choose camera —";
+  select.appendChild(none);
+  $("#protect-motion-setup").hidden = true;
+  $("#protect-motion-url").textContent = "";
+  $("#protect-motion-header").textContent = "";
+  $("#protect-motion-token").textContent = "";
+  $("#protect-motion-token-hint").textContent = "";
+  $("#protect-motion-last-event").textContent = "";
+}
+
+function renderProtectMotionSettings(payload, cameras) {
+  const settings = protectMotionSettings(payload);
+  const select = $("#protect-motion-camera");
+  select.textContent = "";
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "— choose camera —";
+  select.appendChild(none);
+  for (const camera of cameras || []) {
+    const option = document.createElement("option");
+    option.value = camera.id;
+    option.textContent = camera.name;
+    option.selected = camera.id === settings.cameraId;
+    select.appendChild(option);
+  }
+  if (
+    settings.cameraId &&
+    !(cameras || []).some((camera) => camera.id === settings.cameraId)
+  ) {
+    const unavailable = document.createElement("option");
+    unavailable.value = settings.cameraId;
+    unavailable.textContent = `${settings.cameraName || settings.cameraId} — unavailable`;
+    unavailable.selected = true;
+    unavailable.disabled = true;
+    select.appendChild(unavailable);
+  }
+  $("#protect-motion-match-window").value = settings.matchWindowSeconds;
+  $("#protect-motion-grace").value = settings.graceSeconds;
+  $("#protect-motion-retention").value = settings.retentionDays;
+  $("#protect-motion-rotate-token").checked = false;
+
+  const setup = $("#protect-motion-setup");
+  setup.hidden = !settings.enabled;
+  if (!settings.enabled) return;
+  $("#protect-motion-url").textContent = protectMotionWebhookUrl(
+    window.location.origin,
+    settings.webhookPath,
+  );
+  $("#protect-motion-header").textContent = settings.webhookHeader;
+  $("#protect-motion-token").textContent = settings.webhookToken || "Not displayed";
+  $("#protect-motion-token-hint").textContent = settings.webhookToken
+    ? "Copy this value now. It is shown only when created or rotated."
+    : "The token is stored securely. Select Rotate the webhook token and save to reveal a replacement.";
+  $("#protect-motion-last-event").textContent = settings.lastEventMs === null
+    ? "Waiting for the first authenticated motion webhook."
+    : `Last authenticated motion webhook: ${new Date(settings.lastEventMs).toLocaleString()}`;
+}
+
+$("#protect-motion-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const submit = $("#protect-motion-form button[type='submit']");
+  submit.disabled = true;
+  try {
+    const result = await api("/api/settings/protect/motion-webhook", {
+      method: "PUT",
+      body: JSON.stringify(protectMotionSettingsRequest({
+        cameraId: $("#protect-motion-camera").value,
+        matchWindowSeconds: $("#protect-motion-match-window").value,
+        graceSeconds: $("#protect-motion-grace").value,
+        retentionDays: $("#protect-motion-retention").value,
+        rotateToken: $("#protect-motion-rotate-token").checked,
+      })),
+    });
+    renderProtectMotionSettings(result, motionSettingsCameras);
+    message("Protect motion webhook saved. Configure or test its Alarm Manager action.", "ok");
+    void loadMotionAlerts();
+  } catch (error) {
+    message(error.message, "error");
+  } finally {
+    submit.disabled = false;
+  }
+});
+
+$("#protect-motion-disable").addEventListener("click", async () => {
+  try {
+    const result = await api("/api/settings/protect/motion-webhook", {
+      method: "DELETE",
+    });
+    renderProtectMotionSettings(result, motionSettingsCameras);
+    message("Protect motion webhook disabled; its token is no longer valid.", "ok");
+    void loadMotionAlerts();
+  } catch (error) {
+    message(error.message, "error");
   }
 });
 
@@ -763,6 +872,7 @@ async function fetchSettingsView() {
     $("#camera-preview-wrap"),
     $("#camera-preview"),
   );
+  clearProtectMotionSettingsView();
   // Each indicator has its own latest-response guard, so a slow previous
   // health request cannot overwrite the result of a newer settings load.
   void refreshSquareStatus();
@@ -772,8 +882,10 @@ async function fetchSettingsView() {
 
 async function fetchMappingData() {
   let cameras = [], locations = [], mappings = [], devices = [];
+  let motionSettings = null;
   let locationRevision = null;
   let cameraGeneration = null;
+  let motionGeneration = null;
   let mappingRevision = "";
   let mappingGeneration = "";
   loadDeepLinkSettings();
@@ -783,6 +895,15 @@ async function fetchMappingData() {
     cameraGeneration =
       result.response.headers.get("x-protect-console-generation") || "";
   } catch { /* Protect not configured yet */ }
+  try {
+    const result = await api(
+      "/api/settings/protect/motion-webhook",
+      { includeResponse: true },
+    );
+    motionSettings = result.data;
+    motionGeneration =
+      result.response.headers.get("x-protect-console-generation") || "";
+  } catch { /* Motion webhook not configured yet */ }
   try {
     const result = await api("/api/locations", { includeResponse: true });
     locations = result.data;
@@ -799,8 +920,9 @@ async function fetchMappingData() {
       result.response.headers.get("x-square-account-revision") || "";
   } catch { return null; }
   return {
-    cameras, locations, mappings, devices,
-    cameraGeneration, locationRevision, mappingGeneration, mappingRevision,
+    cameras, locations, mappings, devices, motionSettings,
+    cameraGeneration, motionGeneration, locationRevision,
+    mappingGeneration, mappingRevision,
   };
 }
 
@@ -919,6 +1041,8 @@ function renderSettingsView(settings) {
   // fence camera-mapping saves against a concurrent account/console switch.
   squareAccountRevision = settings.mappingRevision || "";
   cameraMappingGeneration = settings.mappingGeneration || "";
+  motionSettingsCameras = settings.cameras;
+  renderProtectMotionSettings(settings.motionSettings, motionSettingsCameras);
   const usable = buildMappingRows(rows, settings);
   saveButton.hidden = !usable;
 }
@@ -968,6 +1092,9 @@ function refreshTransactionsIfVisible() {
   // returning to the newest page resumes the normal live refresh.
   if (transactionRefreshAllowed()) {
     void loadTransactions({ reset: true, background: true });
+  }
+  if (document.visibilityState === "visible" && !$("#nav").hidden) {
+    void loadMotionAlerts();
   }
 }
 
@@ -1202,6 +1329,80 @@ function renderTransactions(
   }
 }
 
+function renderMotionAlerts(payload) {
+  const configured = payload && payload.configured === true;
+  const panel = $("#motion-alerts-panel");
+  panel.hidden = !configured;
+  const list = $("#motion-alert-list");
+  list.textContent = "";
+  if (!configured) return;
+  const summary = payload.summary || {};
+  const flagged = Number(summary.flagged) || 0;
+  const pending = Number(summary.pending) || 0;
+  $("#motion-alert-summary").textContent =
+    `${flagged} flagged · ${pending} pending`;
+  const events = Array.isArray(payload.events)
+    ? payload.events.map(protectMotionAlert)
+    : [];
+  if (!events.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "No unmatched motion events.";
+    list.appendChild(empty);
+    return;
+  }
+  for (const event of events) {
+    const row = document.createElement("article");
+    row.className = `motion-alert ${event.state}`;
+    const heading = document.createElement("div");
+    heading.className = "motion-alert-heading";
+    const camera = document.createElement("strong");
+    camera.textContent = event.camera_name || event.camera_id || "Protect camera";
+    const state = document.createElement("span");
+    state.className = "motion-alert-state";
+    state.textContent = protectMotionStateText(event);
+    heading.append(camera, state);
+    const detail = document.createElement("p");
+    detail.className = "hint";
+    const matchWindow = Math.round((Number(event.match_window_ms) || 0) / 1000);
+    detail.textContent =
+      `${new Date(event.event_ts_ms).toLocaleString()} · ±${matchWindow} second match window`;
+    row.append(heading, detail);
+    if (event.alarm_name) {
+      const alarm = document.createElement("p");
+      alarm.className = "hint";
+      alarm.textContent = `Protect alarm: ${event.alarm_name}`;
+      row.appendChild(alarm);
+    }
+    if (event.deep_link) {
+      const link = document.createElement("a");
+      link.href = event.deep_link;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = "Open Protect footage";
+      link.setAttribute(
+        "aria-label",
+        `Open Protect footage for motion at ${new Date(event.event_ts_ms).toLocaleString()}`,
+      );
+      row.appendChild(link);
+    }
+    list.appendChild(row);
+  }
+}
+
+async function loadMotionAlerts() {
+  const generation = ++motionAlertLoadGeneration;
+  try {
+    const payload = await api("/api/motion-alerts?limit=50");
+    if (generation === motionAlertLoadGeneration) renderMotionAlerts(payload);
+  } catch (error) {
+    if (generation === motionAlertLoadGeneration && !isSessionExpiredError(error)) {
+      // Transaction and dashboard errors remain the primary global status.
+      $("#motion-alerts-panel").hidden = true;
+    }
+  }
+}
+
 function setTile(name, state, value, hint) {
   const tile = document.querySelector(`.tile[data-tile="${name}"]`);
   tile.className = `tile ${state}`;
@@ -1241,6 +1442,26 @@ function renderDashboard(data) {
   } else {
     setTile("webhook", "idle", "Waiting for first event",
       "Check the Square webhook subscription if sales are not arriving");
+  }
+
+  if (!data.motion.configured) {
+    setTile("motion", "idle", "Not configured", "Enable it in Settings");
+  } else if (data.motion.flagged > 0) {
+    setTile(
+      "motion",
+      "bad",
+      `${data.motion.flagged} flagged`,
+      `${data.motion.pending} event(s) still waiting for Square`,
+    );
+  } else if (data.motion.pending > 0) {
+    setTile(
+      "motion",
+      "idle",
+      `${data.motion.pending} pending`,
+      "Waiting for Square before evaluating",
+    );
+  } else {
+    setTile("motion", "ok", "No unmatched motion", data.motion.camera_name || "");
   }
 
   const pending = data.queues.thumbnails_pending + data.queues.alarms_pending;

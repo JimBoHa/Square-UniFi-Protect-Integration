@@ -30,6 +30,7 @@ from . import (
     deeplink,
     discovery,
     frame_time,
+    protect_motion,
     sync,
     thumbnail_storage,
     webhook_delivery,
@@ -57,6 +58,7 @@ from .store import (
     ALARM_ENABLED_AFTER_SETTING,
     DEFAULT_ADMIN_USERNAME,
     FRAME_OFFSET_UNAVAILABLE,
+    MotionWebhookUnauthorized,
     PROTECT_CONSOLE_ID_SETTING,
     PROTECT_CONSOLE_GENERATION_SETTING,
     ROLE_ADMIN,
@@ -90,6 +92,8 @@ REQUEST_BODY_LIMIT_EXEMPT_ROUTES = (
     ("POST", "/webhooks/square"),
     # Transaction search owns a tighter auth-first streaming bound.
     ("POST", "/api/transactions"),
+    # Token authentication runs before the tighter 32 KiB motion reader.
+    ("POST", "/webhooks/protect/motion"),
 )
 LOGIN_FAILURE_KEY_LIMIT = 10_000
 DRAIN_MAX_BATCHES = 100
@@ -128,6 +132,18 @@ FORWARDED_CLIENT_HEADERS = frozenset(
         "x-envoy-external-address",
         "x-real-ip",
     }
+)
+TRUSTED_LAN_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "127.0.0.0/8",
+        "fc00::/7",
+        "fe80::/10",
+        "::1/128",
+    )
 )
 
 
@@ -223,6 +239,22 @@ def _has_forwarding_headers(request: Request) -> bool:
         ):
             return True
     return False
+
+
+def _is_trusted_lan_peer(request: Request) -> bool:
+    """Trust only the direct socket peer, never caller-controlled proxy headers."""
+    peer = request.scope.get("client")
+    if (
+        not isinstance(peer, (tuple, list))
+        or not peer
+        or not isinstance(peer[0], str)
+    ):
+        return False
+    address = _normalized_ip_address(peer[0].split("%", 1)[0])
+    return bool(
+        address is not None
+        and any(address in network for network in TRUSTED_LAN_NETWORKS)
+    )
 
 
 def _is_explicit_local_setup_request(request: Request, bind_host: str | None) -> bool:
@@ -486,6 +518,14 @@ class TransactionQueryBody(BaseModel):
 class TransactionNoteBody(BaseModel):
     note: str = Field(default="", max_length=2000)
     revision: int = Field(ge=0)
+
+
+class ProtectMotionSettingsBody(BaseModel):
+    camera_id: str = Field(min_length=1, max_length=64)
+    match_window_seconds: int = Field(default=15, ge=1, le=300)
+    grace_seconds: int = Field(default=90, ge=0, le=600)
+    retention_days: int = Field(default=30, ge=1, le=365)
+    rotate_token: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1591,6 +1631,115 @@ def create_app(
         schedule_thumbnail_maintenance(optimize_existing=True)
         return {"ok": True, **thumbnail_storage_settings_response()}
 
+    def motion_webhook_settings_response(
+        response: Response,
+        *,
+        revealed_token: str | None = None,
+    ) -> dict:
+        config = store.motion_webhook_config()
+        response.headers["Cache-Control"] = PRIVATE_NO_STORE
+        response.headers["X-Protect-Console-Generation"] = (
+            store.get_setting(PROTECT_CONSOLE_GENERATION_SETTING) or ""
+        )
+        result = {
+            **config,
+            "webhook_path": "/webhooks/protect/motion",
+            "webhook_header": "X-SPI-Webhook-Token",
+        }
+        if revealed_token is not None:
+            result["webhook_token"] = revealed_token
+        return result
+
+    @app.get("/api/settings/protect/motion-webhook")
+    def get_motion_webhook_settings(
+        response: Response,
+        _=admin_only,
+    ) -> dict:
+        with store.integration_guard():
+            return motion_webhook_settings_response(response)
+
+    @app.put("/api/settings/protect/motion-webhook")
+    def set_motion_webhook_settings(
+        body: ProtectMotionSettingsBody,
+        response: Response,
+        _=admin_only,
+    ) -> dict:
+        try:
+            camera_id = validate_camera_id(body.camera_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        with store.protect_settings_guard():
+            with store.integration_guard():
+                protect_settings = store.get_settings(PROTECT_SETTING_KEYS)
+                client = build_protect(protect_settings)
+                if client is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="UniFi Protect is not configured",
+                    )
+                try:
+                    cameras, observed_console_id = (
+                        client.get_cameras_with_console_identity()
+                    )
+                except ProtectAuthError as exc:
+                    raise HTTPException(status_code=401, detail=str(exc)) from exc
+                except (ProtectError, OSError) as exc:
+                    raise HTTPException(status_code=502, detail=str(exc)) from exc
+                finally:
+                    client.close()
+                expected_console_id = protect_settings[PROTECT_CONSOLE_ID_SETTING]
+                if (
+                    expected_console_id is not None
+                    and observed_console_id != expected_console_id
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Protect console identity changed; reconnect Protect "
+                            "before enabling motion alerts"
+                        ),
+                    )
+                camera = next(
+                    (
+                        candidate
+                        for candidate in cameras
+                        if candidate["id"] == camera_id
+                    ),
+                    None,
+                )
+                if camera is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "Motion alert camera was not found on this Protect console"
+                        ),
+                    )
+                try:
+                    _config, revealed_token = store.configure_motion_webhook(
+                        camera_id=camera_id,
+                        camera_name=camera["name"],
+                        match_window_seconds=body.match_window_seconds,
+                        grace_seconds=body.grace_seconds,
+                        retention_days=body.retention_days,
+                        rotate_token=body.rotate_token,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                return motion_webhook_settings_response(
+                    response,
+                    revealed_token=revealed_token,
+                )
+
+    @app.delete("/api/settings/protect/motion-webhook")
+    def delete_motion_webhook_settings(
+        response: Response,
+        _=admin_only,
+    ) -> dict:
+        with store.protect_settings_guard():
+            with store.integration_guard():
+                store.disable_motion_webhook()
+                return {"ok": True, **motion_webhook_settings_response(response)}
+
     WEBHOOK_SUBSCRIPTION_NAME = "square-unifi-protect"
 
     @app.post("/api/settings/square/webhook/register")
@@ -2220,6 +2369,14 @@ def create_app(
             },
         }
 
+        motion_config = store.motion_webhook_config()
+        motion = {
+            "configured": motion_config["enabled"],
+            "camera_name": motion_config["camera_name"],
+            "last_event_ms": motion_config["last_event_ms"],
+            **store.motion_alert_summary(),
+        }
+
         queues = store.queue_depths()
         if not store.get_setting("protect.alarm_trigger_id"):
             # Idle alarm states are meaningless while the feature is off.
@@ -2228,8 +2385,70 @@ def create_app(
             "protect": protect,
             "square": square,
             "webhook": webhook,
+            "motion": motion,
             "queues": queues,
         }
+
+    def motion_alert_response(
+        event: dict,
+        host: str | None,
+        deep_link_template: str | None,
+    ) -> dict:
+        link = None
+        if host:
+            try:
+                link = deeplink.build_deep_link(
+                    host,
+                    event["camera_id"],
+                    event["event_ts_ms"],
+                    template=deep_link_template,
+                )
+            except ValueError:
+                link = None
+        return {
+            "id": event["id"],
+            "camera_id": event["camera_id"],
+            "camera_name": event["camera_name"],
+            "event_ts_ms": event["event_ts_ms"],
+            "received_at_ms": event["received_at_ms"],
+            "evaluate_after_ms": event["evaluate_after_ms"],
+            "match_window_ms": event["match_window_ms"],
+            "delivery_method": event["delivery_method"],
+            "alarm_name": event["alarm_name"],
+            "device_identifiers": event["device_identifiers"],
+            "state": event["state"],
+            "matched_transaction_id": event["matched_transaction_id"],
+            "matched_transaction_ts_ms": event["matched_transaction_ts_ms"],
+            "transaction_delta_ms": event["transaction_delta_ms"],
+            "deep_link": link,
+        }
+
+    @app.get("/api/motion-alerts")
+    def motion_alerts(
+        limit: int = Query(default=50, ge=1, le=250),
+        include_matched: bool = False,
+        _=authed,
+    ) -> dict:
+        with store.integration_guard():
+            events = store.list_motion_alerts(
+                limit=limit,
+                include_matched=include_matched,
+            )
+            link_settings = store.get_settings(
+                ("protect.host", "deep_link_template")
+            )
+            return {
+                "configured": store.motion_webhook_config()["enabled"],
+                "summary": store.motion_alert_summary(),
+                "events": [
+                    motion_alert_response(
+                        event,
+                        link_settings["protect.host"],
+                        link_settings["deep_link_template"],
+                    )
+                    for event in events
+                ],
+            }
 
     @app.get("/api/transactions/export.csv")
     def export_transactions(_=authed) -> Response:
@@ -2546,6 +2765,163 @@ def create_app(
         finally:
             schedule_thumbnail_maintenance()
         return {"ok": True, "ingested": ingested}
+
+    # -- Protect motion webhook (unauthenticated; LAN + token verified) -----------
+
+    def presented_motion_webhook_token(request: Request) -> str:
+        custom_token = request.headers.get("x-spi-webhook-token", "").strip()
+        authorization = request.headers.get("authorization", "").strip()
+        bearer_token = ""
+        if authorization:
+            scheme, separator, credential = authorization.partition(" ")
+            if separator and scheme.casefold() == "bearer":
+                bearer_token = credential.strip()
+            else:
+                return ""
+        if custom_token and bearer_token and not secrets.compare_digest(
+            custom_token, bearer_token
+        ):
+            return ""
+        return custom_token or bearer_token
+
+    async def read_protect_motion_webhook_body(request: Request) -> bytes:
+        media_type = request.headers.get("content-type", "").split(";", 1)[0]
+        if media_type.strip().lower() != "application/json":
+            raise HTTPException(
+                status_code=415,
+                detail="Protect motion webhooks require application/json",
+                headers={"Cache-Control": PRIVATE_NO_STORE},
+            )
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid Protect webhook Content-Length",
+                    headers={"Cache-Control": PRIVATE_NO_STORE},
+                ) from exc
+            if declared_length < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid Protect webhook Content-Length",
+                    headers={"Cache-Control": PRIVATE_NO_STORE},
+                )
+            if declared_length > protect_motion.PROTECT_MOTION_WEBHOOK_MAX_BODY_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Protect motion webhook payload too large",
+                    headers={"Cache-Control": PRIVATE_NO_STORE},
+                )
+        payload = bytearray()
+        async for chunk in request.stream():
+            if (
+                len(payload) + len(chunk)
+                > protect_motion.PROTECT_MOTION_WEBHOOK_MAX_BODY_BYTES
+            ):
+                raise HTTPException(
+                    status_code=413,
+                    detail="Protect motion webhook payload too large",
+                    headers={"Cache-Control": PRIVATE_NO_STORE},
+                )
+            payload.extend(chunk)
+        return bytes(payload)
+
+    @app.api_route(
+        "/webhooks/protect/motion",
+        methods=["GET", "POST"],
+        status_code=204,
+    )
+    async def protect_motion_webhook(request: Request) -> Response:
+        if _has_forwarding_headers(request) or not _is_trusted_lan_peer(request):
+            raise HTTPException(
+                status_code=403,
+                detail="Protect motion webhook accepts direct LAN requests only",
+                headers={"Cache-Control": PRIVATE_NO_STORE},
+            )
+        if request.query_params:
+            raise HTTPException(
+                status_code=400,
+                detail="Protect motion webhook does not accept URL parameters",
+                headers={"Cache-Control": PRIVATE_NO_STORE},
+            )
+        presented_token = presented_motion_webhook_token(request)
+        try:
+            config = await run_in_threadpool(
+                store.authenticate_motion_webhook,
+                presented_token,
+            )
+        except MotionWebhookUnauthorized:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid Protect motion webhook token",
+                headers={"Cache-Control": PRIVATE_NO_STORE},
+            ) from None
+
+        received_at_ms = int(time.time() * 1000)
+        if request.method == "POST":
+            body = await read_protect_motion_webhook_body(request)
+            try:
+                delivery = protect_motion.parse_protect_motion_payload(
+                    body,
+                    received_at_ms=received_at_ms,
+                    oldest_allowed_ms=(
+                        received_at_ms
+                        - int(config["retention_days"]) * 86_400_000
+                    ),
+                )
+            except protect_motion.ProtectMotionPayloadError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=str(exc),
+                    headers={"Cache-Control": PRIVATE_NO_STORE},
+                ) from exc
+            event_key = delivery.event_key
+            event_ts_ms = delivery.event_ts_ms
+            alarm_name = delivery.alarm_name
+            device_identifiers = delivery.device_identifiers
+            delivery_method = "post"
+        else:
+            content_length = request.headers.get("content-length")
+            if content_length not in (None, "0"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Protect motion GET webhook cannot include a body",
+                    headers={"Cache-Control": PRIVATE_NO_STORE},
+                )
+            event_key = protect_motion.get_delivery_event_key(
+                config["camera_id"], received_at_ms
+            )
+            event_ts_ms = received_at_ms
+            alarm_name = ""
+            device_identifiers = ()
+            delivery_method = "get"
+        try:
+            await run_in_threadpool(
+                lambda: store.record_motion_event(
+                    presented_token=presented_token,
+                    event_key=event_key,
+                    event_ts_ms=event_ts_ms,
+                    received_at_ms=received_at_ms,
+                    delivery_method=delivery_method,
+                    alarm_name=alarm_name,
+                    device_identifiers=device_identifiers,
+                )
+            )
+        except MotionWebhookUnauthorized:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid Protect motion webhook token",
+                headers={"Cache-Control": PRIVATE_NO_STORE},
+            ) from None
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=str(exc),
+                headers={"Cache-Control": PRIVATE_NO_STORE},
+            ) from exc
+        return Response(status_code=204, headers={"Cache-Control": PRIVATE_NO_STORE})
 
     # -- Square webhook (unauthenticated; HMAC-verified) ---------------------------
 

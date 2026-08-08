@@ -18,7 +18,7 @@ function protectConsoleSwitchTokenRequest(confirmationCheckbox, settings) {
 function protectConnectionMessage(result) {
   const alarm = result.alarm_configured ? " Alarm trigger enabled." : "";
   const reset = result.console_switched
-    ? " Previous camera mappings and Protect evidence were cleared; select POS cameras again."
+    ? " Previous camera mappings and Protect evidence were cleared; the motion webhook was disabled. Please select POS cameras again and enable motion alerts."
     : "";
   return `Connected to UniFi Protect (${result.cameras} cameras found).${alarm}${reset}`;
 }
@@ -31,12 +31,14 @@ function publishLatestSettingsLoad(loadGeneration, latestGeneration, publish) {
 
 function settingsSnapshotsMatch({
   cameraGeneration,
+  motionGeneration = null,
   locationRevision,
   mappingGeneration,
   mappingRevision,
 }) {
   return (
     (cameraGeneration === null || cameraGeneration === mappingGeneration) &&
+    (motionGeneration === null || motionGeneration === mappingGeneration) &&
     (locationRevision === null || locationRevision === mappingRevision)
   );
 }

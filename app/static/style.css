@@ -87,6 +87,7 @@ button[type="submit"], #save-mapping, #sync-now, #export-csv {
 .txn .amount { font-size: 1.15rem; font-weight: 700; min-width: 90px; }
 .txn .txn-details { min-width: 0; overflow-wrap: anywhere; }
 .txn .meta { font-size: 0.85rem; opacity: 0.8; }
+.txn .frame-offset { font-weight: 600; opacity: 1; }
 .txn .status { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
 .txn .refund-status {
   display: inline-block; margin-top: 0.25rem; padding: 0.1rem 0.4rem;

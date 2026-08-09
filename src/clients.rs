@@ -610,7 +610,11 @@ pub fn validate_protect_host(value: &str) -> AppResult<String> {
     }
     let url = Url::parse(&format!("https://{value}"))
         .map_err(|_| AppError::Unprocessable("Invalid Protect host".into()))?;
-    if url.host_str().is_none() || url.port_or_known_default().is_none() {
+    if url.host_str().is_none()
+        || url.port_or_known_default().is_none()
+        || url.port() == Some(0)
+        || value.ends_with(':')
+    {
         return Err(AppError::Unprocessable("Invalid Protect host".into()));
     }
     Ok(value.to_owned())
@@ -1127,6 +1131,8 @@ mod tests {
             "protect.lan?x=1",
             "protect.lan#fragment",
             "protect .lan",
+            "protect.lan:",
+            "protect.lan:0",
             "protect.lan:65536",
         ] {
             assert!(

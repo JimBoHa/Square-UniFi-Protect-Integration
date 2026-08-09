@@ -89,6 +89,9 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn parse_port(value: &str) -> AppResult<u16> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_port());
+    }
     let port = value.parse::<u16>().map_err(|_| invalid_port())?;
     if port == 0 {
         return Err(invalid_port());
@@ -141,7 +144,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_signed_decimal_whitespace_and_overflow_ports() {
-        for value in ["", "0", "-1", " 8000", "8000 ", "65536", "1.5"] {
+        for value in ["", "0", "+1", "-1", " 8000", "8000 ", "65536", "1.5"] {
             assert!(
                 matches!(parse_port(value), Err(AppError::BadRequest(_))),
                 "{value:?}"

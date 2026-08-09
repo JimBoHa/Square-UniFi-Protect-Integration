@@ -2171,28 +2171,47 @@ fn explicit_loopback_request(config: &Config, peer: SocketAddr, headers: &Header
 }
 
 fn authority_host(authority: &str) -> Option<&str> {
-    if authority.contains(['/', '\\', '@', '?', '#', ','])
+    if authority.is_empty()
+        || authority.contains(['/', '\\', '@', '?', '#', ','])
         || authority.chars().any(char::is_whitespace)
     {
         return None;
     }
     if authority.starts_with('[') {
         let close = authority.find(']')?;
-        let suffix = &authority[close + 1..];
-        if !suffix.is_empty() && (!suffix.starts_with(':') || suffix[1..].parse::<u16>().is_err()) {
+        let host = &authority[1..close];
+        if host.is_empty() {
             return None;
         }
-        Some(&authority[1..close])
+        let suffix = &authority[close + 1..];
+        if !suffix.is_empty() && (!suffix.starts_with(':') || !valid_authority_port(&suffix[1..])) {
+            return None;
+        }
+        Some(host)
     } else {
-        let (host, port) = authority.split_once(':').unwrap_or((authority, ""));
-        if !port.is_empty() && port.parse::<u16>().is_err() {
+        let host = match authority.split_once(':') {
+            Some((host, port)) if valid_authority_port(port) => host,
+            Some(_) => return None,
+            None => authority,
+        };
+        if host.is_empty() {
             return None;
         }
         Some(host)
     }
 }
 
+fn valid_authority_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
 fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
         || host
             .parse::<IpAddr>()
@@ -2712,18 +2731,25 @@ mod tests {
             assert_eq!(authority_host(authority), expected);
         }
         for invalid in [
+            "",
+            "localhost:",
+            "localhost:+1",
+            "localhost:0",
             "localhost:65536",
             "localhost/path",
             "user@localhost",
             "localhost?x=1",
             "localhost #fragment",
             "[::1",
+            "[]:8000",
             "[::1]:bad",
+            "[::1]:0",
         ] {
             assert!(authority_host(invalid).is_none(), "{invalid:?}");
         }
         assert!(loopback_origin("http://localhost:8000"));
         assert!(loopback_origin("https://127.0.0.1"));
+        assert!(loopback_origin("http://[::1]:9443"));
         assert!(!loopback_origin("https://10.0.0.1"));
         assert!(!loopback_origin("file:///tmp/index.html"));
     }

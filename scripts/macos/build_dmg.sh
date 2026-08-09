@@ -9,40 +9,46 @@
 #   xcrun stapler staple dist/SquareProtect.dmg
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-cargo build --locked --release
+cargo build --locked --release --features menubar \
+  --bin square-unifi-protect --bin square-protect-menubar
+for BINARY_PATH in \
+  target/release/square-unifi-protect \
+  target/release/square-protect-menubar; do
+  if otool -L "$BINARY_PATH" | grep -Eq '^[[:space:]]+(/opt|/usr/local|/Users|/private)/'; then
+    echo "Non-portable dynamic library linked by $BINARY_PATH" >&2
+    otool -L "$BINARY_PATH" >&2
+    exit 1
+  fi
+done
 
-BUILD_VENV=.build-venv
-if [ ! -x "$BUILD_VENV/bin/python" ]; then
-  python3 -m venv "$BUILD_VENV"
-  "$BUILD_VENV/bin/pip" install --quiet --upgrade pip
-fi
-"$BUILD_VENV/bin/pip" install --quiet pyinstaller rumps
-
-rm -rf build "dist/Square Protect.app" dist/SquareProtect.dmg
-"$BUILD_VENV/bin/pyinstaller" \
-  --noconfirm --clean --windowed \
-  --name "Square Protect" \
-  --osx-bundle-identifier com.squareprotect.app \
-  --add-binary "target/release/square-unifi-protect:." \
-  --add-data "app/static:app/static" \
-  scripts/macos/menubar_app.py
-
-PLIST="dist/Square Protect.app/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PLIST" 2>/dev/null \
-  || /usr/libexec/PlistBuddy -c "Set :LSUIElement true" "$PLIST"
+APP="dist/Square Protect.app"
+CONTENTS="$APP/Contents"
+MACOS="$CONTENTS/MacOS"
+RESOURCES="$CONTENTS/Resources"
+rm -rf build "$APP" dist/SquareProtect.dmg
+mkdir -p "$MACOS" "$RESOURCES/app"
+cp target/release/square-protect-menubar "$MACOS/Square Protect"
+cp target/release/square-unifi-protect "$RESOURCES/square-unifi-protect"
+cp -R app/static "$RESOURCES/app/static"
+cp scripts/macos/Info.plist "$CONTENTS/Info.plist"
+chmod 755 "$MACOS/Square Protect" "$RESOURCES/square-unifi-protect"
+"$MACOS/Square Protect" --validate-bundle
+"$MACOS/Square Protect" --smoke-test
 
 if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
-  codesign --deep --force --options runtime \
-    --sign "$MACOS_SIGNING_IDENTITY" "dist/Square Protect.app"
+  SIGNING_IDENTITY="$MACOS_SIGNING_IDENTITY"
 else
-  # PlistBuddy invalidates PyInstaller's ad-hoc bundle signature. Restore a
-  # valid local signature even when no release identity is configured.
-  codesign --deep --force --sign - "dist/Square Protect.app"
+  SIGNING_IDENTITY=-
 fi
-codesign --verify --deep --strict "dist/Square Protect.app"
+codesign --force --options runtime --sign "$SIGNING_IDENTITY" \
+  "$RESOURCES/square-unifi-protect"
+codesign --force --options runtime --sign "$SIGNING_IDENTITY" \
+  "$MACOS/Square Protect"
+codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$APP"
+codesign --verify --deep --strict "$APP"
 
 STAGE=$(mktemp -d)
-cp -R "dist/Square Protect.app" "$STAGE/"
+cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname "Square Protect" -srcfolder "$STAGE" -ov -format UDZO \
   dist/SquareProtect.dmg

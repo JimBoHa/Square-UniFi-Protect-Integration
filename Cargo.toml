@@ -14,6 +14,15 @@ path = "src/lib.rs"
 name = "square-unifi-protect"
 path = "src/main.rs"
 
+[[bin]]
+name = "square-protect-menubar"
+path = "src/bin/square-protect-menubar.rs"
+required-features = ["menubar"]
+
+[features]
+default = []
+menubar = []
+
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8.9", features = ["macros", "query"] }
@@ -21,7 +30,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1"
-fernet = "0.2.2"
+fernet = { version = "0.2.2", default-features = false, features = ["rustcrypto"] }
 fs2 = "0.4"
 hex = "0.4"
 hmac = "0.12"
@@ -51,6 +60,12 @@ x509-parser = "0.18"
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFRunLoop"] }
+tray-icon = { version = "0.24.2", default-features = false }
+winit = { version = "0.30.13", default-features = false }
+zeroize = "1"
 
 [profile.release]
 lto = "thin"

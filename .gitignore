@@ -7,6 +7,4 @@ data/
 .DS_Store
 build/
 dist/
-.build-venv/
-*.spec
 target/

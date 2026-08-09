@@ -27,3 +27,13 @@ jobs:
           done
           docker logs spi
           exit 1
+  macos-app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
+      - name: Test native menu-bar wrapper
+        run: rustup run 1.88.0 cargo test --locked --features menubar --bin square-protect-menubar
+      - name: Build and validate unsigned DMG
+        run: RUSTUP_TOOLCHAIN=1.88.0 scripts/macos/build_dmg.sh

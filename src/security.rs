@@ -290,4 +290,14 @@ mod tests {
         let encrypted = cipher.encrypt("secret");
         assert_eq!(cipher.decrypt(&encrypted).unwrap(), "secret");
     }
+
+    #[test]
+    fn pure_rust_fernet_decrypts_python_cryptography_token() {
+        let fernet = Fernet::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=").unwrap();
+        let plaintext = fernet
+            .decrypt("gAAAAABlU_EAlBsofvIBHhtZlk-rrUgknfrH-wbyxLmFm5-cIrDRFL3HXZ8yzY4B4dXQtJ0XCEs_An68xr78u4L5RtJ9YNZGb449DfFao8tl0L9m6PQFDiA=")
+            .unwrap();
+
+        assert_eq!(plaintext, b"python-fernet-compatibility");
+    }
 }

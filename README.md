@@ -105,9 +105,10 @@ cargo run --locked --release
 
 Install the current stable Rust toolchain from [rustup.rs](https://rustup.rs/)
 if `cargo` is not already available. The former Python backend remains in the
-repository as a rollback/packaging compatibility implementation; the primary
-server, provider clients, security layer, SQLite store, synchronization engine,
-webhooks, TLS, and thumbnail pipeline are Rust.
+repository only as a rollback and behavioral-contract implementation. The
+primary server, provider clients, security layer, SQLite store, synchronization
+engine, webhooks, TLS, thumbnail pipeline, macOS menu-bar app, and supported
+installers use native Rust binaries.
 
 The bundled runner binds only to `127.0.0.1` by default. On first start it
 prints a generated one-time bootstrap secret in the server console. Copy that

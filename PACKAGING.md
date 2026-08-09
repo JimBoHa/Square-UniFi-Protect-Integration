@@ -44,18 +44,20 @@ alongside Homebridge on the Pi; or use the systemd installer below.
 
 ## 2. macOS menu-bar app (.dmg)
 
-`scripts/macos/menubar_app.py` wraps the Rust server in a native menu-bar app
-(status icon, Open Dashboard, Start at Login hint, Quit). Build:
+The `square-protect-menubar` Rust binary wraps the Rust server in a native
+menu-bar app (status icon, Open Dashboard, Open Data Folder, one-time setup
+secret, and Quit). Build:
 
 ```bash
 scripts/macos/build_dmg.sh          # → dist/SquareProtect.dmg
 ```
 
-The script compiles the locked Rust release binary, embeds it beside a minimal
-PyInstaller/rumps menu-bar wrapper (`LSUIElement` suppresses the Dock icon),
-and wraps the signed app in a drag-to-Applications dmg. For a signed release,
-set `MACOS_SIGNING_IDENTITY` to the Developer ID Application identity when
-running the build script; the app is signed before it enters the dmg. Then notarize with
+The script compiles both locked Rust release binaries, assembles a native
+`LSUIElement` app bundle without Python or PyInstaller, validates its embedded
+server and browser assets, and wraps the signed app in a drag-to-Applications
+dmg. For a signed release, set `MACOS_SIGNING_IDENTITY` to the Developer ID
+Application identity when running the build script; the nested binaries and
+app are signed before entering the dmg. Then notarize with
 `xcrun notarytool submit`, staple, and attach the dmg to a GitHub release.
 Unsigned builds run via right-click → Open.
 

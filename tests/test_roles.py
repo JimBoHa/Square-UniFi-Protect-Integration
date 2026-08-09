@@ -10,7 +10,13 @@ from fastapi.routing import APIRoute
 
 import app.main as main_module
 from app.security import hash_password, hash_session_token
-from app.store import ROLE_ADMIN, ROLE_VIEWER, Store, normalize_username
+from app.store import (
+    ROLE_ADMIN,
+    ROLE_VIEWER,
+    Store,
+    UserAlreadyExists,
+    normalize_username,
+)
 
 from .conftest import ADMIN_PASSWORD, bootstrap_setup_body
 
@@ -42,6 +48,9 @@ ADMIN_ENDPOINTS = frozenset(
         ("GET", "/api/camera-mapping"),
         ("PUT", "/api/camera-mapping"),
         ("POST", "/api/sync"),
+        ("GET", "/api/users"),
+        ("POST", "/api/users"),
+        ("PUT", "/api/users/{user_id}/password"),
     }
 )
 
@@ -375,7 +384,7 @@ def test_store_enforces_case_insensitive_unique_usernames(tmp_path):
         )
         assert account["username"] == "Desk.Viewer"
         assert store.user_for_login("desk.viewer")["id"] == account["id"]
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(UserAlreadyExists):
             store.create_user(
                 "DESK.VIEWER",
                 hash_password("another-password"),

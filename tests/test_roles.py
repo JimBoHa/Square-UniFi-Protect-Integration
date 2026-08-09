@@ -69,6 +69,9 @@ VIEWER_ENDPOINTS = frozenset(
         ("GET", "/api/transactions"),
         ("POST", "/api/transactions"),
         ("GET", "/api/thumbnails/{txn_id}"),
+        ("GET", "/api/settings/thumbnail-storage"),
+        ("PUT", "/api/settings/thumbnail-storage"),
+        ("POST", "/api/settings/thumbnail-storage/maintenance"),
     }
 )
 

@@ -437,6 +437,62 @@ const loadDeepLinkSettings = createLatestDeepLinkSettingsLoader(
   ),
 );
 
+function formatStorageBytes(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value < 1024) return `${value} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let amount = value;
+  let unit = "B";
+  for (const candidate of units) {
+    amount /= 1024;
+    unit = candidate;
+    if (amount < 1024) break;
+  }
+  return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${unit}`;
+}
+
+function renderThumbnailStorageSettings(settings) {
+  $("#thumbnail-compression-enabled").checked = settings.compression_enabled;
+  $("#thumbnail-jpeg-quality").value = settings.jpeg_quality;
+  $("#thumbnail-max-dimension").value = settings.max_dimension;
+  $("#thumbnail-retention-days").value = settings.retention_days;
+  $("#thumbnail-max-storage-mib").value = settings.max_storage_mib;
+  const usage = settings.usage || {};
+  const maintenance = settings.maintenance || {};
+  const parts = [
+    `${usage.active_count || 0} thumbnail(s) using ${formatStorageBytes(usage.active_bytes)}`,
+    `${usage.retired_count || 0} expired`,
+  ];
+  if (["queued", "running"].includes(maintenance.state)) {
+    parts.push("maintenance running…");
+  } else if (maintenance.state === "error") {
+    parts.push(maintenance.error || "maintenance failed");
+  } else if (maintenance.result) {
+    parts.push(`${formatStorageBytes(maintenance.result.bytes_saved)} reclaimed last run`);
+  }
+  $("#thumbnail-storage-status").textContent = parts.join(" · ");
+}
+
+const loadThumbnailStorageSettings = createLatestSettingsLoader(
+  () => api("/api/settings/thumbnail-storage"),
+  renderThumbnailStorageSettings,
+);
+
+async function pollThumbnailMaintenance() {
+  try {
+    const settings = await api("/api/settings/thumbnail-storage");
+    renderThumbnailStorageSettings(settings);
+    if (["queued", "running"].includes(settings.maintenance?.state)) {
+      window.setTimeout(pollThumbnailMaintenance, 750);
+    } else {
+      $("#thumbnail-optimize-existing").disabled = false;
+    }
+  } catch (err) {
+    $("#thumbnail-optimize-existing").disabled = false;
+    message(err.message, "error");
+  }
+}
+
 $("#protect-discover").addEventListener("click", async () => {
   const button = $("#protect-discover");
   if (button.disabled) return;
@@ -715,6 +771,44 @@ $("#protect-motion-disable").addEventListener("click", async () => {
   }
 });
 
+$("#thumbnail-storage-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    const settings = await api("/api/settings/thumbnail-storage", {
+      method: "PUT",
+      body: JSON.stringify({
+        compression_enabled: $("#thumbnail-compression-enabled").checked,
+        jpeg_quality: Number($("#thumbnail-jpeg-quality").value),
+        max_dimension: Number($("#thumbnail-max-dimension").value),
+        retention_days: Number($("#thumbnail-retention-days").value),
+        max_storage_mib: Number($("#thumbnail-max-storage-mib").value),
+      }),
+    });
+    renderThumbnailStorageSettings(settings);
+    void pollThumbnailMaintenance();
+    message("Thumbnail storage controls saved.", "ok");
+  } catch (err) {
+    message(err.message, "error");
+  }
+});
+
+$("#thumbnail-optimize-existing").addEventListener("click", async () => {
+  const button = $("#thumbnail-optimize-existing");
+  button.disabled = true;
+  try {
+    const settings = await api(
+      "/api/settings/thumbnail-storage/maintenance",
+      { method: "POST" },
+    );
+    renderThumbnailStorageSettings(settings);
+    void pollThumbnailMaintenance();
+    message("Existing-thumbnail optimization started.", "ok");
+  } catch (err) {
+    button.disabled = false;
+    message(err.message, "error");
+  }
+});
+
 $("#square-oauth-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {
@@ -912,6 +1006,7 @@ async function fetchSettingsView() {
   // health request cannot overwrite the result of a newer settings load.
   void refreshSquareStatus();
   void refreshProtectStatus();
+  void loadThumbnailStorageSettings().catch(() => {});
   return fetchMappingData();
 }
 
@@ -1316,6 +1411,7 @@ function renderTransactions(
         unmapped: "camera not mapped",
         queued: "footage queued",
         retrying: "capture retrying",
+        expired: "thumbnail expired",
       };
       thumb.textContent = thumbnailLabels[txn.thumbnail_status] || "no footage";
       if (txn.deep_link) {
@@ -1473,10 +1569,18 @@ function renderDashboard(data) {
   if (!data.webhook.configured) {
     setTile("webhook", "idle", "Not configured",
       "Optional: real-time sales via Settings; polling still syncs every minute");
-  } else if (data.webhook.last_event_ms) {
-    const minutes = Math.round((Date.now() - data.webhook.last_event_ms) / 60000);
+  } else if (data.webhook.last_payment_ms || data.webhook.last_event_ms) {
+    const lastPayment = Boolean(data.webhook.last_payment_ms);
+    const eventTime = data.webhook.last_payment_ms || data.webhook.last_event_ms;
+    const minutes = Math.max(0, Math.round((Date.now() - eventTime) / 60000));
     const age = minutes < 1 ? "just now" : `${minutes} min ago`;
-    setTile("webhook", "ok", `Last event ${age}`, "");
+    const eventLabel = lastPayment ? "Last payment" : "Last event";
+    setTile(
+      "webhook",
+      "ok",
+      `${eventLabel} ${age}`,
+      webhookDeliveryHint(data.webhook),
+    );
   } else {
     setTile("webhook", "idle", "Waiting for first event",
       "Check the Square webhook subscription if sales are not arriving");
@@ -1650,7 +1754,10 @@ $("#txn-filter-clear").addEventListener("click", () => {
   $("#txn-query").focus();
 });
 
-$("#sync-now").addEventListener("click", async () => {
+const syncNowButton = $("#sync-now");
+syncNowButton.addEventListener("click", async () => {
+  if (syncNowButton.disabled) return;
+  syncNowButton.disabled = true;
   message("Syncing…", "");
   try {
     const result = await api("/api/sync", { method: "POST" });
@@ -1658,6 +1765,8 @@ $("#sync-now").addEventListener("click", async () => {
     await loadTransactions({ reset: true });
   } catch (err) {
     message(err.message, "error");
+  } finally {
+    syncNowButton.disabled = false;
   }
 });
 

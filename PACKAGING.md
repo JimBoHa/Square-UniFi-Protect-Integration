@@ -62,7 +62,9 @@ Unsigned builds run via right-click → Open.
 `scripts/install-service.sh` detects the OS:
 
 - **macOS:** installs a `launchd` LaunchAgent
-  (`~/Library/LaunchAgents/com.squareprotect.app.plist`), starts at login.
+  (`~/Library/LaunchAgents/com.squareprotect.app.plist`), starts at login and
+  listens on all LAN interfaces with built-in TLS. Its generated certificate
+  follows the computer's resolved LAN addresses after a DHCP change.
 - **Linux (Debian/Ubuntu/Raspberry Pi OS):** installs a `systemd` unit
   (`/etc/systemd/system/square-protect.service`), starts at boot. The service
   listens on the network with the app's built-in TLS; open

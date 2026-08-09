@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 
-REQUIRED_MODULES = ("app", "cryptography", "fastapi", "httpx", "uvicorn")
+REQUIRED_MODULES = ("app", "PIL", "cryptography", "fastapi", "httpx", "uvicorn")
 PROJECT_DISTRIBUTION = "square-unifi-protect-integration"
 STAMP_FILENAME = ".square-protect-dependencies.sha256"
 

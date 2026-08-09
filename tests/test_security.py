@@ -141,6 +141,28 @@ def test_session_cookie_flags(client):
     assert "samesite=lax" in cookie
 
 
+@pytest.mark.parametrize("path", ["/", "/api/session", "/missing"])
+def test_browser_security_headers_cover_success_and_error_responses(client, path):
+    response = client.get(path)
+
+    policy = response.headers["content-security-policy"]
+    assert "default-src 'self'" in policy
+    assert "script-src 'self'" in policy
+    assert "style-src 'self'" in policy
+    assert "frame-ancestors 'none'" in policy
+    assert "object-src 'none'" in policy
+    assert "'unsafe-inline'" not in policy
+    assert "'unsafe-eval'" not in policy
+    assert response.headers["cross-origin-resource-policy"] == "same-origin"
+    assert response.headers["permissions-policy"] == (
+        "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+    )
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["x-permitted-cross-domain-policies"] == "none"
+
+
 def test_transaction_search_stays_out_of_request_target_even_when_unauthorized(client):
     search_term = "private-card-4242"
     response = client.post("/api/transactions", json={"q": search_term})

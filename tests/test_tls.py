@@ -82,7 +82,7 @@ def test_cert_covers_explicit_bind_ip_instead_of_default_route(
     import app.tls as tls
     import ipaddress
 
-    monkeypatch.setenv("SPI_HOST", "10.0.7.215")
+    monkeypatch.setenv("SPI_HOST", "192.0.2.44")
     monkeypatch.setattr(
         tls.socket,
         "socket",
@@ -95,9 +95,77 @@ def test_cert_covers_explicit_bind_ip_instead_of_default_route(
         x509.SubjectAlternativeName
     ).value
 
-    assert ipaddress.ip_address("10.0.7.215") in sans.get_values_for_type(
+    assert ipaddress.ip_address("192.0.2.44") in sans.get_values_for_type(
         x509.IPAddress
     )
+
+
+def test_wildcard_bind_certificate_tracks_resolved_lan_addresses(
+    tmp_path, monkeypatch
+):
+    import app.tls as tls
+    import ipaddress
+
+    monkeypatch.setenv("SPI_HOST", "0.0.0.0")
+    monkeypatch.setattr(tls.socket, "gethostname", lambda: "register-host")
+    monkeypatch.setattr(
+        tls.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (tls.socket.AF_INET, tls.socket.SOCK_STREAM, 6, "", ("192.0.2.10", 0)),
+            (tls.socket.AF_INET, tls.socket.SOCK_STREAM, 6, "", ("192.0.2.11", 0)),
+            (tls.socket.AF_INET, tls.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0)),
+        ],
+    )
+    monkeypatch.setattr(
+        tls.socket,
+        "socket",
+        lambda *_args, **_kwargs: pytest.fail("route fallback must not be probed"),
+    )
+
+    cert_path, _ = tls.ensure_self_signed_cert(tmp_path)
+    cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    sans = cert.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName
+    ).value.get_values_for_type(x509.IPAddress)
+
+    assert ipaddress.ip_address("192.0.2.10") in sans
+    assert ipaddress.ip_address("192.0.2.11") in sans
+    assert ipaddress.ip_address("0.0.0.0") not in sans
+
+
+def test_wildcard_bind_certificate_rotates_after_dhcp_change(tmp_path, monkeypatch):
+    import app.tls as tls
+    import ipaddress
+
+    monkeypatch.setenv("SPI_HOST", "0.0.0.0")
+    current_address = ["192.0.2.10"]
+    monkeypatch.setattr(tls.socket, "gethostname", lambda: "register-host")
+    monkeypatch.setattr(
+        tls.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (
+                tls.socket.AF_INET,
+                tls.socket.SOCK_STREAM,
+                6,
+                "",
+                (current_address[0], 0),
+            )
+        ],
+    )
+
+    original, _ = tls.ensure_self_signed_cert(tmp_path)
+    current_address[0] = "192.0.2.99"
+    regenerated, _ = tls.ensure_self_signed_cert(tmp_path)
+
+    assert regenerated != original
+    cert = x509.load_pem_x509_certificate(regenerated.read_bytes())
+    sans = cert.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName
+    ).value.get_values_for_type(x509.IPAddress)
+    assert ipaddress.ip_address("192.0.2.99") in sans
+    assert ipaddress.ip_address("192.0.2.10") not in sans
 
 
 def test_uvicorn_kwargs_disabled_and_enabled(tmp_path):

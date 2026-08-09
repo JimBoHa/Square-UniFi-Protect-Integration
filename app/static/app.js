@@ -1117,6 +1117,98 @@ function protectTimelineLink(txn, content) {
   return link;
 }
 
+function clipNoteElement(txn) {
+  const state = transactionNoteState(txn);
+  if (!state.note && !isAdmin(currentUser)) return null;
+  const note = document.createElement("div");
+  note.className = "clip-note";
+  let title = null;
+  let text = null;
+  function renderNoteText(value) {
+    if (!value) {
+      if (title) title.remove();
+      if (text) text.remove();
+      title = null;
+      text = null;
+      return;
+    }
+    if (!title) {
+      title = document.createElement("strong");
+      title.textContent = "Clip note";
+      note.prepend(title);
+    }
+    if (!text) {
+      text = document.createElement("p");
+      title.after(text);
+    }
+    text.textContent = value;
+  }
+  renderNoteText(state.note);
+  if (!isAdmin(currentUser)) return note;
+
+  const editor = document.createElement("details");
+  editor.className = "clip-note-editor";
+  const summary = document.createElement("summary");
+  summary.textContent = state.note ? "Edit clip note" : "Add clip note";
+  const form = document.createElement("form");
+  form.className = "clip-note-form";
+  const label = document.createElement("label");
+  label.textContent = "Clip note";
+  const textarea = document.createElement("textarea");
+  textarea.value = state.note;
+  textarea.maxLength = MAX_TRANSACTION_NOTE_LENGTH;
+  textarea.placeholder = "Add a searchable note…";
+  textarea.spellcheck = true;
+  label.appendChild(textarea);
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.textContent = "Save note";
+  form.append(label, submit);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    let body;
+    try {
+      body = transactionNoteUpdate(textarea.value, state.revision);
+    } catch (error) {
+      message(error.message, "error");
+      return;
+    }
+    submit.disabled = true;
+    try {
+      const result = await api(
+        `/api/transactions/${encodeURIComponent(txn.id)}/note`,
+        {
+          method: "PUT",
+          body: JSON.stringify(body),
+        },
+      );
+      txn.note = result.note;
+      txn.note_revision = result.note_revision;
+      state.note = result.note;
+      state.revision = result.note_revision;
+      renderNoteText(result.note);
+      summary.textContent = result.note ? "Edit clip note" : "Add clip note";
+      editor.open = false;
+      transactionSnapshot = null;
+      lastTransactionPayload = null;
+      message("Clip note saved.", "ok");
+      await loadTransactions({ offset: transactionOffset });
+    } catch (error) {
+      if (error.status === 409) {
+        transactionSnapshot = null;
+        lastTransactionPayload = null;
+        void loadTransactions({ offset: transactionOffset });
+      }
+      message(error.message, "error");
+    } finally {
+      submit.disabled = false;
+    }
+  });
+  editor.append(summary, form);
+  note.appendChild(editor);
+  return note;
+}
+
 function renderTransactions(
   txns,
   filtered = transactionFiltersActive(transactionFilters),
@@ -1196,6 +1288,8 @@ function renderTransactions(
     meta.appendChild(transactionId);
     meta.appendChild(status);
     if (refundStatus) meta.appendChild(refundStatus);
+    const clipNote = clipNoteElement(txn);
+    if (clipNote) meta.appendChild(clipNote);
 
     row.appendChild(thumb);
     row.appendChild(amount);

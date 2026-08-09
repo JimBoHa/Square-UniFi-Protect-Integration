@@ -1426,6 +1426,8 @@ def test_store_migrates_legacy_fields_and_scrubs_raw_payment(tmp_path):
         "receipt_url": "https://square.example/legacy",
         "camera_id": "cam1aaaaaaaaaaaaaaaaaaaaa",
         "thumbnail_path": "PAY_LEGACY.jpg",
+        "note": "",
+        "note_revision": 0,
         "thumbnail_bytes": len(b"legacy image"),
         "thumbnail_policy_revision": 0,
         "thumbnail_retired_at": None,

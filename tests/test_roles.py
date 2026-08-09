@@ -52,6 +52,7 @@ ADMIN_ENDPOINTS = frozenset(
         ("POST", "/api/users"),
         ("PUT", "/api/users/{user_id}/password"),
         ("GET", "/api/login-audit"),
+        ("PUT", "/api/transactions/{txn_id}/note"),
     }
 )
 

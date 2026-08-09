@@ -24,6 +24,7 @@ EXPORT_HEADERS = [
     "card_last4",
     "receipt_url",
     "protect_timeline_url",
+    "note",
 ]
 
 
@@ -67,6 +68,7 @@ def test_transaction_export_returns_allowlisted_facts_and_timeline_links(configu
         row["protect_timeline_url"] == expected_links[row["amount_minor_units"]]
         for row in rows
     )
+    assert all(row["note"] == "" for row in rows)
     assert SQUARE_TOKEN.encode() not in response.content
     assert FAKE_JPEG not in response.content
     assert b"thumbnail_path" not in response.content
@@ -82,7 +84,7 @@ def test_transaction_export_quotes_rfc4180_fields_and_neutralizes_formulas(
         store._db.execute(
             "UPDATE transactions SET created_at = ?, currency = ?, status = ?, "
             "location_id = ?, device_id = ?, device_name = ?, card_last4 = ?, "
-            "receipt_url = ?, raw = ?, thumbnail_path = ? WHERE id = ?",
+            "receipt_url = ?, note = ?, raw = ?, thumbnail_path = ? WHERE id = ?",
             (
                 "=1+1",
                 "=USD",
@@ -92,6 +94,7 @@ def test_transaction_export_quotes_rfc4180_fields_and_neutralizes_formulas(
                 'Register, "A"\nNorth',
                 "\t=4242",
                 '=HYPERLINK("https://attacker.invalid")',
+                '=HYPERLINK("https://note.invalid")\nfollow up',
                 '{"access_token":"raw-provider-secret"}',
                 "thumbnail-secret.jpg",
                 "PAY_001",
@@ -117,6 +120,9 @@ def test_transaction_export_quotes_rfc4180_fields_and_neutralizes_formulas(
         "'=HYPERLINK(\"https://attacker.invalid\")"
     )
     assert row["protect_timeline_url"].startswith("https://192.168.1.1/")
+    assert row["note"] == (
+        "'=HYPERLINK(\"https://note.invalid\")\r\nfollow up"
+    )
     assert b'"Register, ""A""\r\nNorth"' in response.content
     assert b"raw-provider-secret" not in response.content
     assert b"thumbnail-secret.jpg" not in response.content

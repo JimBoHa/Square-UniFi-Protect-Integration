@@ -135,14 +135,6 @@ THUMBNAIL_STORAGE_SETTING_KEYS = (
     THUMBNAIL_MAX_STORAGE_MIB_SETTING,
     THUMBNAIL_POLICY_REVISION_SETTING,
 )
-FRAME_OFFSET_PENDING = "pending"
-FRAME_OFFSET_MEASURED = "measured"
-FRAME_OFFSET_UNAVAILABLE = "unavailable"
-FRAME_OFFSET_STATUSES = frozenset(
-    (FRAME_OFFSET_PENDING, FRAME_OFFSET_MEASURED, FRAME_OFFSET_UNAVAILABLE)
-)
-FRAME_DIGIT_TEMPLATE_BYTES = 24 * 36
-MAX_FRAME_DIGIT_TEMPLATES_PER_DIGIT = 16
 SQUARE_OAUTH_STATE_TTL_SECONDS = 10 * 60
 MAX_PENDING_SQUARE_OAUTH_STATES = 16
 _NO_EXPECTED_PROTECT_HOST = object()
@@ -230,17 +222,6 @@ CREATE TABLE IF NOT EXISTS transactions (
     thumbnail_policy_revision INTEGER NOT NULL DEFAULT 0,
     thumbnail_retired_at INTEGER,
     thumbnail_retired_reason TEXT NOT NULL DEFAULT '',
-    frame_ts_ms INTEGER,
-    frame_offset_ms INTEGER,
-    frame_offset_confidence INTEGER CHECK (
-        frame_offset_confidence IS NULL OR
-        frame_offset_confidence BETWEEN 0 AND 10000
-    ),
-    frame_offset_status TEXT NOT NULL DEFAULT 'pending' CHECK (
-        frame_offset_status IN ('pending', 'measured', 'unavailable')
-    ),
-    frame_offset_attempts INTEGER NOT NULL DEFAULT 0 CHECK (frame_offset_attempts >= 0),
-    frame_offset_error TEXT NOT NULL DEFAULT '',
     note TEXT NOT NULL DEFAULT '' CHECK (length(note) <= 2000),
     note_revision INTEGER NOT NULL DEFAULT 0 CHECK (note_revision >= 0),
     raw TEXT NOT NULL DEFAULT '{}',
@@ -317,15 +298,6 @@ CREATE TABLE IF NOT EXISTS thumbnail_retries (
 );
 CREATE INDEX IF NOT EXISTS idx_thumbnail_retries_due
     ON thumbnail_retries (next_attempt_at, lease_expires_at);
-CREATE TABLE IF NOT EXISTS frame_digit_templates (
-    camera_id TEXT NOT NULL,
-    digit TEXT NOT NULL CHECK (digit IN ('0','1','2','3','4','5','6','7','8','9')),
-    glyph BLOB NOT NULL CHECK (length(glyph) = 864),
-    created_at REAL NOT NULL,
-    PRIMARY KEY (camera_id, digit, glyph)
-);
-CREATE INDEX IF NOT EXISTS idx_frame_digit_templates_created
-    ON frame_digit_templates (camera_id, digit, created_at DESC);
 CREATE TABLE IF NOT EXISTS protect_evidence_retired (
     transaction_id TEXT PRIMARY KEY,
     FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE CASCADE
@@ -770,17 +742,11 @@ class Store:
                 row["location_id"], row["device_id"]
             )
             camera_id = mapping["camera_id"] if mapping else None
-            frame_status = (
-                FRAME_OFFSET_PENDING if camera_id else FRAME_OFFSET_UNAVAILABLE
-            )
             self._db.execute(
                 "UPDATE transactions SET camera_id = ?, thumbnail_path = NULL, "
-                "thumbnail_bytes = NULL, thumbnail_policy_revision = 0, "
-                "frame_ts_ms = NULL, frame_offset_ms = NULL, "
-                "frame_offset_confidence = NULL, frame_offset_status = ?, "
-                "frame_offset_attempts = 0, frame_offset_error = '' "
+                "thumbnail_bytes = NULL, thumbnail_policy_revision = 0 "
                 "WHERE id = ?",
-                (camera_id, frame_status, row["id"]),
+                (camera_id, row["id"]),
             )
 
     def _backfill_thumbnail_sizes_locked(self) -> None:
@@ -944,43 +910,6 @@ class Store:
             self._db.execute(
                 "ALTER TABLE transactions ADD COLUMN thumbnail_retired_reason "
                 "TEXT NOT NULL DEFAULT ''"
-            )
-        if "frame_ts_ms" not in transaction_columns:
-            self._db.execute(
-                "ALTER TABLE transactions ADD COLUMN frame_ts_ms INTEGER"
-            )
-        if "frame_offset_ms" not in transaction_columns:
-            self._db.execute(
-                "ALTER TABLE transactions ADD COLUMN frame_offset_ms INTEGER"
-            )
-        if "frame_offset_confidence" not in transaction_columns:
-            self._db.execute(
-                "ALTER TABLE transactions ADD COLUMN frame_offset_confidence "
-                "INTEGER CHECK (frame_offset_confidence IS NULL OR "
-                "frame_offset_confidence BETWEEN 0 AND 10000)"
-            )
-        added_frame_offset_status = "frame_offset_status" not in transaction_columns
-        if added_frame_offset_status:
-            self._db.execute(
-                "ALTER TABLE transactions ADD COLUMN frame_offset_status "
-                "TEXT NOT NULL DEFAULT 'pending' CHECK (frame_offset_status "
-                "IN ('pending', 'measured', 'unavailable'))"
-            )
-        if "frame_offset_attempts" not in transaction_columns:
-            self._db.execute(
-                "ALTER TABLE transactions ADD COLUMN frame_offset_attempts "
-                "INTEGER NOT NULL DEFAULT 0 CHECK (frame_offset_attempts >= 0)"
-            )
-        if "frame_offset_error" not in transaction_columns:
-            self._db.execute(
-                "ALTER TABLE transactions ADD COLUMN frame_offset_error "
-                "TEXT NOT NULL DEFAULT ''"
-            )
-        if added_frame_offset_status:
-            self._db.execute(
-                "UPDATE transactions SET frame_offset_status = ? "
-                "WHERE thumbnail_path IS NULL",
-                (FRAME_OFFSET_UNAVAILABLE,),
             )
         self._backfill_transaction_devices()
 
@@ -1453,7 +1382,6 @@ class Store:
                     )
                     self._db.execute("DELETE FROM camera_map")
                     self._db.execute("DELETE FROM thumbnail_retries")
-                    self._db.execute("DELETE FROM frame_digit_templates")
                     self._db.execute("DELETE FROM protect_motion_events")
                     self._db.executemany(
                         "DELETE FROM settings WHERE key = ?",
@@ -1462,12 +1390,8 @@ class Store:
                     self._db.execute(
                         "UPDATE transactions SET camera_id = NULL, "
                         "thumbnail_path = NULL, thumbnail_bytes = NULL, "
-                        "thumbnail_policy_revision = 0, frame_ts_ms = NULL, "
-                        "frame_offset_ms = NULL, frame_offset_confidence = NULL, "
-                        "frame_offset_status = ?, frame_offset_attempts = 0, "
-                        "frame_offset_error = '' "
-                        "WHERE camera_id IS NOT NULL OR thumbnail_path IS NOT NULL",
-                        (FRAME_OFFSET_UNAVAILABLE,),
+                        "thumbnail_policy_revision = 0 "
+                        "WHERE camera_id IS NOT NULL OR thumbnail_path IS NOT NULL"
                     )
                     self._db.execute(
                         "INSERT INTO settings (key, value, encrypted) VALUES (?, '1', 0) "
@@ -3017,17 +2941,9 @@ class Store:
 
                     if txn["camera_id"] == camera_id:
                         continue
-                    frame_status = (
-                        FRAME_OFFSET_PENDING
-                        if camera_id
-                        else FRAME_OFFSET_UNAVAILABLE
-                    )
                     self._db.execute(
-                        "UPDATE transactions SET camera_id = ?, frame_ts_ms = NULL, "
-                        "frame_offset_ms = NULL, frame_offset_confidence = NULL, "
-                        "frame_offset_status = ?, frame_offset_attempts = 0, "
-                        "frame_offset_error = '' WHERE id = ?",
-                        (camera_id, frame_status, txn["id"]),
+                        "UPDATE transactions SET camera_id = ? WHERE id = ?",
+                        (camera_id, txn["id"]),
                     )
                     if camera_id is None:
                         self._db.execute(
@@ -3074,12 +2990,6 @@ class Store:
             "thumbnail_path": None,
             "thumbnail_bytes": None,
             "thumbnail_policy_revision": 0,
-            "frame_ts_ms": None,
-            "frame_offset_ms": None,
-            "frame_offset_confidence": None,
-            "frame_offset_status": FRAME_OFFSET_PENDING,
-            "frame_offset_attempts": 0,
-            "frame_offset_error": "",
             "location_id": "",
             "device_id": "",
             "device_name": "",
@@ -3095,29 +3005,6 @@ class Store:
         values["updated_at"] = txn.get("updated_at") or txn["created_at"]
         values["updated_ts_ms"] = txn.get("updated_ts_ms", txn["ts_ms"])
         values["replace_evidence"] = int(bool(replace_evidence))
-        if values["frame_offset_status"] not in FRAME_OFFSET_STATUSES:
-            raise ValueError("Invalid frame offset status")
-        values["frame_offset_attempts"] = max(
-            0, int(values["frame_offset_attempts"] or 0)
-        )
-        values["frame_offset_error"] = str(values["frame_offset_error"] or "")[:500]
-        if values["frame_offset_status"] == FRAME_OFFSET_MEASURED:
-            if (
-                values["frame_ts_ms"] is None
-                or values["frame_offset_ms"] is None
-                or int(values["frame_ts_ms"]) - int(values["ts_ms"])
-                != int(values["frame_offset_ms"])
-            ):
-                raise ValueError("Frame timestamp and offset disagree")
-            values["frame_ts_ms"] = int(values["frame_ts_ms"])
-            values["frame_offset_ms"] = int(values["frame_offset_ms"])
-            values["frame_offset_confidence"] = max(
-                0, min(int(values["frame_offset_confidence"] or 0), 10_000)
-            )
-        else:
-            values["frame_ts_ms"] = None
-            values["frame_offset_ms"] = None
-            values["frame_offset_confidence"] = None
         superseded_thumbnail: str | None = None
         protect_identity_mismatch = False
 
@@ -3145,12 +3032,6 @@ class Store:
                         values["thumbnail_path"] = None
                         values["thumbnail_bytes"] = None
                         values["thumbnail_policy_revision"] = 0
-                        values["frame_ts_ms"] = None
-                        values["frame_offset_ms"] = None
-                        values["frame_offset_confidence"] = None
-                        values["frame_offset_status"] = FRAME_OFFSET_UNAVAILABLE
-                        values["frame_offset_attempts"] = 0
-                        values["frame_offset_error"] = ""
                         values["replace_evidence"] = 0
                 protect_retired = self._db.execute(
                     "SELECT 1 FROM protect_evidence_retired "
@@ -3162,19 +3043,11 @@ class Store:
                     values["thumbnail_path"] = None
                     values["thumbnail_bytes"] = None
                     values["thumbnail_policy_revision"] = 0
-                    values["frame_ts_ms"] = None
-                    values["frame_offset_ms"] = None
-                    values["frame_offset_confidence"] = None
-                    values["frame_offset_status"] = FRAME_OFFSET_UNAVAILABLE
-                    values["frame_offset_attempts"] = 0
-                    values["frame_offset_error"] = ""
                     values["replace_evidence"] = 0
                 existing = self._db.execute(
                     "SELECT id, camera_id, ts_ms, updated_ts_ms, status, "
                     "location_id, device_id, device_name, card_last4, thumbnail_path, "
-                    "thumbnail_bytes, thumbnail_policy_revision, thumbnail_retired_at, "
-                    "frame_ts_ms, frame_offset_ms, frame_offset_confidence, "
-                    "frame_offset_status, frame_offset_attempts, frame_offset_error "
+                    "thumbnail_bytes, thumbnail_policy_revision, thumbnail_retired_at "
                     "FROM transactions WHERE id = ?",
                     (txn["id"],),
                 ).fetchone()
@@ -3188,12 +3061,6 @@ class Store:
                     values["thumbnail_path"] = None
                     values["thumbnail_bytes"] = None
                     values["thumbnail_policy_revision"] = 0
-                    values["frame_ts_ms"] = None
-                    values["frame_offset_ms"] = None
-                    values["frame_offset_confidence"] = None
-                    values["frame_offset_status"] = FRAME_OFFSET_UNAVAILABLE
-                    values["frame_offset_attempts"] = 0
-                    values["frame_offset_error"] = ""
                     values["replace_evidence"] = 0
                 if enforce_current_mapping:
                     accepted_version = bool(
@@ -3229,34 +3096,18 @@ class Store:
                             values["thumbnail_path"] = None
                             values["thumbnail_bytes"] = None
                             values["thumbnail_policy_revision"] = 0
-                            values["frame_ts_ms"] = None
-                            values["frame_offset_ms"] = None
-                            values["frame_offset_confidence"] = None
-                            values["frame_offset_status"] = (
-                                FRAME_OFFSET_PENDING
-                                if mapped_camera_id
-                                else FRAME_OFFSET_UNAVAILABLE
-                            )
-                            values["frame_offset_attempts"] = 0
-                            values["frame_offset_error"] = ""
                         values["camera_id"] = mapped_camera_id
-                if not values["camera_id"] and not values["thumbnail_path"]:
-                    values["frame_offset_status"] = FRAME_OFFSET_UNAVAILABLE
                 applied = self._db.execute(
                     "INSERT INTO transactions (id, created_at, ts_ms, updated_at, updated_ts_ms, "
                     "amount, currency, refunded_amount, status, location_id, device_id, "
                     "device_name, card_last4, "
                     "receipt_url, camera_id, thumbnail_path, thumbnail_bytes, "
-                    "thumbnail_policy_revision, frame_ts_ms, frame_offset_ms, "
-                    "frame_offset_confidence, frame_offset_status, "
-                    "frame_offset_attempts, frame_offset_error, raw) "
+                    "thumbnail_policy_revision, raw) "
                     "VALUES (:id, :created_at, :ts_ms, :updated_at, "
                     ":updated_ts_ms, :amount, :currency, :refunded_amount, :status, "
                     ":location_id, :device_id, "
                     ":device_name, :card_last4, :receipt_url, :camera_id, :thumbnail_path, "
-                    ":thumbnail_bytes, :thumbnail_policy_revision, :frame_ts_ms, "
-                    ":frame_offset_ms, :frame_offset_confidence, :frame_offset_status, "
-                    ":frame_offset_attempts, :frame_offset_error, :raw) "
+                    ":thumbnail_bytes, :thumbnail_policy_revision, :raw) "
                     "ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at, "
                     "ts_ms=excluded.ts_ms, updated_at=excluded.updated_at, "
                     "updated_ts_ms=excluded.updated_ts_ms, amount=excluded.amount, "
@@ -3289,29 +3140,7 @@ class Store:
                     "THEN excluded.thumbnail_policy_revision "
                     "WHEN excluded.thumbnail_path IS NOT NULL "
                     "THEN excluded.thumbnail_policy_revision "
-                    "ELSE transactions.thumbnail_policy_revision END, "
-                    "frame_ts_ms=CASE WHEN excluded.ts_ms != transactions.ts_ms "
-                    "OR :replace_evidence = 1 OR excluded.thumbnail_path IS NOT NULL "
-                    "THEN excluded.frame_ts_ms ELSE transactions.frame_ts_ms END, "
-                    "frame_offset_ms=CASE WHEN excluded.ts_ms != transactions.ts_ms "
-                    "OR :replace_evidence = 1 OR excluded.thumbnail_path IS NOT NULL "
-                    "THEN excluded.frame_offset_ms ELSE transactions.frame_offset_ms END, "
-                    "frame_offset_confidence=CASE WHEN excluded.ts_ms != transactions.ts_ms "
-                    "OR :replace_evidence = 1 OR excluded.thumbnail_path IS NOT NULL "
-                    "THEN excluded.frame_offset_confidence "
-                    "ELSE transactions.frame_offset_confidence END, "
-                    "frame_offset_status=CASE WHEN excluded.ts_ms != transactions.ts_ms "
-                    "OR :replace_evidence = 1 OR excluded.thumbnail_path IS NOT NULL "
-                    "THEN excluded.frame_offset_status "
-                    "ELSE transactions.frame_offset_status END, "
-                    "frame_offset_attempts=CASE WHEN excluded.ts_ms != transactions.ts_ms "
-                    "OR :replace_evidence = 1 OR excluded.thumbnail_path IS NOT NULL "
-                    "THEN excluded.frame_offset_attempts "
-                    "ELSE transactions.frame_offset_attempts END, "
-                    "frame_offset_error=CASE WHEN excluded.ts_ms != transactions.ts_ms "
-                    "OR :replace_evidence = 1 OR excluded.thumbnail_path IS NOT NULL "
-                    "THEN excluded.frame_offset_error "
-                    "ELSE transactions.frame_offset_error END "
+                    "ELSE transactions.thumbnail_policy_revision END "
                     "WHERE excluded.updated_ts_ms >= transactions.updated_ts_ms",
                     values,
                 )
@@ -3536,13 +3365,10 @@ class Store:
                     return False
                 cursor = self._db.execute(
                     "UPDATE transactions SET thumbnail_path = NULL, "
-                    "thumbnail_bytes = NULL, thumbnail_policy_revision = 0, "
-                    "frame_ts_ms = NULL, frame_offset_ms = NULL, "
-                    "frame_offset_confidence = NULL, frame_offset_status = ?, "
-                    "frame_offset_attempts = 0, frame_offset_error = '' "
+                    "thumbnail_bytes = NULL, thumbnail_policy_revision = 0 "
                     "WHERE id = ? AND thumbnail_path = ? "
                     "AND thumbnail_retired_at IS NULL",
-                    (FRAME_OFFSET_PENDING, txn_id, expected_path),
+                    (txn_id, expected_path),
                 )
                 if cursor.rowcount != 1:
                     self._db.commit()
@@ -3559,13 +3385,9 @@ class Store:
                     else None
                 )
                 camera_id = mapping["camera_id"] if mapping else None
-                frame_status = (
-                    FRAME_OFFSET_PENDING if camera_id else FRAME_OFFSET_UNAVAILABLE
-                )
                 self._db.execute(
-                    "UPDATE transactions SET camera_id = ?, frame_offset_status = ? "
-                    "WHERE id = ?",
-                    (camera_id, frame_status, txn_id),
+                    "UPDATE transactions SET camera_id = ? WHERE id = ?",
+                    (camera_id, txn_id),
                 )
                 if camera_id:
                     self._db.execute(
@@ -3687,33 +3509,8 @@ class Store:
         thumbnail_path: str,
         thumbnail_bytes: int | None = None,
         thumbnail_policy_revision: int = 0,
-        frame_ts_ms: int | None = None,
-        frame_offset_ms: int | None = None,
-        frame_offset_confidence: int | None = None,
-        frame_offset_status: str = FRAME_OFFSET_PENDING,
-        frame_offset_error: str = "",
     ) -> bool:
         """Attach retry evidence only when token, camera, and time still match."""
-        if frame_offset_status not in FRAME_OFFSET_STATUSES:
-            raise ValueError("Invalid frame offset status")
-        if frame_offset_status == FRAME_OFFSET_MEASURED:
-            if (
-                frame_ts_ms is None
-                or frame_offset_ms is None
-                or int(frame_ts_ms) - int(ts_ms) != int(frame_offset_ms)
-            ):
-                raise ValueError("Frame timestamp and offset disagree")
-            frame_ts_ms = int(frame_ts_ms)
-            frame_offset_ms = int(frame_offset_ms)
-            frame_offset_confidence = max(
-                0, min(int(frame_offset_confidence or 0), 10_000)
-            )
-            frame_offset_error = ""
-        else:
-            frame_ts_ms = None
-            frame_offset_ms = None
-            frame_offset_confidence = None
-            frame_offset_error = str(frame_offset_error or "")[:500]
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -3728,21 +3525,13 @@ class Store:
 
                 updated = self._db.execute(
                     "UPDATE transactions SET thumbnail_path = ?, thumbnail_bytes = ?, "
-                    "thumbnail_policy_revision = ?, frame_ts_ms = ?, "
-                    "frame_offset_ms = ?, frame_offset_confidence = ?, "
-                    "frame_offset_status = ?, frame_offset_attempts = 0, "
-                    "frame_offset_error = ? "
+                    "thumbnail_policy_revision = ? "
                     "WHERE id = ? AND camera_id = ? AND ts_ms = ? "
                     "AND thumbnail_path IS NULL AND thumbnail_retired_at IS NULL",
                     (
                         thumbnail_path,
                         thumbnail_bytes,
                         max(0, int(thumbnail_policy_revision)),
-                        frame_ts_ms,
-                        frame_offset_ms,
-                        frame_offset_confidence,
-                        frame_offset_status,
-                        frame_offset_error,
                         transaction_id,
                         camera_id,
                         int(ts_ms),
@@ -3896,170 +3685,6 @@ class Store:
             "retired_count": int(retired["count"]),
         }
 
-    def get_frame_digit_templates(
-        self,
-        camera_id: str,
-    ) -> dict[str, tuple[bytes, ...]]:
-        """Return bounded, scene-free glyph templates learned for one camera."""
-        with self._lock:
-            rows = self._db.execute(
-                "SELECT digit, glyph FROM frame_digit_templates "
-                "WHERE camera_id = ? ORDER BY digit, created_at DESC, rowid DESC",
-                (camera_id,),
-            ).fetchall()
-        templates: dict[str, list[bytes]] = {}
-        for row in rows:
-            templates.setdefault(row["digit"], []).append(bytes(row["glyph"]))
-        return {digit: tuple(samples) for digit, samples in templates.items()}
-
-    def add_frame_digit_templates(
-        self,
-        camera_id: str,
-        templates: dict[str, list[bytes] | tuple[bytes, ...]],
-    ) -> int:
-        """Learn normalized overlay digits while keeping each class bounded."""
-        if not camera_id or len(camera_id) > 64:
-            raise ValueError("Invalid frame template camera")
-        rows: list[tuple[str, str, bytes, float]] = []
-        now = time.time()
-        for digit, samples in templates.items():
-            if digit not in "0123456789":
-                raise ValueError("Invalid frame template digit")
-            for sample in dict.fromkeys(bytes(value) for value in samples):
-                if len(sample) != FRAME_DIGIT_TEMPLATE_BYTES:
-                    raise ValueError("Invalid frame template glyph")
-                if any(value not in (0, 1) for value in sample):
-                    raise ValueError("Invalid frame template glyph")
-                rows.append((camera_id, digit, sample, now))
-        if not rows:
-            return 0
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                before = self._db.total_changes
-                self._db.executemany(
-                    "INSERT OR IGNORE INTO frame_digit_templates "
-                    "(camera_id, digit, glyph, created_at) VALUES (?, ?, ?, ?)",
-                    rows,
-                )
-                inserted = self._db.total_changes - before
-                for digit in set(row[1] for row in rows):
-                    self._db.execute(
-                        "DELETE FROM frame_digit_templates WHERE rowid IN ("
-                        "SELECT rowid FROM frame_digit_templates "
-                        "WHERE camera_id = ? AND digit = ? "
-                        "ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?)",
-                        (
-                            camera_id,
-                            digit,
-                            MAX_FRAME_DIGIT_TEMPLATES_PER_DIGIT,
-                        ),
-                    )
-                if inserted:
-                    # A row can become classifiable after another frame teaches
-                    # a previously unseen digit. Retry only classifier misses;
-                    # absent/malformed overlays remain durably unavailable.
-                    self._db.execute(
-                        "UPDATE transactions SET frame_offset_status = ?, "
-                        "frame_offset_attempts = 0, frame_offset_error = '' "
-                        "WHERE camera_id = ? AND thumbnail_path IS NOT NULL "
-                        "AND frame_offset_status = ? AND ("
-                        "frame_offset_error LIKE 'Not enough learned%' OR "
-                        "frame_offset_error LIKE "
-                        "'UniFi frame timestamp digit was ambiguous%')",
-                        (
-                            FRAME_OFFSET_PENDING,
-                            camera_id,
-                            FRAME_OFFSET_UNAVAILABLE,
-                        ),
-                    )
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-        return int(inserted)
-
-    def list_pending_frame_offset_assets(self, limit: int = 50) -> list[dict]:
-        limit = max(1, min(int(limit), 100))
-        with self._lock:
-            rows = self._db.execute(
-                "SELECT id, ts_ms, camera_id, thumbnail_path, "
-                "frame_offset_attempts FROM transactions "
-                "WHERE thumbnail_path IS NOT NULL AND camera_id IS NOT NULL "
-                "AND frame_offset_status = ? "
-                "ORDER BY frame_offset_attempts, ts_ms DESC, id DESC LIMIT ?",
-                (FRAME_OFFSET_PENDING, limit),
-            ).fetchall()
-        return [dict(row) for row in rows]
-
-    def record_frame_offset_attempt(
-        self,
-        transaction_id: str,
-        expected_path: str,
-        measurement,
-        error: str,
-        *,
-        max_attempts: int = 3,
-    ) -> str:
-        """Attach a local OCR result only to the same thumbnail evidence."""
-        max_attempts = max(1, min(int(max_attempts), 100))
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                row = self._db.execute(
-                    "SELECT ts_ms, thumbnail_path, frame_offset_status, "
-                    "frame_offset_attempts FROM transactions WHERE id = ?",
-                    (transaction_id,),
-                ).fetchone()
-                if (
-                    row is None
-                    or row["thumbnail_path"] != expected_path
-                    or row["frame_offset_status"] != FRAME_OFFSET_PENDING
-                ):
-                    self._db.commit()
-                    return "stale"
-                attempts = int(row["frame_offset_attempts"]) + 1
-                if measurement is not None:
-                    frame_ts_ms = int(measurement.frame_ts_ms)
-                    offset_ms = int(measurement.offset_ms)
-                    confidence = max(0, min(int(measurement.confidence), 10_000))
-                    if frame_ts_ms - int(row["ts_ms"]) != offset_ms:
-                        raise ValueError("Frame timestamp and offset disagree")
-                    status = FRAME_OFFSET_MEASURED
-                    error = ""
-                else:
-                    frame_ts_ms = None
-                    offset_ms = None
-                    confidence = None
-                    status = (
-                        FRAME_OFFSET_UNAVAILABLE
-                        if attempts >= max_attempts
-                        else FRAME_OFFSET_PENDING
-                    )
-                updated = self._db.execute(
-                    "UPDATE transactions SET frame_ts_ms = ?, frame_offset_ms = ?, "
-                    "frame_offset_confidence = ?, frame_offset_status = ?, "
-                    "frame_offset_attempts = ?, frame_offset_error = ? "
-                    "WHERE id = ? AND thumbnail_path = ? "
-                    "AND frame_offset_status = ?",
-                    (
-                        frame_ts_ms,
-                        offset_ms,
-                        confidence,
-                        status,
-                        attempts,
-                        str(error)[:500],
-                        transaction_id,
-                        expected_path,
-                        FRAME_OFFSET_PENDING,
-                    ),
-                )
-                self._db.commit()
-                return status if updated.rowcount == 1 else "stale"
-            except Exception:
-                self._db.rollback()
-                raise
-
     def update_thumbnail_metadata(
         self,
         transaction_id: str,
@@ -4108,20 +3733,12 @@ class Store:
                 updated = self._db.execute(
                     "UPDATE transactions SET thumbnail_path = NULL, "
                     "thumbnail_bytes = NULL, thumbnail_policy_revision = 0, "
-                    "thumbnail_retired_at = ?, thumbnail_retired_reason = ?, "
-                    "frame_offset_status = CASE "
-                    "WHEN frame_offset_status = ? THEN ? ELSE ? END, "
-                    "frame_offset_error = CASE WHEN frame_offset_status = ? "
-                    "THEN frame_offset_error ELSE 'Thumbnail retired before measurement' END "
+                    "thumbnail_retired_at = ?, thumbnail_retired_reason = ? "
                     "WHERE id = ? AND thumbnail_path = ? "
                     "AND thumbnail_retired_at IS NULL",
                     (
                         max(0, int(retired_at_ms)),
                         reason,
-                        FRAME_OFFSET_MEASURED,
-                        FRAME_OFFSET_MEASURED,
-                        FRAME_OFFSET_UNAVAILABLE,
-                        FRAME_OFFSET_MEASURED,
                         transaction_id,
                         expected_path,
                     ),

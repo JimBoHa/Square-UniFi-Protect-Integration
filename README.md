@@ -33,9 +33,6 @@ timeline near that timestamp.
   refund API request is needed.
 - **Click through to footage** — clicking a thumbnail uses the configured URL
   template to open the Protect timeline near the transaction timestamp.
-- **Measured frame offset** — each readable thumbnail compares Protect's
-  burned-in whole-second frame time with Square's millisecond transaction time
-  and displays the signed difference beside the sale.
 - **Fast retail lookup** — search the local feed by transaction ID, card last-4,
   locally authored clip note, POS device/name, location ID, or status, and
   narrow it to a Square payment status. Searches use normalized local fields,
@@ -243,18 +240,6 @@ and application startup all schedule maintenance.
 The oldest JPEGs are retired first until both limits are satisfied. Retired
 transactions remain searchable and keep their Protect timeline links, and are
 marked so later Square overlap polls cannot recreate the deleted bytes.
-
-Frame-offset measurement runs entirely on this machine. It segments the white
-digits in Protect's top-left timestamp overlay, learns only normalized binary
-digit shapes per camera (not scene pixels), and stores the measured frame time
-with the transaction. Existing thumbnails are backfilled in bounded background
-batches. The camera timestamp overlay must be enabled and the Protect console
-and app host should use the same timezone. Because the overlay shows whole
-seconds, the displayed offset has sub-second arithmetic but an inherent
-uncertainty of less than one second. If the overlay is absent, unreadable, or
-ambiguous, the app leaves the offset blank instead of estimating it.
-Measurements more than ten seconds from the Square timestamp are rejected as
-the wrong frame instead of being displayed.
 
 ### Motion without a transaction
 

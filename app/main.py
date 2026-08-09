@@ -29,7 +29,6 @@ from pydantic import BaseModel, Field, ValidationError
 from . import (
     deeplink,
     discovery,
-    frame_time,
     protect_motion,
     sync,
     thumbnail_storage,
@@ -57,7 +56,6 @@ from .square_client import (
 from .store import (
     ALARM_ENABLED_AFTER_SETTING,
     DEFAULT_ADMIN_USERNAME,
-    FRAME_OFFSET_UNAVAILABLE,
     MotionWebhookUnauthorized,
     PROTECT_CONSOLE_ID_SETTING,
     PROTECT_CONSOLE_GENERATION_SETTING,
@@ -838,25 +836,11 @@ def create_app(
                     "error": "",
                 }
             try:
-                try:
-                    frame_offsets = frame_time.backfill_frame_offsets(
-                        store,
-                        thumbnail_storage.read_thumbnail_file,
-                    )
-                except Exception:
-                    logger.exception("Frame offset backfill failed")
-                    frame_offsets = {
-                        "processed_count": 0,
-                        "measured_count": 0,
-                        "unavailable_count": 0,
-                        "pending_count": 0,
-                    }
-                storage_result = thumbnail_storage.run_thumbnail_maintenance(
+                result = thumbnail_storage.run_thumbnail_maintenance(
                     store,
                     sync.write_thumbnail,
                     optimize_existing=optimize_existing,
                 )
-                result = {**storage_result, "frame_offsets": frame_offsets}
             except Exception:
                 logger.exception("Thumbnail storage maintenance failed")
                 state = "error"
@@ -2416,11 +2400,6 @@ def create_app(
             ),
             "thumbnail_retired_at": txn.get("thumbnail_retired_at"),
             "thumbnail_retired_reason": txn.get("thumbnail_retired_reason", ""),
-            "frame_ts_ms": txn.get("frame_ts_ms"),
-            "frame_offset_ms": txn.get("frame_offset_ms"),
-            "frame_offset_status": txn.get(
-                "frame_offset_status", FRAME_OFFSET_UNAVAILABLE
-            ),
             "note": txn.get("note", ""),
             "note_revision": int(txn.get("note_revision", 0)),
             "protect_flag_delivered_at_ms": (

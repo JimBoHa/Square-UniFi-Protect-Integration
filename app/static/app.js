@@ -1453,12 +1453,6 @@ function renderTransactions(
     const when = document.createElement("div");
     when.className = "meta";
     when.textContent = new Date(txn.ts_ms).toLocaleString();
-    const frameOffset = document.createElement("div");
-    frameOffset.className = "meta frame-offset";
-    frameOffset.textContent = frameOffsetText(txn.frame_offset_ms);
-    if (frameOffset.textContent) {
-      frameOffset.title = frameOffsetTitle(txn.frame_offset_ms);
-    }
     const card = document.createElement("div");
     card.className = "meta";
     card.textContent = txn.card_last4 ? `Card •••• ${txn.card_last4}` : "";
@@ -1480,7 +1474,6 @@ function renderTransactions(
     const refundStatus = renderRefundStatus(document, txn);
     const protectFlag = protectFlagDelivery(txn);
     meta.appendChild(when);
-    if (frameOffset.textContent) meta.appendChild(frameOffset);
     meta.appendChild(card);
     meta.appendChild(source);
     meta.appendChild(transactionId);

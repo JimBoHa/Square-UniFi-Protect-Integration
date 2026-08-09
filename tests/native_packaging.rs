@@ -58,8 +58,12 @@ fn docker_lan_bootstrap_uses_builtin_tls_and_native_healthcheck() {
     let dockerfile = source("Dockerfile");
     let compose = source("docker-compose.yml");
     assert!(dockerfile.contains("SPI_HOST=0.0.0.0"));
+    assert!(dockerfile.contains("SPI_PORT=3546"));
+    assert!(dockerfile.contains("EXPOSE 3546"));
     assert!(dockerfile.contains("SPI_TLS=1"));
     assert!(dockerfile.contains("--healthcheck"));
+    assert!(compose.contains("\"3546:3546\""));
+    assert!(compose.contains("SPI_PORT: \"3546\""));
     assert!(compose.contains("SPI_TLS: \"1\""));
     assert!(!compose.contains("SPI_BOOTSTRAP_SECRET"));
 }
@@ -80,21 +84,24 @@ fn github_ci_runs_native_rust_and_container_smoke_tests() {
         "cargo clippy --locked --all-targets --all-features -- -D warnings",
         "cargo test --locked --all-targets",
         "docker build -t square-unifi-protect:ci .",
-        "docker run -d --name spi -p 8000:8000",
-        "curl -kfs https://127.0.0.1:8000/api/status",
+        "docker run -d --name spi -p 3546:3546",
+        "curl -kfs https://127.0.0.1:3546/api/status",
     ] {
         assert!(workflow.contains(command), "missing CI command: {command}");
     }
 }
 
 #[test]
-fn double_click_launcher_builds_locked_rust_and_bounds_ports() {
+fn double_click_launcher_builds_locked_rust_and_reserves_its_port() {
     let launcher = source("Start Square Protect.command");
     assert!(launcher.contains("cargo build --locked --release"));
     assert!(launcher.contains("target/release/square-unifi-protect"));
+    assert!(launcher.contains("PORT=\"${SPI_PORT-3546}\""));
     assert!(launcher.contains("[ \"$PORT\" -lt 1 ]"));
     assert!(launcher.contains("[ \"$PORT\" -gt 65535 ]"));
-    assert!(launcher.contains("PORT_CAP=$((PORT + 20))"));
+    assert!(launcher.contains("requires fixed TCP port $PORT"));
+    assert!(!launcher.contains("trying $((PORT + 1))"));
+    assert!(!launcher.contains("PORT_CAP"));
     assert!(launcher.contains("export SPI_PORT=\"$PORT\""));
     assert!(!launcher.contains("python -m"));
 }
@@ -117,9 +124,11 @@ fn unix_lan_services_enable_tls_without_hard_coded_host_ip() {
     let installer = source("scripts/install-service.sh");
     assert!(installer.contains("<key>SPI_HOST</key><string>0.0.0.0</string>"));
     assert!(installer.contains("Environment=SPI_HOST=0.0.0.0"));
+    assert!(installer.contains("<key>SPI_PORT</key><string>3546</string>"));
+    assert!(installer.contains("Environment=SPI_PORT=3546"));
     assert!(installer.contains("<key>SPI_TLS</key><string>1</string>"));
     assert!(installer.contains("Environment=SPI_TLS=1"));
-    assert!(installer.contains("https://<this-host>:8000"));
+    assert!(installer.contains("https://<this-host>:3546"));
     assert!(!installer.contains("10.0.7.215"));
 }
 
@@ -146,6 +155,7 @@ fn windows_bootstrap_secret_is_dpapi_protected_and_scrubbed() {
     assert!(runner.contains("ProtectedData]::Unprotect"));
     assert!(runner.contains("Remove-Item Env:SPI_BOOTSTRAP_SECRET"));
     assert!(runner.contains("Remove-Item $BootstrapSecretFile"));
+    assert!(runner.contains("$env:SPI_PORT = \"3546\""));
 }
 
 #[test]
@@ -189,9 +199,37 @@ fn packaging_documentation_matches_secure_container_and_lan_urls() {
     let readme = source("README.md");
     let packaging = source("PACKAGING.md");
     assert!(packaging.contains("docker compose up -d"));
-    assert!(packaging.contains("Open `https://<host>:8000`"));
+    assert!(packaging.contains("Open `https://<host>:3546`"));
+    assert!(packaging.contains("reserve TCP port `3546`"));
     assert!(packaging.contains("plaintext setup secret"));
     assert!(readme.contains("SPI_COOKIE_SECURE=1"));
+    assert!(readme.contains("| `SPI_PORT` | `3546` |"));
+}
+
+#[test]
+fn fixed_port_assignment_is_consistent_across_runtime_and_packaging() {
+    assert!(source("src/config.rs").contains("pub const DEFAULT_PORT: u16 = 3546;"));
+    assert!(source("src/main.rs").contains("DEFAULT_PORT.to_string()"));
+    assert!(
+        source("src/bin/square-protect-menubar.rs")
+            .contains("use square_unifi_protect::DEFAULT_PORT;")
+    );
+
+    for path in [
+        "Dockerfile",
+        "docker-compose.yml",
+        ".github/workflows/docker.yml",
+        "Start Square Protect.command",
+        "scripts/install-service.sh",
+        "scripts/windows/install-service.ps1",
+        "scripts/windows/run-service.ps1",
+        "PACKAGING.md",
+    ] {
+        assert!(
+            !source(path).contains("8000"),
+            "legacy port assignment remains in {path}"
+        );
+    }
 }
 
 #[test]

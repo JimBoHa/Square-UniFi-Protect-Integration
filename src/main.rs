@@ -1,5 +1,6 @@
 use anyhow::Context as _;
-use square_unifi_protect::{AppState, Config, Store, build_router, tls};
+use square_unifi_protect::{AppState, Config, DEFAULT_PORT, Store, build_router, tls};
+use std::net::{SocketAddr, TcpListener};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -30,21 +31,22 @@ async fn main() -> anyhow::Result<()> {
     state.start_background_work();
     let router = build_router(state);
     let address = config.socket_addr();
-
-    if let Some(tls_config) = tls::rustls_config(&config)
+    let tls_config = tls::rustls_config(&config)
         .await
-        .map_err(anyhow::Error::from)?
-    {
+        .map_err(anyhow::Error::from)?;
+    let listener = bind_listener(address)?;
+
+    if let Some(tls_config) = tls_config {
         tracing::info!(%address, "Square Protect Rust server listening with TLS");
-        axum_server::bind_rustls(address, tls_config)
+        axum_server::from_tcp_rustls(listener, tls_config)
+            .context("could not adopt the reserved TCP listener")?
             .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .context("TLS server stopped unexpectedly")?;
     } else {
         tracing::info!(%address, "Square Protect Rust server listening");
-        let listener = tokio::net::TcpListener::bind(address)
-            .await
-            .with_context(|| format!("could not bind {address}"))?;
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .context("could not adopt the reserved TCP listener")?;
         axum::serve(
             listener,
             router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -53,6 +55,19 @@ async fn main() -> anyhow::Result<()> {
         .context("server stopped unexpectedly")?;
     }
     Ok(())
+}
+
+fn bind_listener(address: SocketAddr) -> anyhow::Result<TcpListener> {
+    let listener = TcpListener::bind(address).with_context(|| {
+        format!(
+            "fixed TCP port {} is unavailable at {address}; stop the service using it or set SPI_PORT explicitly",
+            address.port()
+        )
+    })?;
+    listener
+        .set_nonblocking(true)
+        .context("could not configure the reserved TCP listener")?;
+    Ok(listener)
 }
 
 fn setup_complete() -> anyhow::Result<()> {
@@ -68,7 +83,7 @@ fn setup_complete() -> anyhow::Result<()> {
 }
 
 async fn healthcheck() -> anyhow::Result<()> {
-    let port = std::env::var("SPI_PORT").unwrap_or_else(|_| "8000".into());
+    let port = std::env::var("SPI_PORT").unwrap_or_else(|_| DEFAULT_PORT.to_string());
     let port = port.parse::<u16>().context("SPI_PORT is invalid")?;
     let scheme = if std::env::var("SPI_TLS").as_deref() == Ok("1") {
         "https"
@@ -85,4 +100,19 @@ async fn healthcheck() -> anyhow::Result<()> {
         .await?;
     anyhow::ensure!(response.status().is_success(), "health endpoint failed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_port_bind_reports_an_occupied_port() {
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = occupied.local_addr().unwrap();
+
+        let error = bind_listener(address).unwrap_err().to_string();
+        assert!(error.contains(&address.port().to_string()));
+        assert!(error.contains("fixed TCP port"));
+    }
 }

@@ -40,6 +40,7 @@ case "$(uname -s)" in
   <key>EnvironmentVariables</key><dict>
     <key>SPI_DATA_DIR</key><string>$REPO/data</string>
     <key>SPI_HOST</key><string>0.0.0.0</string>
+    <key>SPI_PORT</key><string>3546</string>
     <key>SPI_TLS</key><string>1</string>
   </dict>
   <key>RunAtLoad</key><true/>
@@ -50,7 +51,7 @@ case "$(uname -s)" in
 PLIST_EOF
     launchctl unload "$PLIST" 2>/dev/null || true
     launchctl load "$PLIST"
-    echo "Installed. The app starts at login; dashboard: https://<this-host>:8000"
+    echo "Installed. The app starts at login; dashboard: https://<this-host>:3546"
     echo "The certificate refreshes when this computer's LAN IP changes."
     echo "Accept the self-signed certificate warning in your browser."
     ;;
@@ -74,6 +75,7 @@ User=$USER
 WorkingDirectory=$REPO
 Environment=SPI_DATA_DIR=$REPO/data
 Environment=SPI_HOST=0.0.0.0
+Environment=SPI_PORT=3546
 Environment=SPI_TLS=1
 ExecStart=$BINARY
 Restart=on-failure
@@ -84,7 +86,7 @@ UNIT_EOF
     sudo systemctl daemon-reload
     sudo systemctl enable square-protect
     sudo systemctl restart square-protect
-    echo "Installed. Dashboard: https://<this-host>:8000"
+    echo "Installed. Dashboard: https://<this-host>:3546"
     echo "Accept the self-signed certificate warning in your browser."
     echo "For the one-time setup secret, run:"
     echo "  sudo journalctl -u square-protect -b --no-pager"

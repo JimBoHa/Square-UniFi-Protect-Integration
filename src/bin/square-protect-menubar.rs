@@ -27,6 +27,7 @@ mod macos {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use objc2_core_foundation::CFRunLoop;
     use rand::RngCore as _;
+    use square_unifi_protect::DEFAULT_PORT;
     use tray_icon::{
         TrayIcon, TrayIconBuilder,
         menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -42,8 +43,6 @@ mod macos {
 
     const APP_NAME: &str = "Square Protect";
     const LOOPBACK_HOST: &str = "127.0.0.1";
-    const DEFAULT_PORT: u16 = 8000;
-    const PORT_SEARCH_WIDTH: u16 = 20;
     const SETUP_PROBE_INTERVAL: Duration = Duration::from_secs(1);
     const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
     const BOOTSTRAP_SECRET_MIN_LENGTH: usize = 32;
@@ -244,8 +243,7 @@ mod macos {
             let data_dir = data_dir()?;
             fs::create_dir_all(&data_dir)
                 .with_context(|| format!("could not create data folder {}", data_dir.display()))?;
-            let preferred_port = configured_port()?;
-            let port = pick_port(preferred_port)?;
+            let port = require_available_port(configured_port()?)?;
             let tls_enabled = env::var("SPI_TLS").as_deref() == Ok("1");
             let bootstrap_secret = prepare_bootstrap_secret(&resources.server_binary, &data_dir);
             let (items, menu) = MenuItems::new(port, bootstrap_secret.is_some())?;
@@ -433,18 +431,14 @@ mod macos {
         }
     }
 
-    fn pick_port(preferred: u16) -> anyhow::Result<u16> {
-        ensure!(
-            preferred > 0,
-            "SPI_PORT must be a whole number from 1 to 65535"
-        );
-        let final_port = preferred.saturating_add(PORT_SEARCH_WIDTH);
-        for port in preferred..=final_port {
-            if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
-                return Ok(port);
-            }
-        }
-        anyhow::bail!("no free port found between {preferred} and {final_port}")
+    fn require_available_port(port: u16) -> anyhow::Result<u16> {
+        ensure!(port > 0, "SPI_PORT must be a whole number from 1 to 65535");
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).with_context(|| {
+            format!(
+                "fixed TCP port {port} is unavailable; stop the service using it or set SPI_PORT explicitly"
+            )
+        })?;
+        Ok(port)
     }
 
     fn data_dir() -> anyhow::Result<PathBuf> {
@@ -696,14 +690,22 @@ mod macos {
         }
 
         #[test]
-        fn port_picker_skips_an_occupied_preferred_port() {
+        fn fixed_port_check_rejects_an_occupied_port() {
             let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let preferred = occupied.local_addr().unwrap().port();
-            if preferred == u16::MAX {
-                return;
-            }
+            let port = occupied.local_addr().unwrap().port();
 
-            assert_ne!(pick_port(preferred).unwrap(), preferred);
+            let error = require_available_port(port).unwrap_err().to_string();
+            assert!(error.contains(&port.to_string()));
+            assert!(error.contains("fixed TCP port"));
+        }
+
+        #[test]
+        fn fixed_port_check_preserves_an_available_port() {
+            let available = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = available.local_addr().unwrap().port();
+            drop(available);
+
+            assert_eq!(require_available_port(port).unwrap(), port);
         }
 
         #[test]

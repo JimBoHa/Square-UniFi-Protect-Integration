@@ -112,7 +112,7 @@ that invoke Node as the JavaScript engine.
 
 The bundled runner binds only to `127.0.0.1` by default. On first start it
 prints a generated one-time bootstrap secret in the server console. Copy that
-secret, open `http://localhost:8000` on the same computer, and enter it with the
+secret, open `http://localhost:3546` on the same computer, and enter it with the
 new admin password. Direct explicit loopback setup may use HTTP; every setup
 still requires the one-time secret.
 
@@ -128,7 +128,7 @@ export SPI_HOST=0.0.0.0
 cargo run --locked --release
 ```
 
-Only after those settings are active, open `https://<server-ip>:8000` from the
+Only after those settings are active, open `https://<server-ip>:3546` from the
 other device, accept the one-time self-signed certificate warning, and enter
 `SPI_BOOTSTRAP_SECRET` in **One-time bootstrap secret**. A wildcard or
 non-loopback bind always requires the app's built-in TLS, even when a proxy
@@ -165,7 +165,7 @@ Then:
    (Developer Dashboard → your application → Credentials). Optionally add your
    webhook signature key and notification URL for real-time ingestion
    (subscribe the webhook to both `payment.created` and `payment.updated`, pointing at
-   `https://<your-host>/webhooks/square`). Existing installations must reconnect
+   `https://<your-host>:3546/webhooks/square`). Existing installations must reconnect
    Square once after upgrading so webhook events can be bound to that merchant.
 4. **Settings → POS camera** — pick the camera that watches each location's
    register.
@@ -192,7 +192,7 @@ Then:
 | --- | --- | --- |
 | `SPI_DATA_DIR` | `./data` | SQLite DB, encryption key/HMAC salt, thumbnails |
 | `SPI_HOST` | `127.0.0.1` | Server bind address. Wildcard and non-loopback values require TLS plus a bootstrap secret for first setup. |
-| `SPI_PORT` | `8000` | Port used by `Start Square Protect.command` |
+| `SPI_PORT` | `3546` | Fixed Square Protect port used by every packaged launcher; override only when the deployment and webhook URLs are updated together. |
 | `SPI_BOOTSTRAP_SECRET` | generated at startup | Random 32–4096 character one-time secret required when creating the first admin password; generate with `openssl rand -base64 32`. Missing or invalid values are replaced with an ephemeral secret printed once to the server console. Only its digest remains in memory, and it is never written to the data directory. |
 | `SPI_POLL_INTERVAL` | `60` | Seconds between Square polls |
 | `SPI_DISABLE_POLLER` | `0` | Set `1` to disable background polling |
@@ -210,6 +210,13 @@ the app's built-in TLS (`SPI_TLS=1`); request URL schemes and
 reverse/local proxies from removing the secret or transport requirements.
 Login throttling uses the directly observed socket address, while bootstrap
 authorization remains independent and fail-closed.
+
+Square Protect reserves TCP port `3546` so it can coexist with Farm Dashboard's
+controller on port `8000`. Packaged launchers stop with an error when the
+configured port is occupied instead of silently selecting another port; stable
+ports keep Square and UniFi Protect webhook URLs valid after restarts. Existing
+installations upgrading from port `8000` must update LAN firewall rules,
+bookmarks, and inbound Square or Protect webhook URLs to use port `3546`.
 
 To replace the generated self-signed certificate with a certificate trusted by
 your LAN devices, set `SPI_TLS_CERTFILE` and `SPI_TLS_KEYFILE` to absolute paths

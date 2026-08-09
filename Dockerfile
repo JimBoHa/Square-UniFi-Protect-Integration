@@ -17,10 +17,10 @@ COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 ENV SPI_DATA_DIR=/data \
     SPI_STATIC_DIR=/opt/square-protect/static \
     SPI_HOST=0.0.0.0 \
-    SPI_PORT=8000 \
+    SPI_PORT=3546 \
     SPI_TLS=1
 VOLUME /data
-EXPOSE 8000
+EXPOSE 3546
 HEALTHCHECK --interval=60s --timeout=5s CMD ["gosu", "square-protect", "square-unifi-protect", "--healthcheck"]
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["square-unifi-protect"]

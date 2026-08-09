@@ -6,11 +6,12 @@ services:
     container_name: square-protect
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "3546:3546"
     environment:
       # Remote first-run setup must use the app's built-in TLS. The app
       # generates a one-time setup secret at startup instead of retaining one
       # in container metadata.
+      SPI_PORT: "3546"
       SPI_TLS: "1"
     volumes:
       - ./data:/data

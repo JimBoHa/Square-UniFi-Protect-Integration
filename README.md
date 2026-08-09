@@ -24,7 +24,8 @@ timeline near that timestamp.
   key and matching Alarm Manager webhook trigger ID to run notifications or
   Protect automations whenever Square marks a payment completed. Delivery is
   at-least-once with durable state; sales completed before the feature is
-  enabled are never replayed.
+  enabled are never replayed. Each transaction card shows when Protect accepted
+  its flag and the measured delay from the Square transaction timestamp.
 - **Transaction feed** — payments appear in the companion app with timestamp,
   tip-inclusive amount, partial or full refund totals, card last-4, status, and
   a camera thumbnail; the feed auto-refreshes while visible. Refund totals come
@@ -141,6 +142,9 @@ Then:
    integration API before it is saved. Leave alarm fields blank to retain saved
    values when the same console is verified, or use the disable button to remove
    them locally even when the Protect console is unavailable.
+   After saving, review the transaction-flag status and use **Send test Protect
+   flag** once. The app requires confirmation because this intentionally runs
+   every action attached to that Protect alarm.
    Changing the saved host/IP or port—or changing or losing the NVR identity
    reported by a previously bound console—requires the **Confirm console switch**
    checkbox. Each confirmation is short-lived and bound to the verified target.
@@ -294,6 +298,20 @@ marked so later Square overlap polls cannot recreate the deleted bytes.
 > are marked handled rather than replayed as a historical burst. Automatic retry
 > uses the Square poller; when `SPI_DISABLE_POLLER=1`, pending deliveries require
 > a duplicate webhook or manual **Sync now**.
+
+Protect documents this as
+[`POST /v1/alarm-manager/webhook/{id}`](https://developer.ui.com/protect/v7.1.87/post-v1alarm-managerwebhookid):
+the path ID is a user-defined string that triggers only alarms configured with
+the same ID, and a successful accept returns HTTP 204. In Protect Alarm Manager,
+create that incoming webhook trigger and attach the notification or automation
+you want to use as the footage flag. The Settings status, dashboard tile, and
+transaction cards distinguish actual Protect accepts from historical
+transactions suppressed when the feature was enabled. The measured per-card
+offset is the Protect response time minus Square's transaction timestamp; it
+therefore includes Square delivery and local processing latency. The official
+trigger accepts an ID but no event body or historical timestamp, so Protect
+marks the receipt time: Square webhooks provide the lowest lag, while the
+polling fallback can place the flag up to one poll interval later.
 
 ## Security
 

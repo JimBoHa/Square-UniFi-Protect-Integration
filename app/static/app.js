@@ -580,6 +580,7 @@ $("#protect-form").addEventListener("submit", async (e) => {
         $("#camera-preview-wrap"),
         $("#camera-preview"),
       );
+      clearProtectAlarmSettingsView();
       clearProtectMotionSettingsView();
       lastTransactionPayload = null;
       renderTransactions([]);
@@ -604,9 +605,58 @@ $("#protect-disable-alarm").addEventListener("click", async () => {
     await api("/api/settings/protect/alarm", { method: "DELETE" });
     $("#protect-api-key").value = "";
     $("#protect-alarm-trigger-id").value = "";
+    clearProtectAlarmSettingsView();
     message("Protect alarm trigger disabled.", "ok");
+    void loadSettingsView();
   } catch (err) {
     message(err.message, "error");
+  }
+});
+
+function clearProtectAlarmSettingsView() {
+  $("#protect-alarm-status").textContent = "Transaction flags not enabled.";
+  $("#protect-test-alarm").hidden = true;
+}
+
+function renderProtectAlarmSettings(payload) {
+  const status = protectAlarmStatus(payload);
+  const button = $("#protect-test-alarm");
+  button.hidden = !status.configured;
+  if (!status.configured) {
+    clearProtectAlarmSettingsView();
+    return;
+  }
+  const active = status.pending + status.inProgress;
+  const last = status.lastDeliveredAtMs === null
+    ? "no transaction flags accepted yet"
+    : `last accepted ${new Date(status.lastDeliveredAtMs).toLocaleString()}`;
+  $("#protect-alarm-status").textContent =
+    `Enabled for trigger “${status.triggerId}” · ${status.delivered} accepted · ${active} pending · ${last}`;
+}
+
+$("#protect-test-alarm").addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "This runs the configured Protect Alarm Manager actions now. Send one test flag?",
+  );
+  if (!confirmed) return;
+  const button = $("#protect-test-alarm");
+  button.disabled = true;
+  try {
+    const result = await api("/api/settings/protect/alarm/test", {
+      method: "POST",
+    });
+    renderProtectAlarmSettings(result);
+    const accepted = protectAlarmStatus(result).testAcceptedAtMs;
+    message(
+      accepted === null
+        ? "Protect accepted the test transaction flag."
+        : `Protect accepted the test transaction flag at ${new Date(accepted).toLocaleString()}.`,
+      "ok",
+    );
+  } catch (error) {
+    message(error.message, "error");
+  } finally {
+    button.disabled = false;
   }
 });
 
@@ -1001,6 +1051,7 @@ async function fetchSettingsView() {
     $("#camera-preview-wrap"),
     $("#camera-preview"),
   );
+  clearProtectAlarmSettingsView();
   clearProtectMotionSettingsView();
   // Each indicator has its own latest-response guard, so a slow previous
   // health request cannot overwrite the result of a newer settings load.
@@ -1012,9 +1063,11 @@ async function fetchSettingsView() {
 
 async function fetchMappingData() {
   let cameras = [], locations = [], mappings = [], devices = [];
+  let alarmSettings = null;
   let motionSettings = null;
   let locationRevision = null;
   let cameraGeneration = null;
+  let alarmGeneration = null;
   let motionGeneration = null;
   let mappingRevision = "";
   let mappingGeneration = "";
@@ -1025,6 +1078,15 @@ async function fetchMappingData() {
     cameraGeneration =
       result.response.headers.get("x-protect-console-generation") || "";
   } catch { /* Protect not configured yet */ }
+  try {
+    const result = await api(
+      "/api/settings/protect/alarm",
+      { includeResponse: true },
+    );
+    alarmSettings = result.data;
+    alarmGeneration =
+      result.response.headers.get("x-protect-console-generation") || "";
+  } catch { /* Transaction flags not configured yet */ }
   try {
     const result = await api(
       "/api/settings/protect/motion-webhook",
@@ -1050,8 +1112,8 @@ async function fetchMappingData() {
       result.response.headers.get("x-square-account-revision") || "";
   } catch { return null; }
   return {
-    cameras, locations, mappings, devices, motionSettings,
-    cameraGeneration, motionGeneration, locationRevision,
+    cameras, locations, mappings, devices, alarmSettings, motionSettings,
+    cameraGeneration, alarmGeneration, motionGeneration, locationRevision,
     mappingGeneration, mappingRevision,
   };
 }
@@ -1171,6 +1233,7 @@ function renderSettingsView(settings) {
   // fence camera-mapping saves against a concurrent account/console switch.
   squareAccountRevision = settings.mappingRevision || "";
   cameraMappingGeneration = settings.mappingGeneration || "";
+  renderProtectAlarmSettings(settings.alarmSettings);
   motionSettingsCameras = settings.cameras;
   renderProtectMotionSettings(settings.motionSettings, motionSettingsCameras);
   const usable = buildMappingRows(rows, settings);
@@ -1447,12 +1510,23 @@ function renderTransactions(
     status.className = "status";
     status.textContent = txn.status;
     const refundStatus = renderRefundStatus(document, txn);
+    const protectFlag = protectFlagDelivery(txn);
     meta.appendChild(when);
     meta.appendChild(card);
     meta.appendChild(source);
     meta.appendChild(transactionId);
     meta.appendChild(status);
     if (refundStatus) meta.appendChild(refundStatus);
+    if (protectFlag.deliveredAtMs !== null) {
+      const flag = document.createElement("div");
+      flag.className = "meta protect-flag-delivery";
+      const offset = formatSignedSeconds(protectFlag.offsetMs);
+      flag.textContent = offset
+        ? `Protect flag accepted · ${offset} from transaction`
+        : "Protect flag accepted";
+      flag.title = new Date(protectFlag.deliveredAtMs).toLocaleString();
+      meta.appendChild(flag);
+    }
     const clipNote = clipNoteElement(txn);
     if (clipNote) meta.appendChild(clipNote);
 
@@ -1604,6 +1678,33 @@ function renderDashboard(data) {
     );
   } else {
     setTile("motion", "ok", "No unmatched motion", data.motion.camera_name || "");
+  }
+
+  const transactionFlags = protectAlarmStatus(data.transaction_flags);
+  const activeFlags = transactionFlags.pending + transactionFlags.inProgress;
+  if (!transactionFlags.configured) {
+    setTile(
+      "transaction-flags",
+      "idle",
+      "Not configured",
+      "Enable it in Protect settings",
+    );
+  } else if (activeFlags > 0) {
+    setTile(
+      "transaction-flags",
+      "idle",
+      `${activeFlags} pending`,
+      `${transactionFlags.delivered} accepted by Protect`,
+    );
+  } else {
+    setTile(
+      "transaction-flags",
+      "ok",
+      `${transactionFlags.delivered} accepted`,
+      transactionFlags.lastDeliveredAtMs === null
+        ? "Waiting for the first completed transaction"
+        : `Last ${new Date(transactionFlags.lastDeliveredAtMs).toLocaleString()}`,
+    );
   }
 
   const pending = data.queues.thumbnails_pending + data.queues.alarms_pending;

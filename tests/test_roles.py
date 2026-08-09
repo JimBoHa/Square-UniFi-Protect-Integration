@@ -26,7 +26,9 @@ VIEWER_PASSWORD = "view-only-password"
 
 ADMIN_ENDPOINTS = frozenset(
     {
+        ("GET", "/api/settings/protect/alarm"),
         ("DELETE", "/api/settings/protect/alarm"),
+        ("POST", "/api/settings/protect/alarm/test"),
         ("POST", "/api/discover/protect"),
         ("POST", "/api/settings/protect/console-switch-token"),
         ("PUT", "/api/settings/protect"),
@@ -207,7 +209,9 @@ def test_every_application_route_has_an_explicit_authorization_class(client):
 @pytest.mark.parametrize(
     ("method", "path", "body"),
     (
+        ("GET", "/api/settings/protect/alarm", None),
         ("DELETE", "/api/settings/protect/alarm", None),
+        ("POST", "/api/settings/protect/alarm/test", None),
         ("POST", "/api/discover/protect", {}),
         (
             "POST",

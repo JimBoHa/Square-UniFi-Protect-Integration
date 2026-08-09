@@ -43,6 +43,8 @@ PROTECTED_ENDPOINTS = [
     ("GET", "/api/thumbnails/PAY_001"),
     ("POST", "/api/sync"),
     ("PUT", "/api/settings/protect"),
+    ("GET", "/api/settings/protect/alarm"),
+    ("POST", "/api/settings/protect/alarm/test"),
     ("GET", "/api/settings/deep-link"),
     ("PUT", "/api/settings/deep-link"),
     ("GET", "/api/settings/protect/motion-webhook"),

@@ -1440,6 +1440,7 @@ def test_store_migrates_legacy_fields_and_scrubs_raw_payment(tmp_path):
         "alarm_state": "sent",
         "alarm_claim_token": None,
         "alarm_claimed_at": None,
+        "alarm_delivered_at_ms": None,
     }
     assert [txn["id"] for txn in page] == ["PAY_LEGACY"]
     assert [txn["id"] for txn in durable_page] == ["PAY_LEGACY"]

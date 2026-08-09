@@ -115,6 +115,7 @@ button[type="submit"], #save-mapping, #sync-now, #export-csv {
 }
 .motion-alert-state { font-size: 0.8rem; font-weight: 600; }
 .motion-alert p { margin: 0.2rem 0; }
+.protect-flag-delivery { color: #18794e; font-weight: 600; }
 
 .txn {
   display: flex; gap: 1rem; align-items: center;

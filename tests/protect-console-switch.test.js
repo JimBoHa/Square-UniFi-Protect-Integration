@@ -198,6 +198,26 @@ test("old motion configuration reloads after a Protect console switch", () => {
   assert.equal(published, false);
 });
 
+test("old transaction-flag status reloads after a Protect console switch", () => {
+  let published = false;
+  const decision = publishCoherentSettingsLoad(
+    1,
+    1,
+    {
+      cameraGeneration: "protect-generation-2",
+      alarmGeneration: "protect-generation-1",
+      motionGeneration: "protect-generation-2",
+      locationRevision: "square-revision-2",
+      mappingGeneration: "protect-generation-2",
+      mappingRevision: "square-revision-2",
+    },
+    () => { published = true; },
+  );
+
+  assert.equal(decision, "reload");
+  assert.equal(published, false);
+});
+
 test("coherent provider snapshots publish mapping save generations", () => {
   let published = false;
   const decision = publishCoherentSettingsLoad(

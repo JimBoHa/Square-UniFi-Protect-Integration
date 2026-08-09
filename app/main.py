@@ -1789,13 +1789,13 @@ def create_app(
         }
 
     @app.get("/api/settings/thumbnail-storage")
-    def get_thumbnail_storage_settings(_=authed) -> dict:
+    def get_thumbnail_storage_settings(_=admin_only) -> dict:
         return thumbnail_storage_settings_response()
 
     @app.put("/api/settings/thumbnail-storage")
     def set_thumbnail_storage_settings(
         body: ThumbnailStorageSettingsBody,
-        _=authed,
+        _=admin_only,
     ) -> dict:
         requested = thumbnail_storage.ThumbnailPolicy(
             compression_enabled=body.compression_enabled,
@@ -1824,7 +1824,7 @@ def create_app(
         return {"ok": True, **thumbnail_storage_settings_response()}
 
     @app.post("/api/settings/thumbnail-storage/maintenance")
-    def optimize_thumbnail_storage(_=authed) -> dict:
+    def optimize_thumbnail_storage(_=admin_only) -> dict:
         schedule_thumbnail_maintenance(optimize_existing=True)
         return {"ok": True, **thumbnail_storage_settings_response()}
 

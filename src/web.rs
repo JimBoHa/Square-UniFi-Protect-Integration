@@ -3201,7 +3201,7 @@ mod tests {
         assert_eq!(created.status(), StatusCode::CREATED);
         let created_body = response_json_value(created).await;
         let user_id = created_body["user"]["id"].as_i64().unwrap();
-        assert!(created_body.to_string().find("viewer-password").is_none());
+        assert!(!created_body.to_string().contains("viewer-password"));
         let listed = app
             .clone()
             .oneshot(http_request("GET", "/api/users", json!({}), Some(&cookie)))

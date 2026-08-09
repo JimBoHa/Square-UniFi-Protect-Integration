@@ -166,6 +166,10 @@
         <button type="submit">Save motion webhook</button>
         <button type="button" id="protect-motion-disable">Disable motion webhook</button>
       </form>
+      <div class="webhook-receipt" data-received="false" role="status" aria-live="polite">
+        <strong>Last UniFi motion webhook received</strong>
+        <time id="protect-motion-last-event">No authenticated motion notification has been received yet.</time>
+      </div>
       <div id="protect-motion-setup" class="webhook-setup" hidden aria-live="polite">
         <p><strong>Webhook URL</strong><br><code id="protect-motion-url"></code></p>
         <p><strong>Custom header</strong><br><code id="protect-motion-header"></code></p>
@@ -182,7 +186,6 @@
           generated self-signed certificate. If POST retains the custom header on
           your Protect version, POST supplies the NVR event timestamp; GET uses the
           app's LAN receipt time.</p>
-        <p id="protect-motion-last-event" class="hint"></p>
       </div>
 
       <h2>Square account

@@ -591,7 +591,24 @@ function clearProtectMotionSettingsView() {
   $("#protect-motion-header").textContent = "";
   $("#protect-motion-token").textContent = "";
   $("#protect-motion-token-hint").textContent = "";
-  $("#protect-motion-last-event").textContent = "";
+  const lastEvent = $("#protect-motion-last-event");
+  lastEvent.removeAttribute("datetime");
+  lastEvent.textContent = "Checking for motion webhook activity…";
+  lastEvent.parentElement.dataset.received = "false";
+}
+
+function renderProtectMotionLastEvent(lastEventMs) {
+  const status = protectMotionReceiptStatus(lastEventMs);
+  const lastEvent = $("#protect-motion-last-event");
+  lastEvent.parentElement.dataset.received = String(status.received);
+  if (!status.received) {
+    lastEvent.removeAttribute("datetime");
+    lastEvent.textContent = status.relativeText;
+    return;
+  }
+  lastEvent.setAttribute("datetime", status.dateTime);
+  lastEvent.textContent =
+    `${new Date(status.timestampMs).toLocaleString()} · ${status.relativeText}`;
 }
 
 function renderProtectMotionSettings(payload, cameras) {
@@ -624,6 +641,7 @@ function renderProtectMotionSettings(payload, cameras) {
   $("#protect-motion-grace").value = settings.graceSeconds;
   $("#protect-motion-retention").value = settings.retentionDays;
   $("#protect-motion-rotate-token").checked = false;
+  renderProtectMotionLastEvent(settings.lastEventMs);
 
   const setup = $("#protect-motion-setup");
   setup.hidden = !settings.enabled;
@@ -637,10 +655,27 @@ function renderProtectMotionSettings(payload, cameras) {
   $("#protect-motion-token-hint").textContent = settings.webhookToken
     ? "Copy this value now. It is shown only when created or rotated."
     : "The token is stored securely. Select Rotate the webhook token and save to reveal a replacement.";
-  $("#protect-motion-last-event").textContent = settings.lastEventMs === null
-    ? "Waiting for the first authenticated motion webhook."
-    : `Last authenticated motion webhook: ${new Date(settings.lastEventMs).toLocaleString()}`;
 }
+
+const refreshProtectMotionLastEvent = createLatestStatusRefresher(
+  async () => {
+    try {
+      return {
+        loaded: true,
+        payload: await api("/api/settings/protect/motion-webhook"),
+      };
+    } catch {
+      return { loaded: false, payload: null };
+    }
+  },
+  (result) => {
+    if (result.loaded) {
+      renderProtectMotionLastEvent(
+        protectMotionSettings(result.payload).lastEventMs,
+      );
+    }
+  },
+);
 
 $("#protect-motion-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1095,6 +1130,9 @@ function refreshTransactionsIfVisible() {
   }
   if (document.visibilityState === "visible" && !$("#nav").hidden) {
     void loadMotionAlerts();
+    if (isAdmin(currentUser) && !$("#view-settings").hidden) {
+      void refreshProtectMotionLastEvent();
+    }
   }
 }
 

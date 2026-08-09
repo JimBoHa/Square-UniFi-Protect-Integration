@@ -29,8 +29,43 @@ function protectMotionSettings(payload) {
     webhookToken: typeof value.webhook_token === "string"
       ? value.webhook_token : "",
     tokenConfigured: value.token_configured === true,
-    lastEventMs: Number.isInteger(value.last_event_ms)
+    lastEventMs: Number.isSafeInteger(value.last_event_ms) &&
+      value.last_event_ms >= 0 &&
+      Number.isFinite(new Date(value.last_event_ms).valueOf())
       ? value.last_event_ms : null,
+  };
+}
+
+function protectMotionReceiptStatus(lastEventMs, nowMs = Date.now()) {
+  const eventDate = new Date(lastEventMs);
+  if (
+    !Number.isSafeInteger(lastEventMs) ||
+    lastEventMs < 0 ||
+    !Number.isFinite(eventDate.valueOf())
+  ) {
+    return {
+      received: false,
+      timestampMs: null,
+      dateTime: "",
+      relativeText: "No authenticated motion notification has been received yet.",
+    };
+  }
+
+  const safeNowMs = Number.isFinite(nowMs) ? nowMs : lastEventMs;
+  const ageMs = Math.max(0, safeNowMs - lastEventMs);
+  const minutes = Math.floor(ageMs / 60_000);
+  const hours = Math.floor(ageMs / 3_600_000);
+  const days = Math.floor(ageMs / 86_400_000);
+  let relativeText = "just now";
+  if (days >= 1) relativeText = `${days} day${days === 1 ? "" : "s"} ago`;
+  else if (hours >= 1) relativeText = `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  else if (minutes >= 1) relativeText = `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+
+  return {
+    received: true,
+    timestampMs: lastEventMs,
+    dateTime: eventDate.toISOString(),
+    relativeText,
   };
 }
 
@@ -68,6 +103,7 @@ function protectMotionStateText(event) {
 if (typeof module !== "undefined") {
   module.exports = {
     protectMotionAlert,
+    protectMotionReceiptStatus,
     protectMotionSettings,
     protectMotionSettingsRequest,
     protectMotionStateText,

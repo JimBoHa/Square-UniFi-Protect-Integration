@@ -7,6 +7,7 @@ const test = require("node:test");
 
 const {
   protectMotionAlert,
+  protectMotionReceiptStatus,
   protectMotionSettings,
   protectMotionSettingsRequest,
   protectMotionStateText,
@@ -86,6 +87,43 @@ test("motion settings request converts bounded number inputs", () => {
   );
 });
 
+test("motion receipt status reports exact machine time and a bounded relative age", () => {
+  const eventMs = Date.UTC(2026, 7, 8, 20, 0, 0);
+  assert.deepEqual(
+    protectMotionReceiptStatus(eventMs, eventMs + 90_000),
+    {
+      received: true,
+      timestampMs: eventMs,
+      dateTime: "2026-08-08T20:00:00.000Z",
+      relativeText: "1 minute ago",
+    },
+  );
+  assert.equal(
+    protectMotionReceiptStatus(eventMs, eventMs + 2 * 3_600_000).relativeText,
+    "2 hours ago",
+  );
+  assert.equal(
+    protectMotionReceiptStatus(eventMs, eventMs + 3 * 86_400_000).relativeText,
+    "3 days ago",
+  );
+  assert.equal(
+    protectMotionReceiptStatus(eventMs, eventMs - 1).relativeText,
+    "just now",
+  );
+});
+
+test("motion receipt status rejects absent and invalid timestamps", () => {
+  const expected = {
+    received: false,
+    timestampMs: null,
+    dateTime: "",
+    relativeText: "No authenticated motion notification has been received yet.",
+  };
+  assert.deepEqual(protectMotionReceiptStatus(null, 1234), expected);
+  assert.deepEqual(protectMotionReceiptStatus(-1, 1234), expected);
+  assert.deepEqual(protectMotionReceiptStatus(Number.MAX_SAFE_INTEGER, 1234), expected);
+});
+
 test("motion alert states use explicit safe labels", () => {
   assert.equal(protectMotionStateText({ state: "pending" }), "Waiting for Square");
   assert.equal(
@@ -111,7 +149,10 @@ test("motion UI loads helper first and renders provider text without HTML", () =
   assert.ok(html.indexOf("/protect-motion.js") >= 0);
   assert.ok(html.indexOf("/protect-motion.js") < html.indexOf("/app.js"));
   assert.match(html, /id="protect-motion-camera"/);
+  assert.match(html, /Last UniFi motion webhook received/);
+  assert.match(html, /id="protect-motion-last-event"/);
   assert.match(html, /id="motion-alerts-panel"/);
+  assert.match(app, /!\$\("#view-settings"\)\.hidden/);
   assert.match(app, /camera\.textContent = event\.camera_name/);
   assert.match(app, /alarm\.textContent = `Protect alarm:/);
   assert.doesNotMatch(app, /motion-alert[\s\S]{0,500}innerHTML/);

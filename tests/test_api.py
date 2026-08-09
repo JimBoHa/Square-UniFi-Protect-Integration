@@ -3355,7 +3355,15 @@ def test_dashboard_unconfigured(authed):
     data = authed.get("/api/dashboard").json()
     assert data["protect"]["configured"] is False
     assert data["square"]["configured"] is False
-    assert data["webhook"] == {"configured": False, "last_event_ms": None}
+    assert data["webhook"] == {
+        "configured": False,
+        "last_event_ms": None,
+        "delivery_count": 0,
+        "last_payment_ms": None,
+        "last_delivery_lag_ms": None,
+        "accepted_payment_count": 0,
+        "duplicate_count": 0,
+    }
     assert data["queues"] == {"thumbnails_pending": 0, "alarms_pending": 0}
 
 def test_dashboard_connected_with_webhook_freshness(configured):
@@ -3373,6 +3381,8 @@ def test_dashboard_connected_with_webhook_freshness(configured):
     assert data["square"]["ok"] is True
     assert data["webhook"]["configured"] is True
     assert isinstance(data["webhook"]["last_event_ms"], int)
+    assert data["webhook"]["delivery_count"] == 1
+    assert data["webhook"]["accepted_payment_count"] == 1
     assert data["queues"]["thumbnails_pending"] == 0
 
 def test_dashboard_counts_pending_queue_work(authed):

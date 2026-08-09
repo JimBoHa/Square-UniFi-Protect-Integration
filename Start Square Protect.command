@@ -1,6 +1,6 @@
 #!/bin/bash
 # Double-clickable launcher for the Square × UniFi Protect integration.
-# Creates the Python environment on first run, starts the server, and opens
+# Builds the Rust binary on first run, starts the server, and opens
 # the dashboard in your browser. Close this window to stop the server.
 set -e
 cd "$(dirname "$0")"
@@ -26,21 +26,24 @@ if [ "${#PORT}" -gt 5 ] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
 fi
 PORT_START="$PORT"
 
-if [ ! -x .venv/bin/python ]; then
-  # python3 is only needed to create the environment; an already-provisioned
-  # machine can launch without it.
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "Python 3 is required but was not found."
-    echo "Install the Apple Command Line Tools by running:  xcode-select --install"
-    echo "or download Python from https://www.python.org/downloads/  then run this again."
+if [ -n "${SPI_LAUNCHER_BINARY:-}" ]; then
+  BINARY="$SPI_LAUNCHER_BINARY"
+  if [ ! -x "$BINARY" ]; then
+    echo "SPI_LAUNCHER_BINARY is not executable: $BINARY" >&2
+    exit 1
+  fi
+else
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "Rust/Cargo is required but was not found."
+    echo "Install it from https://rustup.rs, then run this launcher again."
     read -r -p "Press Return to close..." _
     exit 1
   fi
-  echo "First run: setting up the Python environment (about a minute)..."
-  python3 -m venv .venv
-fi
 
-.venv/bin/python scripts/ensure_dependencies.py "$PWD" "$PWD/.venv"
+  echo "Building the Rust server (the first build can take a few minutes)..."
+  cargo build --locked --release
+  BINARY="$PWD/target/release/square-unifi-protect"
+fi
 
 # Lets automated checks verify setup without starting a browser or server.
 [ "${SPI_LAUNCHER_SETUP_ONLY:-0}" = "1" ] && exit 0
@@ -73,7 +76,6 @@ echo "Keep this window open while using the app; close it (or press Ctrl+C) to s
 echo
 
 ( sleep 2 && open "$SCHEME://localhost:$PORT" ) &
-# python -m app honors SPI_TLS (self-signed HTTPS + Secure cookies).
 export SPI_HOST="${SPI_HOST:-127.0.0.1}"
 export SPI_PORT="$PORT"
-exec .venv/bin/python -m app
+exec "$BINARY"

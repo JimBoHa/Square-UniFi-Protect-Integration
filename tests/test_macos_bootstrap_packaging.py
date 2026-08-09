@@ -61,9 +61,7 @@ def menubar_module(monkeypatch):
         Window=_FakeWindow,
         quit_application=lambda: None,
     )
-    fake_uvicorn = SimpleNamespace(Config=object, Server=object)
     monkeypatch.setitem(sys.modules, "rumps", fake_rumps)
-    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
     spec = importlib.util.spec_from_file_location("packaging_menubar_app", MENUBAR_APP)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -71,78 +69,43 @@ def menubar_module(monkeypatch):
     return module
 
 
-def _fake_web_app(password_hash=None):
-    store = SimpleNamespace(
-        setup_complete=lambda: password_hash is not None,
-    )
-    return SimpleNamespace(state=SimpleNamespace(store=store))
-
-
-def test_packaging_base_stays_dormant_without_secure_bootstrap_api(
+def test_setup_probe_uses_the_rust_binary_without_inheriting_a_secret(
     tmp_path, monkeypatch, menubar_module
 ):
     calls = []
-    expected_app = _fake_web_app()
-
-    class LegacyMain:
-        @staticmethod
-        def create_app(data_dir=None):
-            calls.append({"data_dir": data_dir})
-            return expected_app
-
-    monkeypatch.setenv("SPI_BOOTSTRAP_SECRET", "leave-legacy-environment-alone")
-
-    web_app, retained_secret = menubar_module._create_menu_web_app(LegacyMain, tmp_path)
-
-    assert web_app is expected_app
-    assert retained_secret is None
-    assert calls == [{"data_dir": tmp_path}]
-    assert (
-        menubar_module.os.environ["SPI_BOOTSTRAP_SECRET"]
-        == "leave-legacy-environment-alone"
+    binary = tmp_path / "square-unifi-protect"
+    monkeypatch.setenv("SPI_BOOTSTRAP_SECRET", "never-forward-this-to-the-probe-0001")
+    monkeypatch.setattr(
+        menubar_module.subprocess,
+        "run",
+        lambda command, **options: calls.append((command, options))
+        or SimpleNamespace(returncode=0),
     )
 
+    assert menubar_module._setup_complete(binary, tmp_path) is True
+    command, options = calls[0]
+    assert command == [str(binary), "--setup-complete"]
+    assert options["env"]["SPI_DATA_DIR"] == str(tmp_path)
+    assert "SPI_BOOTSTRAP_SECRET" not in options["env"]
 
-def test_secure_bootstrap_is_classified_as_explicit_loopback(
+
+def test_incomplete_setup_generates_a_revealable_one_time_secret(
     tmp_path, monkeypatch, menubar_module, capsys
 ):
     generated_secret = "generated-menu-secret-01234567890123456789"
-    calls = []
-    expected_app = _fake_web_app()
-
-    class SecureMain:
-        BOOTSTRAP_SECRET_MIN_LENGTH = 32
-        BOOTSTRAP_SECRET_MAX_LENGTH = 4096
-
-        @staticmethod
-        def create_app(data_dir=None, bind_host=None, tls_enabled=None):
-            calls.append(
-                {
-                    "data_dir": data_dir,
-                    "bind_host": bind_host,
-                    "tls_enabled": tls_enabled,
-                }
-            )
-            return expected_app
-
     monkeypatch.delenv("SPI_BOOTSTRAP_SECRET", raising=False)
+    monkeypatch.setattr(menubar_module, "_setup_complete", lambda *_args: False)
     monkeypatch.setattr(
         menubar_module.secrets,
         "token_urlsafe",
         lambda _size: generated_secret,
     )
 
-    web_app, retained_secret = menubar_module._create_menu_web_app(SecureMain, tmp_path)
+    retained_secret = menubar_module._prepare_bootstrap_secret(
+        tmp_path / "square-unifi-protect", tmp_path
+    )
 
-    assert web_app is expected_app
     assert bytes(retained_secret).decode("utf-8") == generated_secret
-    assert calls == [
-        {
-            "data_dir": tmp_path,
-            "bind_host": "127.0.0.1",
-            "tls_enabled": False,
-        }
-    ]
     assert "SPI_BOOTSTRAP_SECRET" not in menubar_module.os.environ
     captured = capsys.readouterr()
     assert generated_secret not in captured.out
@@ -150,14 +113,19 @@ def test_secure_bootstrap_is_classified_as_explicit_loopback(
 
 
 def test_secret_reveal_is_user_initiated_and_cleared_after_setup(
-    menubar_module,
+    monkeypatch, menubar_module, tmp_path
 ):
     secret_text = "visible-only-on-request-secret-0123456789"
     secret_buffer = bytearray(secret_text.encode("utf-8"))
     setup_state = {"complete": False}
-    store = SimpleNamespace(setup_complete=lambda: setup_state["complete"])
+    monkeypatch.setattr(
+        menubar_module,
+        "_setup_complete",
+        lambda *_args: setup_state["complete"],
+    )
     app = object.__new__(menubar_module.SquareProtectApp)
-    app.web_app = SimpleNamespace(state=SimpleNamespace(store=store))
+    app.binary = tmp_path / "square-unifi-protect"
+    app.data_dir = tmp_path
     app._bootstrap_secret = secret_buffer
     app._setup_secret_item = _FakeMenuItem(
         "Show One-Time Setup Secret", callback=app.show_setup_secret

@@ -8,13 +8,14 @@ INSTALLER = ROOT / "scripts" / "windows" / "install-service.ps1"
 RUNNER = ROOT / "scripts" / "windows" / "run-service.ps1"
 
 
-def test_installer_activates_only_when_secure_bootstrap_is_available():
+def test_installer_builds_and_probes_the_rust_backend():
     installer = INSTALLER.read_text(encoding="utf-8")
 
-    assert "inspect.signature(main.create_app).parameters" in installer
-    assert '{"bind_host", "tls_enabled"} <= set(p)' in installer
-    assert "$SecureBootstrap = $LASTEXITCODE -eq 0" in installer
-    assert "if ($SecureBootstrap)" in installer
+    assert 'cargo build --manifest-path "$Repo\\Cargo.toml" --locked --release' in installer
+    assert "square-unifi-protect.exe" in installer
+    assert "& $Binary --setup-complete" in installer
+    assert "if (-not $SetupAlreadyComplete)" in installer
+    assert ".venv" not in installer
 
 
 def test_task_persists_only_a_dpapi_protected_secret():
@@ -46,7 +47,7 @@ def test_runner_clears_plaintext_and_deletes_handoff_after_setup():
     decrypt = runner.index("ProtectedData]::Unprotect")
     child_start = runner.index("[System.Diagnostics.Process]::Start")
     clear_environment = runner.index("Remove-Item Env:SPI_BOOTSTRAP_SECRET")
-    setup_complete = runner.index("setup_complete.py")
+    setup_complete = runner.index("--setup-complete")
     delete_handoff = runner.index("Remove-Item $BootstrapSecretFile", setup_complete)
 
     assert decrypt < child_start < clear_environment < setup_complete < delete_handoff
@@ -56,7 +57,7 @@ def test_runner_clears_plaintext_and_deletes_handoff_after_setup():
     assert "https://" not in runner
 
 
-def test_reinstall_and_uninstall_stop_only_the_recorded_python_child():
+def test_reinstall_and_uninstall_stop_only_the_recorded_rust_child():
     installer = INSTALLER.read_text(encoding="utf-8")
 
     stop_function = installer[
@@ -66,15 +67,15 @@ def test_reinstall_and_uninstall_stop_only_the_recorded_python_child():
     ]
     assert "service-process.pid" in installer
     assert "Get-CimInstance Win32_Process" in stop_function
-    assert "[IO.Path]::GetFullPath($Python)" in stop_function
+    assert "[IO.Path]::GetFullPath($Binary)" in stop_function
     assert "[StringComparison]::OrdinalIgnoreCase" in stop_function
-    assert "$ServiceProcess.CommandLine -match" in stop_function
+    assert "$ServiceProcess.CommandLine -match" not in stop_function
     assert "Stop-Process -Id $ServicePid" in stop_function
     assert installer.count("Stop-SquareProtectService") >= 3
     assert "if ($Process.HasExited)" in RUNNER.read_text(encoding="utf-8")
     uninstall_exit = installer.index("exit 0", installer.index("if ($Uninstall)"))
     reinstall_stop = installer.index("Stop-SquareProtectService", uninstall_exit)
-    dependency_setup = installer.index("ensure_dependencies.py")
+    dependency_setup = installer.index("& cargo build")
     assert reinstall_stop < dependency_setup
 
 

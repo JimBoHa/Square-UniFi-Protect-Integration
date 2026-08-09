@@ -99,7 +99,7 @@ def test_missing_project_install_is_incomplete(monkeypatch):
     assert dependency_setup._dependencies_available() is False
 
 
-def test_service_installers_check_existing_venvs():
+def test_service_installers_prepare_their_runtime():
     unix_installer = (
         Path(__file__).resolve().parents[1] / "scripts" / "install-service.sh"
     ).read_text(encoding="utf-8")
@@ -110,14 +110,16 @@ def test_service_installers_check_existing_venvs():
         / "install-service.ps1"
     ).read_text(encoding="utf-8")
 
-    unix_create_end = unix_installer.index(
-        "fi\n", unix_installer.index("python3 -m venv")
+    unix_guard = unix_installer.index('if [ "$UNINSTALL" != "--uninstall" ]; then')
+    unix_check = unix_installer.index(
+        'cargo build --manifest-path "$REPO/Cargo.toml" --locked --release'
     )
-    unix_check = unix_installer.index("ensure_dependencies.py")
-    windows_create_end = windows_installer.index(
-        "}\n", windows_installer.index("python -m venv")
+    unix_guard_end = unix_installer.index("\nfi\n", unix_check)
+    windows_guard = windows_installer.index("if ($Uninstall)")
+    windows_exit = windows_installer.index("exit 0", windows_guard)
+    windows_check = windows_installer.index(
+        '& cargo build --manifest-path "$Repo\\Cargo.toml" --locked --release'
     )
-    windows_check = windows_installer.index("ensure_dependencies.py")
 
-    assert unix_create_end < unix_check
-    assert windows_create_end < windows_check
+    assert unix_guard < unix_check < unix_guard_end
+    assert windows_guard < windows_exit < windows_check

@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 $Repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $TaskName = "SquareProtect"
 $DataDir = Join-Path $Repo "data"
-$Python = "$Repo\.venv\Scripts\python.exe"
+$Binary = "$Repo\target\release\square-unifi-protect.exe"
 $BootstrapSecretFile = Join-Path $DataDir "bootstrap-secret.dpapi"
 $ServicePidFile = Join-Path $DataDir "service-process.pid"
 
@@ -19,15 +19,14 @@ function Stop-SquareProtectService {
       $ServiceProcess = Get-CimInstance Win32_Process `
         -Filter "ProcessId = $ServicePid" -ErrorAction SilentlyContinue
       if ($null -ne $ServiceProcess -and $ServiceProcess.ExecutablePath) {
-        $ExpectedPython = [IO.Path]::GetFullPath($Python)
+        $ExpectedBinary = [IO.Path]::GetFullPath($Binary)
         $ObservedExecutable = [IO.Path]::GetFullPath($ServiceProcess.ExecutablePath)
-        $RunsSquareProtect = $ServiceProcess.CommandLine -match '(?:^|\s)-m\s+app(?:\s|$)'
         if (
           [string]::Equals(
-            $ExpectedPython,
+            $ExpectedBinary,
             $ObservedExecutable,
             [StringComparison]::OrdinalIgnoreCase
-          ) -and $RunsSquareProtect
+          )
         ) {
           Stop-Process -Id $ServicePid -Force -ErrorAction SilentlyContinue
         }
@@ -47,19 +46,22 @@ if ($Uninstall) {
 
 Stop-SquareProtectService
 
-if (-not (Test-Path "$Repo\.venv\Scripts\python.exe")) {
-  Write-Host "Setting up the Python environment..."
-  python -m venv "$Repo\.venv"
+if ($null -eq (Get-Command cargo -ErrorAction SilentlyContinue)) {
+  throw "Rust/Cargo is required. Install it from https://rustup.rs and run this installer again."
 }
-& "$Repo\.venv\Scripts\python.exe" "$Repo\scripts\ensure_dependencies.py" `
-  "$Repo" "$Repo\.venv"
+Write-Host "Building the Rust service..."
+& cargo build --manifest-path "$Repo\Cargo.toml" --locked --release
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Binary)) {
+  throw "The Rust service build failed."
+}
 
-& $Python -c 'import inspect; from app import main; p = inspect.signature(main.create_app).parameters; raise SystemExit(0 if {"bind_host", "tls_enabled"} <= set(p) and hasattr(main, "BOOTSTRAP_SECRET_MIN_LENGTH") else 1)'
-$SecureBootstrap = $LASTEXITCODE -eq 0
 $SetupSecret = $null
 New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+$env:SPI_DATA_DIR = $DataDir
+& $Binary --setup-complete 2>$null
+$SetupAlreadyComplete = $LASTEXITCODE -eq 0
 
-if ($SecureBootstrap) {
+if (-not $SetupAlreadyComplete) {
   Add-Type -AssemblyName System.Security
   $RandomBytes = New-Object byte[] 32
   $Generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
@@ -83,8 +85,6 @@ if ($SecureBootstrap) {
     [Array]::Clear($PlainBytes, 0, $PlainBytes.Length)
   }
 } else {
-  # The packaging PR can merge before secure bootstrap without changing the
-  # legacy app's setup behavior.
   Remove-Item $BootstrapSecretFile -Force -ErrorAction SilentlyContinue
 }
 
@@ -101,7 +101,7 @@ Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger `
   -Settings $Settings -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 Write-Host "Installed. Dashboard: http://localhost:8000"
-if ($SecureBootstrap) {
+if ($null -ne $SetupSecret) {
   Write-Host "One-time setup secret: $SetupSecret"
   Write-Host "The encrypted handoff is deleted automatically after setup succeeds."
   $SetupSecret = $null

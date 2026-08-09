@@ -6,6 +6,22 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_macos_app_compiles_and_bundles_the_locked_rust_server():
+    build_script = (
+        REPO_ROOT / "scripts" / "macos" / "build_dmg.sh"
+    ).read_text(encoding="utf-8")
+
+    cargo_build = build_script.index("cargo build --locked --release")
+    pyinstaller = build_script.index('"$BUILD_VENV/bin/pyinstaller"')
+    bundled_binary = build_script.index(
+        '--add-binary "target/release/square-unifi-protect:."'
+    )
+
+    assert cargo_build < pyinstaller < bundled_binary
+    assert 'pip" install --quiet pyinstaller rumps' in build_script
+    assert 'pip" install --quiet -r requirements.txt' not in build_script
+
+
 def test_macos_app_is_signed_before_it_enters_dmg():
     build_script = (
         REPO_ROOT / "scripts" / "macos" / "build_dmg.sh"

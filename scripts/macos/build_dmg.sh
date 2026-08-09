@@ -9,19 +9,21 @@
 #   xcrun stapler staple dist/SquareProtect.dmg
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+cargo build --locked --release
 
 BUILD_VENV=.build-venv
 if [ ! -x "$BUILD_VENV/bin/python" ]; then
   python3 -m venv "$BUILD_VENV"
   "$BUILD_VENV/bin/pip" install --quiet --upgrade pip
 fi
-"$BUILD_VENV/bin/pip" install --quiet . pyinstaller rumps
+"$BUILD_VENV/bin/pip" install --quiet pyinstaller rumps
 
 rm -rf build "dist/Square Protect.app" dist/SquareProtect.dmg
 "$BUILD_VENV/bin/pyinstaller" \
   --noconfirm --clean --windowed \
   --name "Square Protect" \
   --osx-bundle-identifier com.squareprotect.app \
+  --add-binary "target/release/square-unifi-protect:." \
   --add-data "app/static:app/static" \
   scripts/macos/menubar_app.py
 

@@ -29,10 +29,9 @@ def test_linux_service_uses_builtin_tls_for_its_remote_dashboard(tmp_path):
     installer = repo / "scripts" / "install-service.sh"
     installer.parent.mkdir(parents=True)
     shutil.copy2(ROOT / "scripts" / "install-service.sh", installer)
-    _write_executable(repo / ".venv" / "bin" / "python", "#!/bin/sh\nexit 0\n")
-
     fake_bin = tmp_path / "fake-bin"
     _write_executable(fake_bin / "uname", "#!/bin/sh\necho Linux\n")
+    _write_executable(fake_bin / "cargo", "#!/bin/sh\nexit 0\n")
     _write_executable(
         fake_bin / "sudo",
         "#!/bin/sh\n"
@@ -65,6 +64,8 @@ def test_linux_service_uses_builtin_tls_for_its_remote_dashboard(tmp_path):
     unit = unit_path.read_text(encoding="utf-8")
     assert "Environment=SPI_HOST=0.0.0.0" in unit
     assert "Environment=SPI_TLS=1" in unit
+    assert "target/release/square-unifi-protect" in unit
+    assert ".venv/bin/python" not in unit
     assert "SPI_BOOTSTRAP_SECRET" not in unit
     assert "https://<this-host>:8000" in result.stdout
     assert "journalctl -u square-protect" in result.stdout

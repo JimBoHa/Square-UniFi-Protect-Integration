@@ -1,40 +1,40 @@
-"""macOS menu-bar app wrapping the Square x UniFi Protect server.
-
-Bundled by scripts/macos/build_dmg.sh via PyInstaller. Runs the server in a
-background thread, lives in the menu bar (no Dock icon), and offers Open
-Dashboard / Data Folder / Quit.
-"""
+"""macOS menu-bar wrapper around the native Rust Square Protect server."""
 
 from __future__ import annotations
 
-import inspect
 import os
 import secrets
 import socket
 import subprocess
-import threading
+import sys
 import webbrowser
 from pathlib import Path
 
 import rumps
-import uvicorn
+
 
 APP_NAME = "Square Protect"
 DATA_DIR = Path.home() / "Library" / "Application Support" / "SquareProtect"
 LOOPBACK_HOST = "127.0.0.1"
+BOOTSTRAP_SECRET_MIN_LENGTH = 32
+BOOTSTRAP_SECRET_MAX_LENGTH = 4096
 
 
-def _supports_secure_bootstrap(app_module) -> bool:
-    """Detect the bootstrap API without making packaging depend on its PR."""
-    parameters = inspect.signature(app_module.create_app).parameters
-    minimum = getattr(app_module, "BOOTSTRAP_SECRET_MIN_LENGTH", None)
-    maximum = getattr(app_module, "BOOTSTRAP_SECRET_MAX_LENGTH", None)
-    return bool(
-        {"bind_host", "tls_enabled"}.issubset(parameters)
-        and isinstance(minimum, int)
-        and isinstance(maximum, int)
-        and 1 <= minimum <= maximum
-    )
+def _resource_dir() -> Path:
+    bundled = getattr(sys, "_MEIPASS", None)
+    if bundled:
+        return Path(bundled)
+    return Path(__file__).resolve().parents[2]
+
+
+RESOURCE_DIR = _resource_dir()
+STATIC_DIR = RESOURCE_DIR / "app" / "static"
+_BINARY_NAME = "square-unifi-protect.exe" if os.name == "nt" else "square-unifi-protect"
+BINARY = (
+    RESOURCE_DIR / _BINARY_NAME
+    if (RESOURCE_DIR / _BINARY_NAME).is_file()
+    else RESOURCE_DIR / "target" / "release" / _BINARY_NAME
+)
 
 
 def _wipe_secret(secret: bytearray | None) -> None:
@@ -42,44 +42,47 @@ def _wipe_secret(secret: bytearray | None) -> None:
         secret[:] = b"\0" * len(secret)
 
 
-def _create_menu_web_app(app_module, data_dir: Path):
-    """Create the web app and retain a revealable secret only while setup is pending."""
-    if not _supports_secure_bootstrap(app_module):
-        return app_module.create_app(data_dir=data_dir), None
+def _probe_environment(data_dir: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["SPI_DATA_DIR"] = str(data_dir)
+    environment.pop("SPI_BOOTSTRAP_SECRET", None)
+    return environment
 
-    minimum = app_module.BOOTSTRAP_SECRET_MIN_LENGTH
-    maximum = app_module.BOOTSTRAP_SECRET_MAX_LENGTH
-    plaintext = os.environ.get("SPI_BOOTSTRAP_SECRET")
-    if plaintext is None or not minimum <= len(plaintext) <= maximum:
-        plaintext = secrets.token_urlsafe(32)
-    retained_secret = bytearray(plaintext.encode("utf-8"))
-    os.environ["SPI_BOOTSTRAP_SECRET"] = plaintext
-    plaintext = None
-    try:
-        web_app = app_module.create_app(
-            data_dir=data_dir,
-            bind_host=LOOPBACK_HOST,
-            tls_enabled=False,
-        )
-    except BaseException:
-        _wipe_secret(retained_secret)
-        raise
-    finally:
-        # Secure bootstrap also removes this value, but keep the packaging
-        # adapter fail-closed if app construction exits before that point.
+
+def _setup_complete(binary: Path, data_dir: Path) -> bool:
+    result = subprocess.run(
+        [str(binary), "--setup-complete"],
+        cwd=RESOURCE_DIR,
+        env=_probe_environment(data_dir),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _prepare_bootstrap_secret(binary: Path, data_dir: Path) -> bytearray | None:
+    if _setup_complete(binary, data_dir):
         os.environ.pop("SPI_BOOTSTRAP_SECRET", None)
-
-    if web_app.state.store.setup_complete():
-        _wipe_secret(retained_secret)
-        return web_app, None
-    return web_app, retained_secret
+        return None
+    plaintext = os.environ.pop("SPI_BOOTSTRAP_SECRET", None)
+    if plaintext is None or not (
+        BOOTSTRAP_SECRET_MIN_LENGTH
+        <= len(plaintext)
+        <= BOOTSTRAP_SECRET_MAX_LENGTH
+    ):
+        plaintext = secrets.token_urlsafe(32)
+    retained = bytearray(plaintext.encode("utf-8"))
+    plaintext = None
+    return retained
 
 
 def pick_port(preferred: int = 8000) -> int:
     for port in range(preferred, preferred + 21):
         with socket.socket() as probe:
             try:
-                probe.bind(("127.0.0.1", port))
+                probe.bind((LOOPBACK_HOST, port))
                 return port
             except OSError:
                 continue
@@ -89,22 +92,45 @@ def pick_port(preferred: int = 8000) -> int:
 class SquareProtectApp(rumps.App):
     def __init__(self) -> None:
         super().__init__(APP_NAME, title="◉", quit_button=None)
+        if not BINARY.is_file() or not os.access(BINARY, os.X_OK):
+            raise RuntimeError(f"Rust server binary is missing or not executable: {BINARY}")
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("SPI_DATA_DIR", str(DATA_DIR))
+        self.binary = BINARY
+        self.data_dir = DATA_DIR
         self.port = int(os.environ.get("SPI_PORT", "0")) or pick_port()
+        self.tls_enabled = os.environ.get("SPI_TLS") == "1"
+        self._bootstrap_secret = _prepare_bootstrap_secret(self.binary, self.data_dir)
 
-        from app import main as app_main  # after SPI_DATA_DIR is set
-
-        self.web_app, self._bootstrap_secret = _create_menu_web_app(app_main, DATA_DIR)
-
-        config = uvicorn.Config(
-            self.web_app,
-            host=LOOPBACK_HOST,
-            port=self.port,
-            log_level="warning",
+        child_environment = os.environ.copy()
+        child_environment.update(
+            {
+                "SPI_DATA_DIR": str(self.data_dir),
+                "SPI_STATIC_DIR": str(STATIC_DIR),
+                "SPI_HOST": LOOPBACK_HOST,
+                "SPI_PORT": str(self.port),
+                "SPI_TLS": "1" if self.tls_enabled else "0",
+            }
         )
-        self.server = uvicorn.Server(config)
-        threading.Thread(target=self.server.run, daemon=True).start()
+        if self._bootstrap_secret is not None:
+            child_environment["SPI_BOOTSTRAP_SECRET"] = bytes(
+                self._bootstrap_secret
+            ).decode("utf-8")
+        self._log = (self.data_dir / "service.log").open("ab", buffering=0)
+        try:
+            self.server = subprocess.Popen(
+                [str(self.binary)],
+                cwd=RESOURCE_DIR,
+                env=child_environment,
+                stdin=subprocess.DEVNULL,
+                stdout=self._log,
+                stderr=subprocess.STDOUT,
+            )
+        except BaseException:
+            _wipe_secret(self._bootstrap_secret)
+            self._log.close()
+            raise
+        finally:
+            child_environment.pop("SPI_BOOTSTRAP_SECRET", None)
 
         self._setup_secret_item = None
         self._setup_timer = None
@@ -128,10 +154,11 @@ class SquareProtectApp(rumps.App):
             self._setup_timer.start()
 
     def open_dashboard(self, _sender) -> None:
-        webbrowser.open(f"http://127.0.0.1:{self.port}")
+        scheme = "https" if self.tls_enabled else "http"
+        webbrowser.open(f"{scheme}://{LOOPBACK_HOST}:{self.port}")
 
     def open_data_folder(self, _sender) -> None:
-        subprocess.run(["open", str(DATA_DIR)], check=False)
+        subprocess.run(["open", str(self.data_dir)], check=False)
 
     def _clear_setup_secret(self) -> None:
         _wipe_secret(self._bootstrap_secret)
@@ -144,9 +171,8 @@ class SquareProtectApp(rumps.App):
             self._setup_timer = None
 
     def _refresh_setup_state(self, _timer=None) -> None:
-        if (
-            self._bootstrap_secret is not None
-            and self.web_app.state.store.setup_complete()
+        if self._bootstrap_secret is not None and _setup_complete(
+            self.binary, self.data_dir
         ):
             self._clear_setup_secret()
 
@@ -172,7 +198,14 @@ class SquareProtectApp(rumps.App):
 
     def quit_app(self, _sender) -> None:
         self._clear_setup_secret()
-        self.server.should_exit = True
+        if self.server.poll() is None:
+            self.server.terminate()
+            try:
+                self.server.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.server.kill()
+                self.server.wait(timeout=5)
+        self._log.close()
         rumps.quit_application()
 
 

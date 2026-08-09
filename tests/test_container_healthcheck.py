@@ -25,7 +25,10 @@ class _Response:
 def test_docker_uses_protocol_aware_healthcheck_module():
     dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
 
-    assert 'CMD ["python", "-m", "app.healthcheck"]' in dockerfile
+    assert (
+        'CMD ["gosu", "square-protect", "square-unifi-protect", "--healthcheck"]'
+        in dockerfile
+    )
     assert "urlopen(f'http://" not in dockerfile
 
 

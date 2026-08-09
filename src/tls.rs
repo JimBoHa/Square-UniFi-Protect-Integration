@@ -323,21 +323,19 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_certificate_or_key_is_repaired_before_reuse() {
-        for corrupt in [CERT_FILENAME] {
-            let temp = tempfile::tempdir().unwrap();
-            let host = "192.0.2.20".parse().unwrap();
-            let (cert, key) = ensure_self_signed_pair(temp.path(), host).unwrap();
-            fs::write(temp.path().join(corrupt), b"corrupt").unwrap();
-            let repaired = ensure_self_signed_pair(temp.path(), host).unwrap();
-            assert!(certificate_covers_names(&repaired.0, &[host.to_string()]));
-            assert!(
-                fs::read_to_string(&repaired.1)
-                    .unwrap()
-                    .contains("PRIVATE KEY")
-            );
-            assert_eq!(repaired, (cert, key));
-        }
+    fn corrupt_certificate_is_repaired_before_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = "192.0.2.20".parse().unwrap();
+        let (cert, key) = ensure_self_signed_pair(temp.path(), host).unwrap();
+        fs::write(temp.path().join(CERT_FILENAME), b"corrupt").unwrap();
+        let repaired = ensure_self_signed_pair(temp.path(), host).unwrap();
+        assert!(certificate_covers_names(&repaired.0, &[host.to_string()]));
+        assert!(
+            fs::read_to_string(&repaired.1)
+                .unwrap()
+                .contains("PRIVATE KEY")
+        );
+        assert_eq!(repaired, (cert, key));
     }
 
     #[test]

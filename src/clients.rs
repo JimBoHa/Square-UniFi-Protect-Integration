@@ -1465,7 +1465,7 @@ mod tests {
             .unwrap();
         assert_eq!(payments, [json!({"id": "PAY_1"})]);
         assert_eq!(cursor.as_deref(), Some("next-page"));
-        let uri = &uris.lock().unwrap()[0];
+        let uri = uris.lock().unwrap()[0].clone();
         for query in [
             "sort_field=UPDATED_AT",
             "sort_order=ASC",

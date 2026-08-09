@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -417,6 +418,42 @@ def test_storage_settings_api_requires_auth_and_validates_bounds(client, authed)
         "active_bytes": 0,
         "retired_count": 0,
     }
+
+
+def test_storage_settings_compress_before_enforcing_new_quota(authed):
+    store = authed.app.state.store
+    originals = [_jpeg(), _jpeg()]
+    for index, original in enumerate(originals):
+        _add_asset(store, f"QUOTA-{index}", NOW_MS + index, original)
+    assert sum(map(len, originals)) > 1024 * 1024
+
+    saved = authed.put(
+        "/api/settings/thumbnail-storage",
+        json={
+            "compression_enabled": True,
+            "jpeg_quality": 40,
+            "max_dimension": 320,
+            "retention_days": 0,
+            "max_storage_mib": 1,
+        },
+    )
+    assert saved.status_code == 200, saved.text
+
+    deadline = time.monotonic() + 10
+    while True:
+        settings = authed.get("/api/settings/thumbnail-storage").json()
+        if settings["maintenance"]["state"] not in {"queued", "running"}:
+            break
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    assert settings["maintenance"]["state"] == "complete"
+    assert settings["maintenance"]["optimize_existing"] is True
+    assert settings["maintenance"]["result"]["optimized_count"] == 2
+    assert settings["maintenance"]["result"]["retired_quota_count"] == 0
+    assert settings["usage"]["active_count"] == 2
+    assert settings["usage"]["retired_count"] == 0
+    assert settings["usage"]["active_bytes"] < 1024 * 1024
 
 
 def test_retired_thumbnail_api_is_gone_but_timeline_link_remains(authed):

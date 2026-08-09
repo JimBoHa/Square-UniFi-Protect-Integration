@@ -7,7 +7,7 @@ use std::{
 
 use axum_server::tls_rustls::RustlsConfig;
 use fs2::FileExt;
-use rcgen::{CertifiedKey, generate_simple_self_signed};
+use rcgen::{CertifiedKey, KeyPair, PublicKeyData, generate_simple_self_signed};
 use x509_parser::{extensions::GeneralName, parse_x509_certificate, time::ASN1Time};
 
 use crate::{
@@ -102,7 +102,7 @@ fn ensure_self_signed_pair(data_dir: &Path, bind_host: IpAddr) -> AppResult<(Pat
 
     let names = local_certificate_names(bind_host);
     if let Some(pair) = legacy_generation_pair(data_dir)
-        && certificate_covers_names(&pair.0, &names)
+        && generated_pair_is_valid(&pair.0, &pair.1, &names)
     {
         // Reuse a currently deployed generation-based pair. It is already
         // atomically published and contains this machine's LAN addresses.
@@ -111,7 +111,10 @@ fn ensure_self_signed_pair(data_dir: &Path, bind_host: IpAddr) -> AppResult<(Pat
     }
     let cert_path = data_dir.join(CERT_FILENAME);
     let key_path = data_dir.join(KEY_FILENAME);
-    if cert_path.is_file() && key_path.is_file() && certificate_covers_names(&cert_path, &names) {
+    if cert_path.is_file()
+        && key_path.is_file()
+        && generated_pair_is_valid(&cert_path, &key_path, &names)
+    {
         secure_file(&cert_path)?;
         secure_file(&key_path)?;
         FileExt::unlock(&lock)?;
@@ -121,8 +124,8 @@ fn ensure_self_signed_pair(data_dir: &Path, bind_host: IpAddr) -> AppResult<(Pat
     let CertifiedKey { cert, signing_key } =
         generate_simple_self_signed(names).map_err(AppError::internal)?;
     // Publish the key first. If the process stops between the two replaces,
-    // the old certificate still lacks at least one required address and the
-    // next startup safely regenerates the pair before opening a socket.
+    // the old certificate either lacks a required address or no longer matches
+    // the new key, so the next startup regenerates before opening a socket.
     publish_private(&key_path, signing_key.serialize_pem().as_bytes())?;
     publish_private(&cert_path, cert.pem().as_bytes())?;
     FileExt::unlock(&lock)?;
@@ -197,6 +200,28 @@ fn certificate_covers_names(path: &Path, required: &[String]) -> bool {
         }
     }
     required.iter().all(|required| names.contains(required))
+}
+
+fn generated_pair_is_valid(cert_path: &Path, key_path: &Path, required: &[String]) -> bool {
+    if !certificate_covers_names(cert_path, required) {
+        return false;
+    }
+    let Ok(cert_pem) = fs::read(cert_path) else {
+        return false;
+    };
+    let Ok((_, cert_pem)) = x509_parser::pem::parse_x509_pem(&cert_pem) else {
+        return false;
+    };
+    let Ok((_, certificate)) = parse_x509_certificate(&cert_pem.contents) else {
+        return false;
+    };
+    let Ok(key_pem) = fs::read_to_string(key_path) else {
+        return false;
+    };
+    let Ok(key_pair) = KeyPair::from_pem(&key_pem) else {
+        return false;
+    };
+    certificate.public_key().raw == key_pair.subject_public_key_info()
 }
 
 fn legacy_generation_pair(data_dir: &Path) -> Option<(PathBuf, PathBuf)> {
@@ -277,6 +302,11 @@ mod tests {
             &cert,
             &local_certificate_names("127.0.0.1".parse().unwrap())
         ));
+        assert!(generated_pair_is_valid(
+            &cert,
+            &key,
+            &local_certificate_names("127.0.0.1".parse().unwrap())
+        ));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -323,19 +353,39 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_certificate_is_repaired_before_reuse() {
-        let temp = tempfile::tempdir().unwrap();
-        let host = "192.0.2.20".parse().unwrap();
-        let (cert, key) = ensure_self_signed_pair(temp.path(), host).unwrap();
-        fs::write(temp.path().join(CERT_FILENAME), b"corrupt").unwrap();
-        let repaired = ensure_self_signed_pair(temp.path(), host).unwrap();
-        assert!(certificate_covers_names(&repaired.0, &[host.to_string()]));
-        assert!(
-            fs::read_to_string(&repaired.1)
-                .unwrap()
-                .contains("PRIVATE KEY")
-        );
-        assert_eq!(repaired, (cert, key));
+    fn corrupt_certificate_or_key_is_repaired_before_reuse() {
+        for corrupt in [CERT_FILENAME, KEY_FILENAME] {
+            let temp = tempfile::tempdir().unwrap();
+            let host = "192.0.2.20".parse().unwrap();
+            let (cert, key) = ensure_self_signed_pair(temp.path(), host).unwrap();
+            fs::write(temp.path().join(corrupt), b"corrupt").unwrap();
+            let repaired = ensure_self_signed_pair(temp.path(), host).unwrap();
+            assert!(generated_pair_is_valid(
+                &repaired.0,
+                &repaired.1,
+                &[host.to_string()]
+            ));
+            assert_eq!(repaired, (cert, key));
+        }
+    }
+
+    #[test]
+    fn mismatched_generated_key_is_rotated_with_certificate() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let host = "192.0.2.21".parse().unwrap();
+        let (cert, key) = ensure_self_signed_pair(first.path(), host).unwrap();
+        let first_cert = fs::read(&cert).unwrap();
+        let (_, other_key) = ensure_self_signed_pair(second.path(), host).unwrap();
+        fs::write(&key, fs::read(other_key).unwrap()).unwrap();
+        assert!(!generated_pair_is_valid(&cert, &key, &[host.to_string()]));
+        let repaired = ensure_self_signed_pair(first.path(), host).unwrap();
+        assert!(generated_pair_is_valid(
+            &repaired.0,
+            &repaired.1,
+            &[host.to_string()]
+        ));
+        assert_ne!(fs::read(repaired.0).unwrap(), first_cert);
     }
 
     #[test]

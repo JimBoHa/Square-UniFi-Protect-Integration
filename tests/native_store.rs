@@ -497,8 +497,8 @@ fn webhook_receipts_dedupe_and_never_regress_freshness() {
             &[],
         )
         .unwrap();
-    store.record_webhook_delivery(1_000).unwrap();
     store.record_webhook_delivery(2_000).unwrap();
+    store.record_webhook_delivery(1_000).unwrap();
     let newest = "a".repeat(64);
     let older = "b".repeat(64);
     assert!(

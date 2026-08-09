@@ -576,8 +576,11 @@ impl ProtectClient {
     }
 
     pub async fn trigger_alarm(&self, trigger_id: &str) -> AppResult<()> {
-        validate_alarm_trigger_id(trigger_id)?;
+        let trigger_id = validate_alarm_trigger_id(trigger_id)?;
         let encoded: String = url::form_urlencoded::byte_serialize(trigger_id.as_bytes()).collect();
+        // Form encoding represents spaces as '+', but this value is one URL
+        // path segment where '+' is literal and spaces must be percent encoded.
+        let encoded = encoded.replace('+', "%20");
         self.integration_request(
             Method::POST,
             &format!("/proxy/protect/integration/v1/alarm-manager/webhook/{encoded}"),
@@ -1769,7 +1772,8 @@ mod tests {
             client.integration_info().await.unwrap()["applicationVersion"],
             "7.1.87"
         );
-        client.trigger_alarm("Barn-East/Sale").await.unwrap();
+        client.trigger_alarm(" Barn East/Sale ").await.unwrap();
+        client.trigger_alarm("Barn+East").await.unwrap();
         let requests = requests.lock().unwrap();
         assert!(
             requests
@@ -1778,9 +1782,14 @@ mod tests {
         );
         assert!(requests.iter().all(|request| !request.2));
         assert!(
-            requests[1].0.ends_with("/Barn-East%2FSale"),
+            requests[1].0.ends_with("/Barn%20East%2FSale"),
             "unexpected alarm path: {:?}",
             requests[1].0
+        );
+        assert!(
+            requests[2].0.ends_with("/Barn%2BEast"),
+            "unexpected literal-plus path: {:?}",
+            requests[2].0
         );
     }
 

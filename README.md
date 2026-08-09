@@ -59,6 +59,10 @@ timeline near that timestamp.
 - **Searchable clip notes** — administrators can add or clear a note on each
   transaction/footage card. View-only accounts can read notes, and the existing
   local search and CSV export include them.
+- **Motion without a transaction** — a Protect-native motion zone can send an
+  authenticated Alarm Manager webhook to the app. Motion waits through a
+  configurable Square grace period, then becomes a visible flag when the same
+  camera has no transaction inside the configured timestamp window.
 
 ## Protect integration boundary
 
@@ -160,14 +164,17 @@ Then:
 5. **Settings → Thumbnail storage** — optionally enable JPEG compression and
    choose an age or total-size limit. Use *Optimize existing thumbnails now*
    once to apply the active compression policy to already-captured files.
-6. Open **Transactions** — press *Sync now* for an immediate backfill; the
+6. Optional: enable **Settings → Motion without a transaction** for the POS
+   camera. Copy the generated URL and one-time-displayed token into a Protect
+   Alarm Manager Custom Webhook action as documented below.
+7. Open **Transactions** — press *Sync now* for an immediate backfill; the
    poller (`SPI_POLL_INTERVAL`, default 60 s) keeps it current thereafter.
-6. Optional: use **Settings → App users** to add view-only staff accounts or
+8. Optional: use **Settings → App users** to add view-only staff accounts or
    another administrator. Password resets immediately revoke that user's
    existing sessions; resetting your own password returns you to login.
    The **Login history** below the account list shows successful sign-ins and
    can load the complete append-only history in bounded pages.
-7. Administrators can enter a **Clip note** directly on any transaction card.
+9. Administrators can enter a **Clip note** directly on any transaction card.
    Saved note text becomes searchable immediately; concurrent stale edits are
    rejected instead of silently overwriting another administrator's work.
 
@@ -220,6 +227,42 @@ link**. Custom templates must use `https://` with `{host}` as the entire hostnam
 default (verified on Protect 7.1.87):
 `https://{host}/protect/timelapse/{camera_id}?start={ts_ms}`.
 
+### Motion without a transaction
+
+Use [Protect's native Motion Zones](https://help.ui.com/hc/en-us/articles/360056987954-UniFi-Protect-Manage-Camera-Zones)
+for the user-drawn box instead of decoding the camera stream in this app. The
+camera/NVR detection pipeline remains active when this companion app restarts,
+is tuned by the camera firmware, and avoids a second continuous video decoder.
+In Protect, open the chosen camera's **Recording Mode → Detection & Privacy
+Zones** and draw the register zone. Then create an **Activity → Motion** alarm
+scoped only to that camera and add a [Custom Webhook](https://help.ui.com/hc/en-us/articles/25478744592023-Send-UniFi-Protect-Alerts-to-Web-Services-using-Webhooks)
+action.
+
+The most compatible secure setup uses the documented HTTP GET action:
+
+1. Copy the webhook URL shown by the app. It is built from the browser's current
+   origin, so it follows a changed LAN address or hostname.
+2. Add the displayed `X-SPI-Webhook-Token` custom header and copy its value when
+   the app creates it. The value is shown only on creation, rotation, or a
+   camera change; changing cameras invalidates the old alarm action.
+3. Enable Protect's **Ignore Repeated Actions** option and test by walking
+   through the zone.
+
+GET records the app server's LAN receipt time. The endpoint also accepts the
+documented Alarm Manager POST JSON and uses its NVR `timestamp`; prefer POST
+when the installed Protect version preserves the custom authentication header
+for POST actions. The Protect console must trust the app's HTTPS certificate.
+
+Each event captures its camera, match window, grace period, and expiry at
+receipt. A transaction on another camera never resolves it. After the grace
+period, an unmatched event is flagged; a late Square webhook or overlap poll
+automatically changes it to matched. Exact POST retries and GET deliveries in
+the same five-second bucket are deduplicated. Raw Alarm Manager payloads are
+not retained, expired rows are pruned, and a 50,000-row hard cap prevents
+unbounded database growth. A confirmed Protect console switch disables the
+receiver and clears old-console events. A confirmed Square merchant switch
+clears old matching results but keeps the current Protect detector enabled.
+
 Thumbnail compression and retention are disabled by default on upgrade. Under
 **Settings → Thumbnail storage**, compression affects new captures immediately;
 the explicit optimization button processes older files once per compression
@@ -255,8 +298,8 @@ marked so later Square overlap polls cannot recreate the deleted bytes.
 ## Security
 
 - **Secrets encrypted at rest** — the Square access token, webhook signature
-  key, Protect password, and Protect API key are Fernet-encrypted in SQLite;
-  the key file is created `0600`.
+  key, Protect password, Protect API key, and inbound motion token are
+  Fernet-encrypted in SQLite; the key file is created `0600`.
 - **Account passwords** are hashed with scrypt; login is throttled after
   repeated failures; sessions are random 256-bit tokens in
   `HttpOnly`/`SameSite` cookies and resolve the account's live role on every
@@ -278,11 +321,15 @@ marked so later Square overlap polls cannot recreate the deleted bytes.
   the endpoint accepts only payment-created/payment-updated envelopes, and it is
   disabled until a signature key is configured. Duplicate detection retains at
   most 4,096 SHA-256 receipt keys; raw event IDs and payloads are not retained.
+  Protect motion deliveries require the rotating secret header and a direct
+  RFC 1918, loopback, IPv6 ULA, or link-local socket peer; forwarding headers
+  are ignored.
 - **Request bodies bounded** — general HTTP requests are capped at 1 MiB before
   routing, authentication, or JSON parsing, including streamed/chunked bodies;
   this leaves ample room for the maximum 500-entry camera mapping. Square
-  webhooks retain their dedicated 1 MiB streaming/HMAC cap, while transaction
-  search uses a tighter auth-first streaming cap.
+  webhooks retain their dedicated 1 MiB streaming/HMAC cap, transaction search
+  uses a tighter auth-first streaming cap, and an authenticated Protect motion
+  POST is limited to 32 KiB.
 - **Input validation** — Protect host and camera ids are strictly validated
   (no URL/path injection), thumbnail serving is confined to the thumbnail
   directory, and the frontend renders all server data as text, never markup.
@@ -292,8 +339,9 @@ marked so later Square overlap polls cannot recreate the deleted bytes.
   and the Protect API key rely on the LAN being trusted.
 
 Serve the integration over HTTPS (reverse proxy) and set `SPI_COOKIE_SECURE=1`
-in production. The webhook endpoint is the only route that must be reachable
-from the internet; everything else can stay LAN-only.
+in production. Only the Square webhook route needs internet reachability. The
+Protect motion webhook is intentionally LAN-only; everything else can remain
+behind the authenticated interface.
 
 ## FAQ
 

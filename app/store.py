@@ -39,6 +39,24 @@ MAX_TRANSACTION_SNAPSHOTS = 8
 MAX_TRANSACTION_ORDER_HISTORY = 10_000
 MAX_TRANSACTION_SEARCH_LENGTH = 64
 MAX_TRANSACTION_NOTE_LENGTH = 2000
+MOTION_WEBHOOK_TOKEN_SETTING = "protect.motion_webhook_token"
+MOTION_CAMERA_ID_SETTING = "protect.motion_camera_id"
+MOTION_CAMERA_NAME_SETTING = "protect.motion_camera_name"
+MOTION_MATCH_WINDOW_SETTING = "protect.motion_match_window_seconds"
+MOTION_GRACE_SETTING = "protect.motion_grace_seconds"
+MOTION_RETENTION_SETTING = "protect.motion_retention_days"
+MOTION_WEBHOOK_SETTING_KEYS = (
+    MOTION_WEBHOOK_TOKEN_SETTING,
+    MOTION_CAMERA_ID_SETTING,
+    MOTION_CAMERA_NAME_SETTING,
+    MOTION_MATCH_WINDOW_SETTING,
+    MOTION_GRACE_SETTING,
+    MOTION_RETENTION_SETTING,
+)
+DEFAULT_MOTION_MATCH_WINDOW_SECONDS = 15
+DEFAULT_MOTION_GRACE_SECONDS = 90
+DEFAULT_MOTION_RETENTION_DAYS = 30
+MAX_MOTION_EVENTS = 50_000
 TRANSACTION_FILTER_SIGNATURE_PREFIX = "hmac-sha256-v2:"
 _TRANSACTION_FILTER_SIGNATURE_DOMAIN = (
     b"square-unifi-protect:transaction-filter-signature:v2"
@@ -214,6 +232,8 @@ CREATE TABLE IF NOT EXISTS transactions (
 CREATE INDEX IF NOT EXISTS idx_transactions_ts ON transactions (ts_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_transactions_status_ts
     ON transactions (status, ts_ms DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_camera_ts
+    ON transactions (camera_id, ts_ms DESC, id DESC);
 CREATE TABLE IF NOT EXISTS square_poll_watermarks (
     location_id TEXT PRIMARY KEY,
     polled_through_ms INTEGER NOT NULL CHECK (polled_through_ms >= 0)
@@ -316,6 +336,29 @@ BEFORE DELETE ON login_audit
 BEGIN
     SELECT RAISE(ABORT, 'login audit is append-only');
 END;
+CREATE TABLE IF NOT EXISTS protect_motion_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL CHECK (length(event_key) BETWEEN 1 AND 80),
+    camera_id TEXT NOT NULL CHECK (length(camera_id) BETWEEN 1 AND 64),
+    camera_name TEXT NOT NULL CHECK (length(camera_name) <= 128),
+    event_ts_ms INTEGER NOT NULL CHECK (event_ts_ms >= 0),
+    received_at_ms INTEGER NOT NULL CHECK (received_at_ms >= 0),
+    evaluate_after_ms INTEGER NOT NULL CHECK (evaluate_after_ms >= 0),
+    expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms >= 0),
+    match_window_ms INTEGER NOT NULL CHECK (
+        match_window_ms BETWEEN 1000 AND 300000
+    ),
+    delivery_method TEXT NOT NULL CHECK (delivery_method IN ('get', 'post')),
+    alarm_name TEXT NOT NULL DEFAULT '' CHECK (length(alarm_name) <= 256),
+    device_identifiers TEXT NOT NULL DEFAULT '[]' CHECK (
+        length(device_identifiers) <= 4096
+    ),
+    UNIQUE (camera_id, event_key)
+);
+CREATE INDEX IF NOT EXISTS idx_protect_motion_events_time
+    ON protect_motion_events (event_ts_ms DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_protect_motion_events_expiry
+    ON protect_motion_events (expires_at_ms);
 CREATE TABLE IF NOT EXISTS square_oauth_states (
     state_hash TEXT PRIMARY KEY,
     created_at REAL NOT NULL,
@@ -336,6 +379,10 @@ class TransactionSnapshotFilterMismatch(Exception):
 
 class TransactionNoteConflict(Exception):
     """A clip note changed after the editor loaded it."""
+
+
+class MotionWebhookUnauthorized(Exception):
+    """An inbound Protect motion delivery did not have the current token."""
 
 
 def normalize_username(value: str) -> str:
@@ -1326,6 +1373,11 @@ class Store:
                     )
                     self._db.execute("DELETE FROM camera_map")
                     self._db.execute("DELETE FROM thumbnail_retries")
+                    self._db.execute("DELETE FROM protect_motion_events")
+                    self._db.executemany(
+                        "DELETE FROM settings WHERE key = ?",
+                        ((key,) for key in MOTION_WEBHOOK_SETTING_KEYS),
+                    )
                     self._db.execute(
                         "UPDATE transactions SET camera_id = NULL, "
                         "thumbnail_path = NULL, thumbnail_bytes = NULL, "
@@ -1596,6 +1648,378 @@ class Store:
                 f"DELETE FROM settings WHERE key IN ({placeholders})", keys
             )
             self._db.commit()
+
+    # -- inbound Protect motion alarms -----------------------------------
+
+    def _motion_webhook_config_locked(self, *, include_token: bool) -> dict:
+        values = {
+            key: self._setting_value_locked(key)
+            for key in MOTION_WEBHOOK_SETTING_KEYS
+        }
+
+        def bounded_integer(key: str, default: int, low: int, high: int) -> int:
+            try:
+                value = int(values[key] or "")
+            except ValueError:
+                return default
+            return value if low <= value <= high else default
+
+        camera_id = values[MOTION_CAMERA_ID_SETTING] or ""
+        camera_name = values[MOTION_CAMERA_NAME_SETTING] or ""
+        token = values[MOTION_WEBHOOK_TOKEN_SETTING] or ""
+        match_window_seconds = bounded_integer(
+            MOTION_MATCH_WINDOW_SETTING,
+            DEFAULT_MOTION_MATCH_WINDOW_SECONDS,
+            1,
+            300,
+        )
+        grace_seconds = bounded_integer(
+            MOTION_GRACE_SETTING,
+            DEFAULT_MOTION_GRACE_SECONDS,
+            0,
+            600,
+        )
+        retention_days = bounded_integer(
+            MOTION_RETENTION_SETTING,
+            DEFAULT_MOTION_RETENTION_DAYS,
+            1,
+            365,
+        )
+        config = {
+            "enabled": bool(camera_id and token),
+            "camera_id": camera_id,
+            "camera_name": camera_name,
+            "match_window_seconds": match_window_seconds,
+            "grace_seconds": grace_seconds,
+            "retention_days": retention_days,
+            "token_configured": bool(token),
+        }
+        if include_token:
+            config["webhook_token"] = token
+        return config
+
+    def motion_webhook_config(self) -> dict:
+        """Return non-secret detector configuration and current-camera liveness."""
+        with self._lock:
+            config = self._motion_webhook_config_locked(include_token=False)
+            last_event = None
+            if config["camera_id"]:
+                row = self._db.execute(
+                    "SELECT MAX(received_at_ms) AS received_at_ms "
+                    "FROM protect_motion_events WHERE camera_id = ?",
+                    (config["camera_id"],),
+                ).fetchone()
+                if row and row["received_at_ms"] is not None:
+                    last_event = int(row["received_at_ms"])
+        return {**config, "last_event_ms": last_event}
+
+    def configure_motion_webhook(
+        self,
+        *,
+        camera_id: str,
+        camera_name: str,
+        match_window_seconds: int,
+        grace_seconds: int,
+        retention_days: int,
+        rotate_token: bool = False,
+    ) -> tuple[dict, str | None]:
+        """Enable one camera-bound detector, revealing only a newly made token."""
+        camera_id = str(camera_id).strip()
+        camera_name = str(camera_name).strip()
+        if not 1 <= len(camera_id) <= 64 or any(
+            not character.isascii() or not character.isalnum()
+            for character in camera_id
+        ):
+            raise ValueError("Invalid Protect motion camera id")
+        if len(camera_name) > 128 or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in camera_name
+        ):
+            raise ValueError("Invalid Protect motion camera name")
+        match_window_seconds = int(match_window_seconds)
+        grace_seconds = int(grace_seconds)
+        retention_days = int(retention_days)
+        if not 1 <= match_window_seconds <= 300:
+            raise ValueError("Motion match window must be 1 to 300 seconds")
+        if not 0 <= grace_seconds <= 600:
+            raise ValueError("Motion grace period must be 0 to 600 seconds")
+        if not 1 <= retention_days <= 365:
+            raise ValueError("Motion retention must be 1 to 365 days")
+
+        revealed_token = None
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                current_token = self._setting_value_locked(
+                    MOTION_WEBHOOK_TOKEN_SETTING
+                )
+                current_camera_id = self._setting_value_locked(
+                    MOTION_CAMERA_ID_SETTING
+                )
+                if (
+                    rotate_token
+                    or not current_token
+                    or current_camera_id != camera_id
+                ):
+                    current_token = secrets.token_urlsafe(32)
+                    revealed_token = current_token
+                updates = (
+                    (
+                        MOTION_WEBHOOK_TOKEN_SETTING,
+                        self.cipher.encrypt(current_token),
+                        1,
+                    ),
+                    (MOTION_CAMERA_ID_SETTING, camera_id, 0),
+                    (MOTION_CAMERA_NAME_SETTING, camera_name, 0),
+                    (
+                        MOTION_MATCH_WINDOW_SETTING,
+                        str(match_window_seconds),
+                        0,
+                    ),
+                    (MOTION_GRACE_SETTING, str(grace_seconds), 0),
+                    (MOTION_RETENTION_SETTING, str(retention_days), 0),
+                )
+                self._db.executemany(
+                    "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                    "encrypted=excluded.encrypted",
+                    updates,
+                )
+                config = self._motion_webhook_config_locked(include_token=False)
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return config, revealed_token
+
+    def disable_motion_webhook(self) -> None:
+        """Invalidate inbound delivery immediately while retaining event history."""
+        with self._lock:
+            self._db.executemany(
+                "DELETE FROM settings WHERE key = ?",
+                ((key,) for key in MOTION_WEBHOOK_SETTING_KEYS),
+            )
+            self._db.commit()
+
+    def authenticate_motion_webhook(self, presented_token: str) -> dict:
+        """Return a configuration snapshot only for the current secret token."""
+        if not isinstance(presented_token, str) or len(presented_token) > 512:
+            raise MotionWebhookUnauthorized
+        with self._lock:
+            config = self._motion_webhook_config_locked(include_token=True)
+        expected = config.pop("webhook_token")
+        if not config["enabled"] or not secrets.compare_digest(
+            presented_token, expected
+        ):
+            raise MotionWebhookUnauthorized
+        return config
+
+    def record_motion_event(
+        self,
+        *,
+        presented_token: str,
+        event_key: str,
+        event_ts_ms: int,
+        received_at_ms: int,
+        delivery_method: str,
+        alarm_name: str = "",
+        device_identifiers: tuple[str, ...] = (),
+    ) -> dict:
+        """Authenticate and persist one bounded event under a coherent config."""
+        if not isinstance(presented_token, str) or len(presented_token) > 512:
+            raise MotionWebhookUnauthorized
+        event_key = str(event_key)
+        alarm_name = str(alarm_name)
+        event_ts_ms = int(event_ts_ms)
+        received_at_ms = int(received_at_ms)
+        if not 1 <= len(event_key) <= 80:
+            raise ValueError("Invalid Protect motion event key")
+        if delivery_method not in {"get", "post"}:
+            raise ValueError("Invalid Protect motion delivery method")
+        if event_ts_ms < 0 or received_at_ms < 0:
+            raise ValueError("Invalid Protect motion timestamp")
+        if len(alarm_name) > 256 or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in alarm_name
+        ):
+            raise ValueError("Invalid Protect motion alarm name")
+        normalized_devices = []
+        for value in device_identifiers:
+            value = str(value).strip()
+            if not value:
+                continue
+            if len(value) > 128 or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in value
+            ):
+                raise ValueError("Invalid Protect motion device identifier")
+            if value not in normalized_devices:
+                normalized_devices.append(value)
+        if len(normalized_devices) > 64:
+            raise ValueError("Too many Protect motion device identifiers")
+        device_json = json.dumps(
+            normalized_devices,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(device_json) > 4096:
+            raise ValueError("Protect motion device identifiers are too large")
+
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                config = self._motion_webhook_config_locked(include_token=True)
+                expected = config.pop("webhook_token")
+                if not config["enabled"] or not secrets.compare_digest(
+                    presented_token, expected
+                ):
+                    raise MotionWebhookUnauthorized
+                retention_ms = int(config["retention_days"]) * 86_400_000
+                oldest_allowed_ms = received_at_ms - retention_ms
+                if event_ts_ms < oldest_allowed_ms:
+                    raise ValueError("Protect motion timestamp is too old")
+                self._db.execute(
+                    "DELETE FROM protect_motion_events WHERE expires_at_ms <= ?",
+                    (received_at_ms,),
+                )
+                existing = self._db.execute(
+                    "SELECT id FROM protect_motion_events "
+                    "WHERE camera_id = ? AND event_key = ?",
+                    (config["camera_id"], event_key),
+                ).fetchone()
+                if existing is not None:
+                    self._db.commit()
+                    return {"id": int(existing["id"]), "created": False}
+                cursor = self._db.execute(
+                    "INSERT INTO protect_motion_events ("
+                    "event_key, camera_id, camera_name, event_ts_ms, "
+                    "received_at_ms, evaluate_after_ms, expires_at_ms, "
+                    "match_window_ms, delivery_method, alarm_name, "
+                    "device_identifiers) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        event_key,
+                        config["camera_id"],
+                        config["camera_name"],
+                        event_ts_ms,
+                        received_at_ms,
+                        max(received_at_ms, event_ts_ms)
+                        + int(config["grace_seconds"]) * 1000,
+                        event_ts_ms + retention_ms,
+                        int(config["match_window_seconds"]) * 1000,
+                        delivery_method,
+                        alarm_name,
+                        device_json,
+                    ),
+                )
+                self._db.execute(
+                    "DELETE FROM protect_motion_events WHERE id IN ("
+                    "SELECT id FROM protect_motion_events "
+                    "ORDER BY received_at_ms DESC, id DESC LIMIT -1 OFFSET ?)",
+                    (MAX_MOTION_EVENTS,),
+                )
+                event_id = int(cursor.lastrowid)
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return {"id": event_id, "created": True}
+
+    def list_motion_alerts(
+        self,
+        *,
+        limit: int = 50,
+        include_matched: bool = False,
+        now_ms: int | None = None,
+    ) -> list[dict]:
+        """Return newest motion events with live, camera-bound sale matching."""
+        limit = max(1, min(int(limit), 250))
+        now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        matched_filter = "" if include_matched else "AND matched.id IS NULL "
+        query = (
+            "SELECT event.*, matched.id AS matched_transaction_id, "
+            "matched.ts_ms AS matched_transaction_ts_ms "
+            "FROM protect_motion_events event "
+            "LEFT JOIN transactions matched ON matched.id = ("
+            "SELECT candidate.id FROM transactions candidate "
+            "WHERE candidate.camera_id = event.camera_id "
+            "AND candidate.ts_ms BETWEEN "
+            "event.event_ts_ms - event.match_window_ms "
+            "AND event.event_ts_ms + event.match_window_ms "
+            "ORDER BY ABS(candidate.ts_ms - event.event_ts_ms), "
+            "candidate.id LIMIT 1) "
+            "WHERE event.expires_at_ms > ? "
+            + matched_filter
+            + "ORDER BY event.event_ts_ms DESC, event.id DESC LIMIT ?"
+        )
+        with self._lock:
+            self._db.execute(
+                "DELETE FROM protect_motion_events WHERE expires_at_ms <= ?",
+                (now_ms,),
+            )
+            rows = self._db.execute(query, (now_ms, limit)).fetchall()
+            self._db.commit()
+        events = []
+        for row in rows:
+            event = dict(row)
+            matched_id = event["matched_transaction_id"]
+            if matched_id:
+                state = "matched"
+                event["transaction_delta_ms"] = (
+                    int(event["matched_transaction_ts_ms"])
+                    - int(event["event_ts_ms"])
+                )
+            elif now_ms < int(event["evaluate_after_ms"]):
+                state = "pending"
+                event["transaction_delta_ms"] = None
+            else:
+                state = "flagged"
+                event["transaction_delta_ms"] = None
+            event["state"] = state
+            try:
+                event["device_identifiers"] = json.loads(
+                    event["device_identifiers"]
+                )
+            except (TypeError, json.JSONDecodeError):
+                event["device_identifiers"] = []
+            events.append(event)
+        return events
+
+    def motion_alert_summary(self, *, now_ms: int | None = None) -> dict:
+        """Count live pending, flagged, and transaction-matched motion events."""
+        now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        query = (
+            "SELECT "
+            "COALESCE(SUM(CASE WHEN matched.id IS NOT NULL THEN 1 ELSE 0 END), 0) "
+            "AS matched, "
+            "COALESCE(SUM(CASE WHEN matched.id IS NULL "
+            "AND event.evaluate_after_ms > ? THEN 1 ELSE 0 END), 0) AS pending, "
+            "COALESCE(SUM(CASE WHEN matched.id IS NULL "
+            "AND event.evaluate_after_ms <= ? THEN 1 ELSE 0 END), 0) AS flagged "
+            "FROM protect_motion_events event "
+            "LEFT JOIN transactions matched ON matched.id = ("
+            "SELECT candidate.id FROM transactions candidate "
+            "WHERE candidate.camera_id = event.camera_id "
+            "AND candidate.ts_ms BETWEEN "
+            "event.event_ts_ms - event.match_window_ms "
+            "AND event.event_ts_ms + event.match_window_ms "
+            "ORDER BY ABS(candidate.ts_ms - event.event_ts_ms), "
+            "candidate.id LIMIT 1) WHERE event.expires_at_ms > ?"
+        )
+        with self._lock:
+            self._db.execute(
+                "DELETE FROM protect_motion_events WHERE expires_at_ms <= ?",
+                (now_ms,),
+            )
+            row = self._db.execute(
+                query,
+                (now_ms, now_ms, now_ms),
+            ).fetchone()
+            self._db.commit()
+        return {
+            "matched": int(row["matched"]),
+            "pending": int(row["pending"]),
+            "flagged": int(row["flagged"]),
+        }
 
     def create_square_oauth_state(self, state: str) -> None:
         """Retain one hashed, expiring OAuth state within a bounded set."""
@@ -1992,6 +2416,7 @@ class Store:
                     # Delete children explicitly because older databases did
                     # not enable SQLite foreign-key enforcement.
                     self._db.execute("DELETE FROM thumbnail_retries")
+                    self._db.execute("DELETE FROM protect_motion_events")
                     if self._table_exists_locked(PROTECT_EVIDENCE_RETIRED_TABLE):
                         # Protect console isolation tracks transaction IDs
                         # whose old-console evidence must stay retired. A new

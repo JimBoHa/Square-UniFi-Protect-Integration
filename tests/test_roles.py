@@ -33,6 +33,9 @@ ADMIN_ENDPOINTS = frozenset(
         ("PUT", "/api/settings/square"),
         ("GET", "/api/settings/deep-link"),
         ("PUT", "/api/settings/deep-link"),
+        ("GET", "/api/settings/protect/motion-webhook"),
+        ("PUT", "/api/settings/protect/motion-webhook"),
+        ("DELETE", "/api/settings/protect/motion-webhook"),
         ("POST", "/api/settings/square/webhook/register"),
         ("PUT", "/api/settings/square/oauth-app"),
         ("GET", "/oauth/square/start"),
@@ -61,6 +64,7 @@ VIEWER_ENDPOINTS = frozenset(
         ("GET", "/api/session"),
         ("POST", "/api/logout"),
         ("GET", "/api/dashboard"),
+        ("GET", "/api/motion-alerts"),
         ("GET", "/api/transactions/export.csv"),
         ("GET", "/api/transactions"),
         ("POST", "/api/transactions"),
@@ -77,6 +81,8 @@ PUBLIC_ENDPOINTS = frozenset(
         ("POST", "/api/setup"),
         ("POST", "/api/login"),
         ("POST", "/webhooks/square"),
+        ("GET", "/webhooks/protect/motion"),
+        ("POST", "/webhooks/protect/motion"),
     }
 )
 
@@ -158,6 +164,7 @@ def test_viewer_can_read_transaction_evidence_but_cannot_force_sync(configured):
 
     responses = (
         configured.get("/api/dashboard"),
+        configured.get("/api/motion-alerts"),
         configured.get("/api/transactions"),
         configured.post("/api/transactions", json={}),
         configured.get("/api/transactions/export.csv"),
@@ -219,6 +226,13 @@ def test_every_application_route_has_an_explicit_authorization_class(client):
         ),
         ("GET", "/api/settings/deep-link", None),
         ("PUT", "/api/settings/deep-link", {"template": ""}),
+        ("GET", "/api/settings/protect/motion-webhook", None),
+        (
+            "PUT",
+            "/api/settings/protect/motion-webhook",
+            {"camera_id": "cam1aaaaaaaaaaaaaaaaaaaaa"},
+        ),
+        ("DELETE", "/api/settings/protect/motion-webhook", None),
         (
             "POST",
             "/api/settings/square/webhook/register",

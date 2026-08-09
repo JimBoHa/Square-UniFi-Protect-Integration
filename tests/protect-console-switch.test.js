@@ -179,6 +179,25 @@ test("old location response reloads instead of rendering after account switch", 
   assert.equal(published, false);
 });
 
+test("old motion configuration reloads after a Protect console switch", () => {
+  let published = false;
+  const decision = publishCoherentSettingsLoad(
+    1,
+    1,
+    {
+      cameraGeneration: "protect-generation-2",
+      motionGeneration: "protect-generation-1",
+      locationRevision: "square-revision-2",
+      mappingGeneration: "protect-generation-2",
+      mappingRevision: "square-revision-2",
+    },
+    () => { published = true; },
+  );
+
+  assert.equal(decision, "reload");
+  assert.equal(published, false);
+});
+
 test("coherent provider snapshots publish mapping save generations", () => {
   let published = false;
   const decision = publishCoherentSettingsLoad(

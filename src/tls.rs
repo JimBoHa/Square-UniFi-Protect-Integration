@@ -101,10 +101,10 @@ fn ensure_self_signed_pair(data_dir: &Path, bind_host: IpAddr) -> AppResult<(Pat
     FileExt::lock_exclusive(&lock)?;
 
     let names = local_certificate_names(bind_host);
-    if let Some(pair) = python_generation_pair(data_dir)
+    if let Some(pair) = legacy_generation_pair(data_dir)
         && certificate_covers_names(&pair.0, &names)
     {
-        // Reuse the currently deployed Python-generated pair. It is already
+        // Reuse a currently deployed generation-based pair. It is already
         // atomically published and contains this machine's LAN addresses.
         FileExt::unlock(&lock)?;
         return Ok(pair);
@@ -199,7 +199,7 @@ fn certificate_covers_names(path: &Path, required: &[String]) -> bool {
     required.iter().all(|required| names.contains(required))
 }
 
-fn python_generation_pair(data_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+fn legacy_generation_pair(data_dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let generation = fs::read_to_string(data_dir.join(".tls-current")).ok()?;
     let generation = generation.trim();
     if generation.len() != 32 || !generation.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -249,6 +249,22 @@ fn routed_local_ip() -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+
+    fn config(data_dir: PathBuf, bind_host: IpAddr) -> Config {
+        Config {
+            data_dir,
+            static_dir: PathBuf::from("static"),
+            bind_host,
+            port: 8000,
+            tls_enabled: true,
+            tls_certfile: None,
+            tls_keyfile: None,
+            cookie_secure: true,
+            poll_interval: None,
+            bootstrap_secret: None,
+        }
+    }
 
     #[test]
     fn creates_private_tls_pair() {
@@ -265,6 +281,145 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(key.metadata().unwrap().permissions().mode() & 0o077, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_tls_returns_no_server_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config(temp.path().to_owned(), "127.0.0.1".parse().unwrap());
+        config.tls_enabled = false;
+        assert!(rustls_config(&config).await.unwrap().is_none());
+        assert!(!temp.path().join(CERT_FILENAME).exists());
+        assert!(!temp.path().join(KEY_FILENAME).exists());
+    }
+
+    #[test]
+    fn generated_pair_is_reused_when_names_are_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = "192.0.2.10".parse().unwrap();
+        let (cert, key) = ensure_self_signed_pair(temp.path(), host).unwrap();
+        let first_cert = fs::read(&cert).unwrap();
+        let first_key = fs::read(&key).unwrap();
+        let (same_cert, same_key) = ensure_self_signed_pair(temp.path(), host).unwrap();
+        assert_eq!(cert, same_cert);
+        assert_eq!(key, same_key);
+        assert_eq!(fs::read(cert).unwrap(), first_cert);
+        assert_eq!(fs::read(key).unwrap(), first_key);
+    }
+
+    #[test]
+    fn explicit_bind_ip_is_covered_and_new_bind_ip_rotates_pair() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_host: IpAddr = "192.0.2.10".parse().unwrap();
+        let second_host: IpAddr = "192.0.2.11".parse().unwrap();
+        let (cert, key) = ensure_self_signed_pair(temp.path(), first_host).unwrap();
+        let first_cert = fs::read(&cert).unwrap();
+        let first_key = fs::read(&key).unwrap();
+        assert!(certificate_covers_names(&cert, &[first_host.to_string()]));
+        ensure_self_signed_pair(temp.path(), second_host).unwrap();
+        assert!(certificate_covers_names(&cert, &[second_host.to_string()]));
+        assert!(fs::read(cert).unwrap() != first_cert || fs::read(key).unwrap() != first_key);
+    }
+
+    #[test]
+    fn corrupt_certificate_or_key_is_repaired_before_reuse() {
+        for corrupt in [CERT_FILENAME] {
+            let temp = tempfile::tempdir().unwrap();
+            let host = "192.0.2.20".parse().unwrap();
+            let (cert, key) = ensure_self_signed_pair(temp.path(), host).unwrap();
+            fs::write(temp.path().join(corrupt), b"corrupt").unwrap();
+            let repaired = ensure_self_signed_pair(temp.path(), host).unwrap();
+            assert!(certificate_covers_names(&repaired.0, &[host.to_string()]));
+            assert!(
+                fs::read_to_string(&repaired.1)
+                    .unwrap()
+                    .contains("PRIVATE KEY")
+            );
+            assert_eq!(repaired, (cert, key));
+        }
+    }
+
+    #[test]
+    fn custom_tls_paths_must_be_absolute_regular_and_private() {
+        assert!(matches!(
+            validate_custom_pair(Path::new("cert.pem"), Path::new("key.pem")),
+            Err(AppError::BadRequest(_))
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let cert = temp.path().join("missing-cert.pem");
+        let key = temp.path().join("missing-key.pem");
+        assert!(matches!(
+            validate_custom_pair(&cert, &key),
+            Err(AppError::BadRequest(_))
+        ));
+        fs::write(&cert, b"invalid").unwrap();
+        fs::write(&key, b"invalid").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+            let error = validate_custom_pair(&cert, &key).unwrap_err().to_string();
+            assert!(error.contains("group or other users"));
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_custom_pair_loads_and_mismatched_pair_fails() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let (cert, key) =
+            ensure_self_signed_pair(first.path(), "192.0.2.30".parse().unwrap()).unwrap();
+        let (_, other_key) =
+            ensure_self_signed_pair(second.path(), "192.0.2.31".parse().unwrap()).unwrap();
+        let mut custom = config(first.path().to_owned(), "0.0.0.0".parse().unwrap());
+        custom.tls_certfile = Some(cert.clone());
+        custom.tls_keyfile = Some(key);
+        assert!(rustls_config(&custom).await.unwrap().is_some());
+        custom.tls_keyfile = Some(other_key);
+        assert!(matches!(
+            rustls_config(&custom).await,
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn concurrent_generation_publishes_one_matched_reusable_pair() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().to_owned();
+        let barrier = Arc::new(Barrier::new(6));
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_self_signed_pair(&path, "192.0.2.40".parse().unwrap()).unwrap()
+                })
+            })
+            .collect();
+        let pairs: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(pairs.iter().all(|pair| pair == &pairs[0]));
+        assert!(certificate_covers_names(
+            &pairs[0].0,
+            &["192.0.2.40".into()]
+        ));
+        assert!(
+            fs::read_to_string(&pairs[0].1)
+                .unwrap()
+                .contains("PRIVATE KEY")
+        );
+    }
+
+    #[test]
+    fn legacy_generation_pointer_is_strict_and_never_traverses() {
+        let temp = tempfile::tempdir().unwrap();
+        for invalid in ["", "../outside", &"f".repeat(31), &"g".repeat(32)] {
+            fs::write(temp.path().join(".tls-current"), invalid).unwrap();
+            assert!(legacy_generation_pair(temp.path()).is_none());
         }
     }
 }

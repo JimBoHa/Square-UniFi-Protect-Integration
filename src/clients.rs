@@ -20,7 +20,7 @@ const SQUARE_SANDBOX_URL: &str = "https://connect.squareupsandbox.com";
 #[derive(Clone)]
 pub struct SquareClient {
     client: Client,
-    base_url: &'static str,
+    base_url: String,
     pub environment: String,
 }
 
@@ -53,7 +53,7 @@ impl SquareClient {
             .map_err(AppError::internal)?;
         Ok(Self {
             client,
-            base_url,
+            base_url: base_url.to_owned(),
             environment: environment.to_owned(),
         })
     }
@@ -310,7 +310,7 @@ impl SquareClient {
 
 #[derive(Clone)]
 pub struct ProtectClient {
-    host: String,
+    base_url: String,
     username: String,
     password: String,
     api_key: Option<String>,
@@ -345,7 +345,7 @@ impl ProtectClient {
             .build()
             .map_err(AppError::internal)?;
         Ok(Self {
-            host,
+            base_url: format!("https://{host}"),
             username: username.to_owned(),
             password: password.to_owned(),
             api_key: api_key
@@ -359,7 +359,7 @@ impl ProtectClient {
     }
 
     async fn login(&self) -> AppResult<()> {
-        let url = format!("https://{}/api/auth/login", self.host);
+        let url = format!("{}/api/auth/login", self.base_url);
         for attempt in 0..=3 {
             let response = self
                 .session_client
@@ -414,7 +414,7 @@ impl ProtectClient {
         for attempt in 0..=1 {
             let mut request = self
                 .session_client
-                .request(method.clone(), format!("https://{}{path}", self.host));
+                .request(method.clone(), format!("{}{path}", self.base_url));
             if let Some(csrf) = self.csrf_token.lock().await.clone() {
                 request = request.header("x-csrf-token", csrf);
             }
@@ -534,7 +534,7 @@ impl ProtectClient {
         })?;
         let response = self
             .integration_client
-            .request(method, format!("https://{}{path}", self.host))
+            .request(method, format!("{}{path}", self.base_url))
             .header("x-api-key", key)
             .header(header::ACCEPT, "application/json")
             .send()
@@ -1037,6 +1037,146 @@ fn is_complete_jpeg(content: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, body::Body, http::Request, response::IntoResponse, routing::any};
+    use http_body_util::BodyExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::TcpListener;
+
+    fn base_payment() -> Value {
+        json!({
+            "id": "PAY_1",
+            "created_at": "2026-07-16T15:30:00.000Z",
+            "updated_at": "2026-07-16T15:31:00.000Z",
+            "amount_money": {"amount": 99, "currency": "USD"},
+            "status": "COMPLETED",
+            "location_id": "LOC_1"
+        })
+    }
+
+    fn minimal_jpeg() -> Vec<u8> {
+        vec![
+            0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11,
+            0x00, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x01, 0x02, 0xff,
+            0xd9,
+        ]
+    }
+
+    async fn spawn_http(router: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    async fn square_with_router(router: Router) -> SquareClient {
+        let mut client = SquareClient::new("sandbox-access-token", "sandbox").unwrap();
+        client.base_url = spawn_http(router).await;
+        client
+    }
+
+    async fn protect_with_router(router: Router, api_key: Option<&str>) -> ProtectClient {
+        let mut client =
+            ProtectClient::new("protect.test", "Square", "password", true, api_key).unwrap();
+        client.base_url = spawn_http(router).await;
+        client
+    }
+
+    #[test]
+    fn square_environment_and_tokens_are_strictly_validated() {
+        assert_eq!(
+            square_base_url("production").unwrap(),
+            "https://connect.squareup.com"
+        );
+        assert_eq!(
+            square_base_url("sandbox").unwrap(),
+            "https://connect.squareupsandbox.com"
+        );
+        for environment in ["", "Sandbox", "test", "production "] {
+            assert!(matches!(
+                square_base_url(environment),
+                Err(AppError::Unprocessable(_))
+            ));
+        }
+        for token in ["", "line\nfeed", "delete\u{7f}"] {
+            assert!(matches!(
+                SquareClient::new(token, "sandbox"),
+                Err(AppError::Unprocessable(_))
+            ));
+        }
+        assert!(SquareClient::new("sandbox-token", "sandbox").is_ok());
+    }
+
+    #[test]
+    fn protect_host_accepts_runtime_hosts_and_rejects_url_injection() {
+        for (input, expected) in [
+            ("10.255.8.123", "10.255.8.123"),
+            (" protect.lan ", "protect.lan"),
+            ("protect.lan:7443", "protect.lan:7443"),
+            ("[fd00::1234]:443", "[fd00::1234]:443"),
+        ] {
+            assert_eq!(validate_protect_host(input).unwrap(), expected);
+        }
+        for input in [
+            "",
+            "https://protect.lan",
+            "protect.lan/path",
+            "user@protect.lan",
+            "protect.lan?x=1",
+            "protect.lan#fragment",
+            "protect .lan",
+            "protect.lan:65536",
+        ] {
+            assert!(
+                matches!(
+                    validate_protect_host(input),
+                    Err(AppError::Unprocessable(_))
+                ),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn alarm_trigger_ids_allow_admin_labels_but_reject_controls_and_bounds() {
+        for value in [
+            "sale",
+            "Barn East Sale",
+            "motion/webhook:flag",
+            " webhook id ",
+        ] {
+            assert!(!validate_alarm_trigger_id(value).unwrap().is_empty());
+        }
+        for value in ["", " \t ", "sale\nother", "sale\u{7f}other"] {
+            assert!(matches!(
+                validate_alarm_trigger_id(value),
+                Err(AppError::Unprocessable(_))
+            ));
+        }
+        assert!(matches!(
+            validate_alarm_trigger_id(&"A".repeat(257)),
+            Err(AppError::Unprocessable(_))
+        ));
+    }
+
+    #[test]
+    fn protect_api_key_validation_fails_closed() {
+        assert!(ProtectClient::new("protect.lan", "Square", "password", false, None).is_ok());
+        assert!(
+            ProtectClient::new("protect.lan", "Square", "password", true, Some(" key ")).is_ok()
+        );
+        assert!(matches!(
+            ProtectClient::new("protect.lan", "Square", "password", true, Some("bad\nkey")),
+            Err(AppError::Unprocessable(_))
+        ));
+        let oversized = "x".repeat(513);
+        assert!(matches!(
+            ProtectClient::new("protect.lan", "Square", "password", true, Some(&oversized)),
+            Err(AppError::Unprocessable(_))
+        ));
+    }
 
     #[test]
     fn square_signature_matches_reference_protocol() {
@@ -1067,6 +1207,575 @@ mod tests {
         let facts = parse_payment(&payment).unwrap();
         assert_eq!(facts.id, "PAY_1");
         assert_eq!(facts.amount, 99);
+    }
+
+    #[test]
+    fn payment_prefers_tip_inclusive_total_and_normalizes_safe_card_facts() {
+        let mut payment = base_payment();
+        payment["total_money"] = json!({"amount": 124, "currency": "USD"});
+        payment["card_details"] = json!({"card": {"last_4": "4242", "cardholder_name": "Private"}});
+        payment["device_details"] = json!({"device_id": "DEVICE_1", "device_name": "Barn East"});
+        payment["receipt_url"] = json!("https://square.example/receipt");
+        let facts = parse_payment(&payment).unwrap();
+        assert_eq!(facts.amount, 124);
+        assert_eq!(facts.currency, "USD");
+        assert_eq!(facts.card_last4, "4242");
+        assert_eq!(facts.device_id, "DEVICE_1");
+        assert_eq!(facts.device_name, "Barn East");
+        assert_eq!(facts.receipt_url, "https://square.example/receipt");
+    }
+
+    #[test]
+    fn offline_payment_uses_client_timestamp_with_server_fallback() {
+        let mut payment = base_payment();
+        payment["is_offline_payment"] = json!(true);
+        payment["offline_payment_details"] =
+            json!({"client_created_at": "2026-07-16T15:00:00-07:00"});
+        let facts = parse_payment(&payment).unwrap();
+        assert_eq!(facts.created_at, "2026-07-16T15:00:00-07:00");
+        assert_eq!(
+            facts.ts_ms,
+            DateTime::parse_from_rfc3339("2026-07-16T15:00:00-07:00")
+                .unwrap()
+                .timestamp_millis()
+        );
+
+        payment["offline_payment_details"] = json!({});
+        let fallback = parse_payment(&payment).unwrap();
+        assert_eq!(fallback.created_at, "2026-07-16T15:30:00.000Z");
+    }
+
+    #[test]
+    fn refund_totals_are_normalized_and_currency_fenced() {
+        let mut payment = base_payment();
+        assert_eq!(parse_payment(&payment).unwrap().refunded_amount, 0);
+        payment["refunded_money"] = json!({"amount": 25, "currency": "USD"});
+        assert_eq!(parse_payment(&payment).unwrap().refunded_amount, 25);
+        for refunded in [
+            json!({"amount": -1, "currency": "USD"}),
+            json!({"amount": "25", "currency": "USD"}),
+            json!({"amount": 25, "currency": "usd"}),
+            json!({"amount": 25, "currency": "CAD"}),
+            json!({"amount": 25}),
+        ] {
+            payment["refunded_money"] = refunded;
+            assert!(matches!(
+                parse_payment(&payment),
+                Err(AppError::Unprocessable(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn payment_required_and_optional_fields_reject_ambiguous_types() {
+        for (path, invalid) in [
+            ("id", json!(1)),
+            ("created_at", json!(null)),
+            ("updated_at", json!([])),
+            ("status", json!({})),
+            ("location_id", json!(false)),
+            ("receipt_url", json!(42)),
+        ] {
+            let mut payment = base_payment();
+            payment[path] = invalid;
+            assert!(
+                matches!(parse_payment(&payment), Err(AppError::Unprocessable(_))),
+                "{path}"
+            );
+        }
+        assert!(matches!(
+            parse_payment(&json!([])),
+            Err(AppError::Unprocessable(_))
+        ));
+    }
+
+    #[test]
+    fn payment_timestamps_require_explicit_rfc3339_timezone() {
+        let mut payment = base_payment();
+        payment["created_at"] = json!("2026-07-16T15:30:00");
+        assert!(matches!(
+            parse_payment(&payment),
+            Err(AppError::Unprocessable(_))
+        ));
+        payment["created_at"] = json!("2026-07-16T15:30:00-07:00");
+        assert!(parse_payment(&payment).is_ok());
+    }
+
+    #[test]
+    fn oauth_authorization_url_is_environment_bound_and_stateful() {
+        let url =
+            Url::parse(&oauth_authorize_url("sandbox", "sandbox-app-id", "opaque-state").unwrap())
+                .unwrap();
+        assert_eq!(url.host_str(), Some("connect.squareupsandbox.com"));
+        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            query.get("client_id").map(String::as_str),
+            Some("sandbox-app-id")
+        );
+        assert_eq!(query.get("state").map(String::as_str), Some("opaque-state"));
+        assert_eq!(query.get("session").map(String::as_str), Some("false"));
+        let scope = query.get("scope").unwrap();
+        assert!(scope.contains("MERCHANT_PROFILE_READ"));
+        assert!(scope.contains("PAYMENTS_READ"));
+    }
+
+    #[test]
+    fn square_response_shape_helpers_fail_closed() {
+        assert!(object_array(&json!({}), "payments").unwrap().is_empty());
+        assert!(
+            object_array(&json!({"payments": null}), "payments")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            object_array(&json!({"payments": []}), "payments")
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(matches!(
+            object_array(&json!({"payments": {}}), "payments"),
+            Err(AppError::Upstream(_))
+        ));
+        assert!(
+            optional_object(&json!({"value": null}), "value")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            optional_object(&json!({"value": []}), "value"),
+            Err(AppError::Unprocessable(_))
+        ));
+    }
+
+    #[test]
+    fn retry_delay_is_exponential_bounded_and_honors_safe_retry_after() {
+        assert_eq!(retry_delay(0, None), Duration::from_millis(500));
+        assert_eq!(retry_delay(1, None), Duration::from_secs(1));
+        assert_eq!(retry_delay(20, None), Duration::from_secs(10));
+        let two = header::HeaderValue::from_static("2");
+        let huge = header::HeaderValue::from_static("9999");
+        let invalid = header::HeaderValue::from_static("nan");
+        assert_eq!(retry_delay(0, Some(&two)), Duration::from_secs(2));
+        assert_eq!(retry_delay(0, Some(&huge)), Duration::from_secs(10));
+        assert_eq!(retry_delay(0, Some(&invalid)), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn jpeg_validator_requires_frame_scan_data_and_terminal_eoi() {
+        let valid = minimal_jpeg();
+        assert!(is_complete_jpeg(&valid));
+        assert!(!is_complete_jpeg(b"not-jpeg"));
+        assert!(!is_complete_jpeg(&valid[..valid.len() - 2]));
+        let mut trailing = valid.clone();
+        trailing.extend_from_slice(b"trailing");
+        assert!(is_complete_jpeg(&trailing));
+        let mut hidden = valid.clone();
+        hidden[25] = 0xff;
+        hidden[26] = 0xd9;
+        assert!(!is_complete_jpeg(&hidden));
+    }
+
+    #[test]
+    fn webhook_signature_rejects_empty_and_wrong_length_inputs() {
+        assert!(!verify_square_webhook_signature(
+            "",
+            "https://example",
+            b"{}",
+            "x"
+        ));
+        assert!(!verify_square_webhook_signature(
+            "key",
+            "https://example",
+            b"{}",
+            ""
+        ));
+        assert!(!verify_square_webhook_signature(
+            "key",
+            "https://example",
+            b"{}",
+            "short"
+        ));
+    }
+
+    #[tokio::test]
+    async fn square_locations_send_auth_version_and_normalize_allowlisted_fields() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = observed.clone();
+        let router = Router::new().fallback(any(move |request: Request<Body>| {
+            let capture = capture.clone();
+            async move {
+                capture.lock().unwrap().push((
+                    request.uri().to_string(),
+                    request
+                        .headers()
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned(),
+                    request
+                        .headers()
+                        .get("square-version")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned(),
+                ));
+                axum::Json(json!({
+                    "locations": [{
+                        "id": "LOC_1",
+                        "name": "Barn East",
+                        "status": "ACTIVE",
+                        "address": {"private": "not returned"}
+                    }]
+                }))
+            }
+        }));
+        let client = square_with_router(router).await;
+        let locations = client.list_locations().await.unwrap();
+        assert_eq!(
+            locations,
+            [json!({"id": "LOC_1", "name": "Barn East", "status": "ACTIVE"})]
+        );
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed[0].0, "/v2/locations");
+        assert_eq!(observed[0].1, "Bearer sandbox-access-token");
+        assert_eq!(observed[0].2, SQUARE_VERSION);
+    }
+
+    #[tokio::test]
+    async fn square_payment_page_preserves_filters_and_rejects_bad_cursor_shape() {
+        let uris = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = uris.clone();
+        let router = Router::new().fallback(any(move |request: Request<Body>| {
+            let capture = capture.clone();
+            async move {
+                capture.lock().unwrap().push(request.uri().to_string());
+                axum::Json(json!({"payments": [{"id": "PAY_1"}], "cursor": "next-page"}))
+            }
+        }));
+        let client = square_with_router(router).await;
+        let (payments, cursor) = client
+            .payment_page(
+                Some("LOC_1"),
+                Some("2026-07-16T00:00:00Z"),
+                Some("current-page"),
+                500,
+            )
+            .await
+            .unwrap();
+        assert_eq!(payments, [json!({"id": "PAY_1"})]);
+        assert_eq!(cursor.as_deref(), Some("next-page"));
+        let uri = &uris.lock().unwrap()[0];
+        for query in [
+            "sort_field=UPDATED_AT",
+            "sort_order=ASC",
+            "limit=100",
+            "location_id=LOC_1",
+            "updated_at_begin_time=2026-07-16T00%3A00%3A00Z",
+            "cursor=current-page",
+        ] {
+            assert!(uri.contains(query), "missing {query} in {uri}");
+        }
+
+        let router = Router::new().fallback(any(|| async {
+            axum::Json(json!({"payments": [], "cursor": []}))
+        }));
+        let malformed = square_with_router(router).await;
+        assert!(matches!(
+            malformed.payment_page(None, None, None, 100).await,
+            Err(AppError::Upstream(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn square_webhook_subscription_pagination_exhausts_and_detects_cycles() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sequence = calls.clone();
+        let router = Router::new().fallback(any(move |request: Request<Body>| {
+            let sequence = sequence.clone();
+            async move {
+                let call = sequence.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    assert!(!request.uri().to_string().contains("cursor="));
+                    axum::Json(json!({
+                        "subscriptions": [{"id": "SUB_1"}],
+                        "cursor": "next-page"
+                    }))
+                } else {
+                    assert!(request.uri().to_string().contains("cursor=next-page"));
+                    axum::Json(json!({"subscriptions": [{"id": "SUB_2"}]}))
+                }
+            }
+        }));
+        let client = square_with_router(router).await;
+        assert_eq!(client.list_webhook_subscriptions().await.unwrap().len(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let router = Router::new().fallback(any(|| async {
+            axum::Json(json!({"subscriptions": [], "cursor": "loop"}))
+        }));
+        let looping = square_with_router(router).await;
+        assert!(matches!(
+            looping.list_webhook_subscriptions().await,
+            Err(AppError::Upstream(message)) if message.contains("repeated")
+        ));
+    }
+
+    #[tokio::test]
+    async fn square_retries_transient_status_and_normalizes_auth_and_json_errors() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sequence = calls.clone();
+        let router = Router::new().fallback(any(move || {
+            let sequence = sequence.clone();
+            async move {
+                if sequence.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(header::RETRY_AFTER, "0")],
+                        axum::Json(json!({"errors": []})),
+                    )
+                        .into_response()
+                } else {
+                    axum::Json(json!({"locations": []})).into_response()
+                }
+            }
+        }));
+        let client = square_with_router(router).await;
+        assert!(client.list_locations().await.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        for (status, expected) in [
+            (StatusCode::UNAUTHORIZED, "unauthorized"),
+            (StatusCode::FORBIDDEN, "forbidden"),
+            (StatusCode::SERVICE_UNAVAILABLE, "upstream"),
+        ] {
+            let router = Router::new().fallback(any(move || async move {
+                (status, axum::Json(json!({"error": true}))).into_response()
+            }));
+            let client = square_with_router(router).await;
+            let error = client.list_locations().await.unwrap_err();
+            assert!(
+                matches!(
+                    (&error, expected),
+                    (AppError::Unauthorized(_), "unauthorized")
+                        | (AppError::Forbidden(_), "forbidden")
+                        | (AppError::Upstream(_), "upstream")
+                ),
+                "{error:?}"
+            );
+        }
+        let router = Router::new().fallback(any(|| async {
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html")],
+                "<html>not json</html>",
+            )
+        }));
+        let client = square_with_router(router).await;
+        assert!(matches!(
+            client.list_locations().await,
+            Err(AppError::Upstream(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn square_webhook_writes_keep_idempotency_and_event_contracts() {
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = bodies.clone();
+        let router = Router::new().fallback(any(move |request: Request<Body>| {
+            let capture = capture.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                capture.lock().unwrap().push((
+                    path.clone(),
+                    serde_json::from_slice::<Value>(&body).unwrap(),
+                ));
+                axum::Json(json!({"subscription": {"id": "SUB_1"}}))
+            }
+        }));
+        let client = square_with_router(router).await;
+        client
+            .create_webhook_subscription("https://example.test/webhooks/square", "stable-key")
+            .await
+            .unwrap();
+        client
+            .update_webhook_subscription("SUB_1", "https://example.test/webhooks/square")
+            .await
+            .unwrap();
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies[0].0, "/v2/webhooks/subscriptions");
+        assert_eq!(bodies[0].1["idempotency_key"], "stable-key");
+        assert_eq!(
+            bodies[0].1["subscription"]["event_types"],
+            json!(["payment.created", "payment.updated"])
+        );
+        assert_eq!(bodies[1].0, "/v2/webhooks/subscriptions/SUB_1");
+        assert_eq!(bodies[1].1["subscription"]["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn protect_session_login_camera_normalization_and_relogin_are_native() {
+        let logins = Arc::new(AtomicUsize::new(0));
+        let bootstraps = Arc::new(AtomicUsize::new(0));
+        let csrf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let login_count = logins.clone();
+        let bootstrap_count = bootstraps.clone();
+        let observed_csrf = csrf.clone();
+        let router = Router::new().fallback(any(move |request: Request<Body>| {
+            let login_count = login_count.clone();
+            let bootstrap_count = bootstrap_count.clone();
+            let observed_csrf = observed_csrf.clone();
+            async move {
+                match request.uri().path() {
+                    "/api/auth/login" => {
+                        login_count.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            [
+                                ("x-csrf-token", "csrf-token"),
+                                ("set-cookie", "TOKEN=session; Path=/"),
+                            ],
+                            axum::Json(json!({"ok": true})),
+                        )
+                            .into_response()
+                    }
+                    "/proxy/protect/api/bootstrap" => {
+                        observed_csrf.lock().unwrap().push(
+                            request
+                                .headers()
+                                .get("x-csrf-token")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or("")
+                                .to_owned(),
+                        );
+                        if bootstrap_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                            StatusCode::UNAUTHORIZED.into_response()
+                        } else {
+                            axum::Json(json!({
+                                "nvr": {"id": "CONSOLE_1"},
+                                "cameras": [
+                                    {"id": "abc123", "name": "Barn East", "state": "CONNECTED"},
+                                    {"id": "def456", "name": "", "marketName": "G5 Dome"}
+                                ]
+                            }))
+                            .into_response()
+                        }
+                    }
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        }));
+        let client = protect_with_router(router, None).await;
+        let (cameras, console) = client.cameras_with_console_identity().await.unwrap();
+        assert_eq!(logins.load(Ordering::SeqCst), 2);
+        assert_eq!(bootstraps.load(Ordering::SeqCst), 2);
+        assert_eq!(console.as_deref(), Some("CONSOLE_1"));
+        assert_eq!(cameras[0]["name"], "Barn East");
+        assert_eq!(cameras[1]["name"], "G5 Dome");
+        assert!(
+            csrf.lock()
+                .unwrap()
+                .iter()
+                .all(|value| value == "csrf-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn protect_historical_snapshot_uses_recording_endpoint_and_validates_jpeg() {
+        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = paths.clone();
+        let jpeg = minimal_jpeg();
+        let router = Router::new().fallback(any(move |request: Request<Body>| {
+            let capture = capture.clone();
+            let jpeg = jpeg.clone();
+            async move {
+                let path = request.uri().to_string();
+                capture.lock().unwrap().push(path.clone());
+                if path == "/api/auth/login" {
+                    return (StatusCode::OK, [("x-csrf-token", "csrf")], Vec::new())
+                        .into_response();
+                }
+                if path.contains("recording-snapshot?ts=1234") {
+                    return (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "image/jpeg; charset=binary")],
+                        jpeg,
+                    )
+                        .into_response();
+                }
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }));
+        let client = protect_with_router(router, None).await;
+        assert_eq!(
+            client.snapshot("abc123", Some(1234)).await.unwrap(),
+            minimal_jpeg()
+        );
+        assert!(
+            paths
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.contains("/cameras/abc123/recording-snapshot?ts=1234"))
+        );
+
+        let router = Router::new().fallback(any(|request: Request<Body>| async move {
+            if request.uri().path() == "/api/auth/login" {
+                (StatusCode::OK, [("x-csrf-token", "csrf")], Vec::new()).into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }));
+        let missing = protect_with_router(router, None).await;
+        assert!(matches!(
+            missing.snapshot("abc123", Some(1234)).await,
+            Err(AppError::Upstream(message)) if message.contains("No recording available")
+        ));
+    }
+
+    #[tokio::test]
+    async fn protect_integration_api_uses_only_api_key_and_encodes_alarm_id() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = requests.clone();
+        let router = Router::new().fallback(any(move |request: Request<Body>| {
+            let capture = capture.clone();
+            async move {
+                capture.lock().unwrap().push((
+                    request.uri().to_string(),
+                    request
+                        .headers()
+                        .get("x-api-key")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned(),
+                    request.headers().get(header::COOKIE).is_some(),
+                ));
+                if request.uri().path().ends_with("/meta/info") {
+                    axum::Json(json!({"applicationVersion": "7.1.87"})).into_response()
+                } else {
+                    StatusCode::NO_CONTENT.into_response()
+                }
+            }
+        }));
+        let client = protect_with_router(router, Some("integration-key")).await;
+        assert_eq!(
+            client.integration_info().await.unwrap()["applicationVersion"],
+            "7.1.87"
+        );
+        client.trigger_alarm("Barn-East/Sale").await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.1 == "integration-key")
+        );
+        assert!(requests.iter().all(|request| !request.2));
+        assert!(
+            requests[1].0.ends_with("/Barn-East%2FSale"),
+            "unexpected alarm path: {:?}",
+            requests[1].0
+        );
     }
 
     #[test]

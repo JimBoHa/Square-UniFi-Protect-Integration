@@ -1,8 +1,8 @@
 //! Rust backend for Square × UniFi Protect.
 //!
 //! The browser assets and SQLite layout intentionally remain compatible with
-//! the original Python service. This lets an installation roll forward or
-//! back without re-entering credentials or resetting local accounts.
+//! the legacy service. This lets an installation upgrade without re-entering
+//! credentials or resetting local accounts.
 
 pub mod clients;
 pub mod config;

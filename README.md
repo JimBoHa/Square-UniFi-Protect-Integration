@@ -104,11 +104,11 @@ cargo run --locked --release
 ```
 
 Install the current stable Rust toolchain from [rustup.rs](https://rustup.rs/)
-if `cargo` is not already available. The former Python backend remains in the
-repository only as a rollback and behavioral-contract implementation. The
-primary server, provider clients, security layer, SQLite store, synchronization
-engine, webhooks, TLS, thumbnail pipeline, macOS menu-bar app, and supported
-installers use native Rust binaries.
+if `cargo` is not already available. The server, provider clients, security
+layer, SQLite store, synchronization engine, webhooks, TLS, thumbnail pipeline,
+macOS menu-bar app, supported installers, and test harness are implemented in
+Rust. Browser assets remain JavaScript and are behavior-tested by Rust tests
+that invoke Node as the JavaScript engine.
 
 The bundled runner binds only to `127.0.0.1` by default. On first start it
 prints a generated one-time bootstrap secret in the server console. Copy that
@@ -384,11 +384,18 @@ The two are separate environments with separate tokens.
 ## Development
 
 ```bash
-.venv/bin/python -m pytest        # functional + security tests
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets
+cargo test --locked --features menubar --bin square-protect-menubar
 ```
 
-Tests run against mocked Square and UniFi Protect APIs. Passing tests do not
-validate firmware-specific snapshot or timeline behavior on real hardware.
+Install Node.js as well as Rust when running the full suite; the test cases and
+assertions are Rust, while browser-helper behavior executes in Node so the
+shipped JavaScript—not a reimplementation—is tested. Provider, persistence,
+security, packaging, browser-contract, TLS, and concurrency tests run locally
+without real Square or UniFi credentials. Passing tests do not validate
+firmware-specific snapshot or timeline behavior on real hardware.
 
 ## License
 

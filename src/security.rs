@@ -268,6 +268,7 @@ pub fn secure_file(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn password_hash_matches_python_storage_contract() {
@@ -275,6 +276,24 @@ mod tests {
         assert!(hash.starts_with("scrypt$"));
         assert!(verify_password("correct horse battery staple", &hash));
         assert!(!verify_password("wrong", &hash));
+    }
+
+    #[test]
+    fn password_hashes_are_salted_and_malformed_values_fail_closed() {
+        let first = hash_password("same-password").unwrap();
+        let second = hash_password("same-password").unwrap();
+        assert_ne!(first, second);
+        for malformed in [
+            "",
+            "scrypt",
+            "scrypt$00",
+            "scrypt$zz$00",
+            "scrypt$00$zz",
+            "scrypt$00$00$extra",
+            "pbkdf2$00$00",
+        ] {
+            assert!(!verify_password("same-password", malformed), "{malformed}");
+        }
     }
 
     #[test]
@@ -289,6 +308,163 @@ mod tests {
         let cipher = CredentialCipher::open(temp.path()).unwrap();
         let encrypted = cipher.encrypt("secret");
         assert_eq!(cipher.decrypt(&encrypted).unwrap(), "secret");
+    }
+
+    #[test]
+    fn credential_cipher_rejects_tampering_and_separates_hmac_domains() {
+        let temp = tempfile::tempdir().unwrap();
+        let cipher = CredentialCipher::open(temp.path()).unwrap();
+        let mut encrypted = cipher.encrypt("private credential").into_bytes();
+        let last = encrypted.len() - 1;
+        encrypted[last] = if encrypted[last] == b'A' { b'B' } else { b'A' };
+        assert!(
+            cipher
+                .decrypt(std::str::from_utf8(&encrypted).unwrap())
+                .is_err()
+        );
+
+        let payload = b"same-payload";
+        let first = cipher.keyed_hmac_hex(b"domain-one", payload).unwrap();
+        let second = cipher.keyed_hmac_hex(b"domain-two", payload).unwrap();
+        assert_eq!(first.len(), 64);
+        assert_ne!(first, second);
+        assert!(matches!(
+            cipher.keyed_hmac_hex(b"", payload),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            cipher.keyed_hmac_hex(b"bad\0domain", payload),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn credential_material_is_private_and_reused() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = CredentialCipher::open(temp.path()).unwrap();
+        let token = first.encrypt("persisted");
+        let second = CredentialCipher::open(temp.path()).unwrap();
+        assert_eq!(second.decrypt(&token).unwrap(), "persisted");
+        assert_eq!(
+            fs::read(temp.path().join(HMAC_SALT_FILENAME))
+                .unwrap()
+                .len(),
+            32
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(temp.path().join(KEY_FILENAME))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+            assert_eq!(
+                fs::metadata(temp.path().join(HMAC_SALT_FILENAME))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_cipher_opens_publish_one_compatible_keypair() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().to_owned();
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    CredentialCipher::open(&path).unwrap()
+                })
+            })
+            .collect();
+        let ciphers: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let token = ciphers[0].encrypt("shared");
+        assert!(
+            ciphers
+                .iter()
+                .all(|cipher| cipher.decrypt(&token).unwrap() == "shared")
+        );
+        assert_eq!(
+            fs::read_dir(&path)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn bootstrap_secret_is_bounded_one_time_and_constant_shape() {
+        let secret = "b".repeat(32);
+        let verifier = BootstrapSecretVerifier::new(Some(secret.clone()), false);
+        assert!(verifier.configured());
+        assert!(verifier.verify(&secret));
+        assert!(!verifier.verify(&format!("{}x", &secret[..31])));
+        verifier.clear();
+        assert!(!verifier.configured());
+        assert!(!verifier.verify(&secret));
+    }
+
+    #[test]
+    fn invalid_configured_bootstrap_secret_is_not_accepted() {
+        let verifier = BootstrapSecretVerifier::new(Some("too-short".into()), false);
+        assert!(!verifier.configured());
+        assert!(!verifier.verify("too-short"));
+        let oversized = "x".repeat(4097);
+        let verifier = BootstrapSecretVerifier::new(Some(oversized.clone()), false);
+        assert!(!verifier.configured());
+        assert!(!verifier.verify(&oversized));
+    }
+
+    #[test]
+    fn session_tokens_are_random_urlsafe_and_hash_deterministically() {
+        let first = new_session_token();
+        let second = new_session_token();
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 43);
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        );
+        assert_eq!(hash_session_token(&first), hash_session_token(&first));
+        assert_ne!(hash_session_token(&first), hash_session_token(&second));
+        assert_eq!(hash_session_token(&first).len(), 64);
+    }
+
+    #[test]
+    fn secure_helpers_repair_existing_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("private");
+        fs::create_dir(&directory).unwrap();
+        let file = directory.join("value");
+        fs::write(&file, b"secret").unwrap();
+        secure_dir(&directory).unwrap();
+        secure_file(&file).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o077,
+                0
+            );
+            assert_eq!(fs::metadata(file).unwrap().permissions().mode() & 0o077, 0);
+        }
     }
 
     #[test]

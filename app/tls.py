@@ -17,6 +17,8 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
+import stat
 import tempfile
 import threading
 import time
@@ -31,6 +33,8 @@ from cryptography.x509.oid import NameOID
 
 CERT_FILENAME = "tls-cert.pem"
 KEY_FILENAME = "tls-key.pem"
+CUSTOM_CERT_ENV = "SPI_TLS_CERTFILE"
+CUSTOM_KEY_ENV = "SPI_TLS_KEYFILE"
 _VALIDITY = datetime.timedelta(days=3650)
 _RENEWAL_MARGIN = datetime.timedelta(days=30)
 _GENERATIONS_DIRNAME = ".tls-material"
@@ -392,9 +396,53 @@ def ensure_self_signed_cert(data_dir: Path) -> tuple[Path, Path]:
         return _publish_pair(data_dir, cert_bytes, key_bytes)
 
 
+def _custom_tls_pair() -> tuple[Path, Path] | None:
+    """Validate an administrator-managed certificate and private key pair."""
+    cert_value = os.environ.get(CUSTOM_CERT_ENV, "").strip()
+    key_value = os.environ.get(CUSTOM_KEY_ENV, "").strip()
+    if not cert_value and not key_value:
+        return None
+    if not cert_value or not key_value:
+        raise ValueError(
+            f"{CUSTOM_CERT_ENV} and {CUSTOM_KEY_ENV} must be configured together"
+        )
+    cert_path = Path(cert_value).expanduser()
+    key_path = Path(key_value).expanduser()
+    if not cert_path.is_absolute() or not key_path.is_absolute():
+        raise ValueError("Custom TLS certificate and key paths must be absolute")
+    if not cert_path.is_file():
+        raise ValueError(f"Custom TLS certificate is not a file: {cert_path}")
+    if not key_path.is_file():
+        raise ValueError(f"Custom TLS private key is not a file: {key_path}")
+    if os.name == "posix" and stat.S_IMODE(key_path.stat().st_mode) & 0o077:
+        raise ValueError(
+            "Custom TLS private key must not be accessible to group or other users"
+        )
+    try:
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise ValueError("Custom TLS certificate is not valid PEM") from exc
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if cert.not_valid_before_utc > now:
+        raise ValueError("Custom TLS certificate is not valid yet")
+    if cert.not_valid_after_utc <= now:
+        raise ValueError("Custom TLS certificate has expired")
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert_path, key_path)
+    except (OSError, ssl.SSLError) as exc:
+        raise ValueError(
+            "Custom TLS certificate and private key could not be loaded as a pair"
+        ) from exc
+    return cert_path, key_path
+
+
 def uvicorn_tls_kwargs(data_dir: Path, enabled: bool) -> dict:
     """Uvicorn ssl kwargs for the runner; empty when TLS is disabled."""
     if not enabled:
+        if os.environ.get(CUSTOM_CERT_ENV) or os.environ.get(CUSTOM_KEY_ENV):
+            raise ValueError("SPI_TLS must be 1 when custom TLS files are configured")
         return {}
-    cert_path, key_path = ensure_self_signed_cert(data_dir)
+    custom_pair = _custom_tls_pair()
+    cert_path, key_path = custom_pair or ensure_self_signed_cert(data_dir)
     return {"ssl_certfile": str(cert_path), "ssl_keyfile": str(key_path)}

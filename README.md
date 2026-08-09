@@ -155,6 +155,8 @@ Then:
 | `SPI_COOKIE_SECURE` | `0` | Set `1` when serving over HTTPS |
 | `SPI_ENCRYPTION_KEY` | — | Fernet key overriding the on-disk key file |
 | `SPI_TLS` | `0` | Set `1` to serve HTTPS with an auto-generated self-signed certificate (via `python -m app` or the macOS launcher); enables Secure cookies automatically. |
+| `SPI_TLS_CERTFILE` | — | Absolute path to an administrator-managed PEM certificate or certificate chain. Requires `SPI_TLS=1` and `SPI_TLS_KEYFILE`. |
+| `SPI_TLS_KEYFILE` | — | Absolute path to the matching unencrypted PEM private key. The key must not be accessible to group or other users. |
 
 Every first-time setup requires the one-time secret. The configured bind host,
 socket peer, HTTP `Host`, optional `Origin`, and absence of forwarding headers
@@ -165,6 +167,14 @@ reverse/local proxies from removing the secret or transport requirements. The
 bundled runner retains Uvicorn's trusted-proxy defaults so login throttling can
 use a real forwarded client address from an explicitly trusted proxy, while
 bootstrap authorization remains independent and fail-closed.
+
+To replace the generated self-signed certificate with a certificate trusted by
+your LAN devices, set `SPI_TLS_CERTFILE` and `SPI_TLS_KEYFILE` to absolute paths
+and restart the service. The runner validates the certificate dates, matching
+private key, and private-key permissions before it opens a socket. Certificate
+renewal remains administrator-managed; restart the service after replacing the
+files so Uvicorn loads the renewed pair. If either path is missing or invalid,
+startup fails instead of silently falling back to another certificate.
 
 The app removes the plaintext bootstrap secret from its own process environment
 immediately after hashing it. The launching shell, service manager, or container

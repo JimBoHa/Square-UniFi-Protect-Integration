@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
-from . import deeplink, discovery, sync, thumbnail_storage
+from . import deeplink, discovery, sync, thumbnail_storage, webhook_delivery
 from .body_limit import RequestBodyLimitMiddleware
 from .protect_client import (
     ProtectAuthError,
@@ -98,6 +98,20 @@ SQUARE_CLIENT_SETTING_KEYS = (
 SQUARE_ACCOUNT_SWITCH_CODE = "square_account_switch_confirmation_required"
 MAX_CAMERA_MAPPINGS = 500
 PRIVATE_NO_STORE = "private, no-store"
+SECURITY_RESPONSE_HEADERS = (
+    (
+        "Content-Security-Policy",
+        "default-src 'self'; base-uri 'none'; connect-src 'self'; "
+        "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+        "img-src 'self'; object-src 'none'; script-src 'self'; style-src 'self'",
+    ),
+    ("Cross-Origin-Resource-Policy", "same-origin"),
+    ("Permissions-Policy", "camera=(), geolocation=(), microphone=(), payment=(), usb=()"),
+    ("Referrer-Policy", "no-referrer"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("X-Permitted-Cross-Domain-Policies", "none"),
+)
 MIN_POLL_INTERVAL_SECONDS = 1.0
 BOOTSTRAP_SECRET_MIN_LENGTH = 32
 BOOTSTRAP_SECRET_MAX_LENGTH = 4096
@@ -486,6 +500,7 @@ def create_app(
     app.state.login_failures: dict[str, list[float]] = {}
     app.state.login_lock = threading.Lock()
     square_account_lock = threading.RLock()
+    sync_execution_lock = threading.Lock()
     # Single worker draining the durable thumbnail-retry queue: webhooks ack
     # before any Protect I/O and just nudge this drain, which the queue's
     # leases and backoff keep bounded and evidence-safe.
@@ -534,6 +549,8 @@ def create_app(
         response = await call_next(request)
         if request.url.path.startswith("/api/"):
             response.headers.setdefault("Cache-Control", PRIVATE_NO_STORE)
+        for name, value in SECURITY_RESPONSE_HEADERS:
+            response.headers.setdefault(name, value)
         return response
 
     # Register after the cache policy so this pure ASGI gate runs first. It
@@ -2051,19 +2068,15 @@ def create_app(
             finally:
                 square_client.close()
 
-        webhook_settings = store.get_settings(
-            ("square.webhook_signature_key", "webhook.last_event_ms")
-        )
-        last_event_ms = None
-        raw_last = webhook_settings["webhook.last_event_ms"]
-        if raw_last:
-            try:
-                last_event_ms = int(raw_last)
-            except ValueError:
-                last_event_ms = None
+        webhook_settings = store.get_settings(("square.webhook_signature_key",))
+        webhook_metrics = store.square_webhook_metrics()
         webhook = {
             "configured": bool(webhook_settings["square.webhook_signature_key"]),
-            "last_event_ms": last_event_ms,
+            **{
+                key: value
+                for key, value in webhook_metrics.items()
+                if key != "retained_receipts"
+            },
         }
 
         queues = store.queue_depths()
@@ -2281,7 +2294,7 @@ def create_app(
                 headers={"Cache-Control": PRIVATE_NO_STORE},
             )
 
-    def run_sync() -> int:
+    def _run_sync() -> int:
         with square_account_lock:
             # Sync passes an account-fenced settings snapshot to build_square,
             # so refresh the OAuth grant before taking that snapshot. Otherwise
@@ -2335,10 +2348,23 @@ def create_app(
                     if protect:
                         protect.close()
 
+    def try_run_sync() -> int | None:
+        if not sync_execution_lock.acquire(blocking=False):
+            return None
+        try:
+            return _run_sync()
+        finally:
+            sync_execution_lock.release()
+
     @app.post("/api/sync")
     def manual_sync(_=authed) -> dict:
         try:
-            ingested = run_sync()
+            ingested = try_run_sync()
+            if ingested is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A sync is already in progress",
+                )
         except (SquareError, ProtectError) as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         except SquareAccountChanged as exc:
@@ -2387,7 +2413,11 @@ def create_app(
             received += len(chunk)
         return bytes(body)
 
-    def process_square_webhook(body: bytes, signature: str) -> dict | None:
+    def process_square_webhook(
+        body: bytes,
+        signature: str,
+        received_at_ms: int,
+    ) -> tuple[dict | None, bool]:
         """Verify and ingest against one current account/settings snapshot."""
         with store.integration_guard():
             square_settings = store.get_settings(
@@ -2409,7 +2439,7 @@ def create_app(
                 raise HTTPException(status_code=401, detail="Invalid webhook signature")
             # Every validly signed delivery counts as webhook liveness for the
             # dashboard tile, including events ignored below.
-            store.set_setting("webhook.last_event_ms", str(int(time.time() * 1000)))
+            store.record_square_webhook_delivery(received_at_ms)
             try:
                 event = json.loads(body)
             except ValueError as exc:
@@ -2422,7 +2452,20 @@ def create_app(
                 or event.get("merchant_id")
                 != square_settings["square.merchant_id"]
             ):
-                return None
+                return None, False
+            event_type = event.get("type")
+            if event_type not in webhook_delivery.SUPPORTED_PAYMENT_EVENT_TYPES:
+                return None, False
+            event_key = webhook_delivery.receipt_key(event.get("event_id"), body)
+            event_created_at_ms = webhook_delivery.event_created_at_ms(event)
+            if store.square_webhook_receipt_exists(event_key):
+                store.record_square_webhook_receipt(
+                    event_key,
+                    event_type,
+                    received_at_ms,
+                    event_created_at_ms,
+                )
+                return None, True
             event_data = event.get("data")
             event_object = (
                 event_data.get("object")
@@ -2435,8 +2478,8 @@ def create_app(
                 else None
             )
             if not isinstance(payment, dict) or not payment:
-                return None
-            return sync.ingest_payment(
+                return None, False
+            transaction = sync.ingest_payment(
                 store,
                 payment,
                 None,
@@ -2448,14 +2491,25 @@ def create_app(
                     square_settings["square.account_revision"]
                 ),
             )
+            store.record_square_webhook_receipt(
+                event_key,
+                event_type,
+                received_at_ms,
+                event_created_at_ms,
+            )
+            return transaction, False
 
     @app.post("/webhooks/square")
     async def square_webhook(request: Request) -> JSONResponse:
+        received_at_ms = int(time.time() * 1000)
         body = await read_square_webhook_body(request)
         signature = request.headers.get("x-square-hmacsha256-signature", "")
         try:
-            txn = await run_in_threadpool(
-                process_square_webhook, body, signature
+            txn, duplicate = await run_in_threadpool(
+                process_square_webhook,
+                body,
+                signature,
+                received_at_ms,
             )
         except SquareAccountChanged:
             # A verified event can race an explicitly confirmed account
@@ -2464,6 +2518,11 @@ def create_app(
             return JSONResponse({"ok": True, "ignored": True})
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
+        if duplicate:
+            # A replayed Square delivery can be the earliest signal that a
+            # previous Protect snapshot/alarm failure is ready to retry.
+            nudge_protect_work_queue()
+            return JSONResponse({"ok": True, "ignored": True})
         if txn is None:
             return JSONResponse({"ok": True, "ignored": True})
         # Both alarm delivery and thumbnail capture are durable queue work;
@@ -2480,9 +2539,9 @@ def create_app(
 
     poller: sync.Poller | None = None
     if poll_interval is not None:
-        def poll_and_maintain() -> int:
+        def poll_and_maintain() -> int | None:
             try:
-                return run_sync()
+                return try_run_sync()
             finally:
                 schedule_thumbnail_maintenance()
 

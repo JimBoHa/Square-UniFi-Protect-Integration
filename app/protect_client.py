@@ -7,14 +7,24 @@ historical timestamp), and official API-key Alarm Manager triggers.
 
 from __future__ import annotations
 
+import logging
+import math
+import random
 import re
+import time
 from urllib.parse import quote
 
 import httpx
 
+
+logger = logging.getLogger("spi.protect")
+
 HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?(?::\d{1,5})?$")
 CAMERA_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
 _CONSOLE_ID_MAX_LENGTH = 256
+LOGIN_RATE_LIMIT_MAX_RETRIES = 3
+LOGIN_RATE_LIMIT_BASE_DELAY_SECONDS = 1.0
+LOGIN_RATE_LIMIT_MAX_DELAY_SECONDS = 10.0
 _SNAPSHOT_CONTENT_TYPES = frozenset(
     {
         "image/jpeg",
@@ -178,6 +188,8 @@ class ProtectClient:
         transport: httpx.BaseTransport | None = None,
         timeout: float = 15.0,
         api_key: str | None = None,
+        login_rate_limit_max_retries: int = LOGIN_RATE_LIMIT_MAX_RETRIES,
+        login_rate_limit_max_delay: float = LOGIN_RATE_LIMIT_MAX_DELAY_SECONDS,
     ):
         self.host = validate_host(host)
         self._username = username
@@ -185,6 +197,8 @@ class ProtectClient:
         self._api_key = api_key.strip() if api_key else None
         self._csrf_token: str | None = None
         self._logged_in = False
+        self.login_rate_limit_max_retries = login_rate_limit_max_retries
+        self.login_rate_limit_max_delay = login_rate_limit_max_delay
         self._client = httpx.Client(
             base_url=f"https://{self.host}",
             verify=verify_ssl,
@@ -210,17 +224,33 @@ class ProtectClient:
     # -- auth ----------------------------------------------------------------
 
     def login(self) -> None:
-        try:
-            resp = self._client.post(
-                "/api/auth/login",
-                json={
-                    "username": self._username,
-                    "password": self._password,
-                    "rememberMe": True,
-                },
+        attempt = 0
+        while True:
+            try:
+                resp = self._client.post(
+                    "/api/auth/login",
+                    json={
+                        "username": self._username,
+                        "password": self._password,
+                        "rememberMe": True,
+                    },
+                )
+            except httpx.RequestError as exc:
+                raise ProtectError(
+                    "Network error while contacting UniFi Protect"
+                ) from exc
+            if (
+                resp.status_code != 429
+                or attempt >= self.login_rate_limit_max_retries
+            ):
+                break
+            delay = self._login_retry_delay(attempt, resp)
+            logger.warning(
+                "UniFi Protect rate limited login; retrying in %.2f seconds",
+                delay,
             )
-        except httpx.RequestError as exc:
-            raise ProtectError("Network error while contacting UniFi Protect") from exc
+            time.sleep(delay)
+            attempt += 1
         if resp.status_code in (401, 403):
             raise ProtectAuthError("UniFi Protect rejected the credentials")
         if resp.status_code >= 400:
@@ -229,6 +259,23 @@ class ProtectClient:
             "x-updated-csrf-token"
         )
         self._logged_in = True
+
+    def _login_retry_delay(self, attempt: int, resp: httpx.Response) -> float:
+        max_delay = self.login_rate_limit_max_delay
+        retry_after = resp.headers.get("retry-after")
+        if retry_after is not None:
+            try:
+                requested_delay = float(retry_after)
+            except ValueError:
+                requested_delay = -1.0
+            if math.isfinite(requested_delay) and requested_delay >= 0:
+                return min(requested_delay, max_delay)
+        backoff = min(
+            LOGIN_RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** max(0, attempt)),
+            max_delay,
+        )
+        jitter = random.uniform(0, backoff * 0.25)
+        return min(backoff + jitter, max_delay)
 
     def _request(
         self, method: str, path: str, raise_for_status: bool = True, **kwargs

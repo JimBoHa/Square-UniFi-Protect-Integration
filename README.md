@@ -41,8 +41,12 @@ timeline near that timestamp.
 - **Real-time + backfill** — a Square webhook receiver acknowledges deliveries
   immediately (HMAC-SHA256 signature verified) and captures footage
   asynchronously, while a background poller reconciles every Square location
-  by update time. Missed thumbnails persist in a durable retry queue with
-  backoff, so a Protect outage never permanently loses evidence.
+  by update time. The dashboard reports measured Square-to-app delivery lag and
+  safely ignores duplicate event IDs. Missed thumbnails persist in a durable
+  retry queue with backoff, so a Protect outage never permanently loses evidence.
+- **Bounded thumbnail storage** — optionally resize/re-encode new or existing
+  JPEGs, expire thumbnails by age, and cap total thumbnail storage. Expiration
+  removes only image bytes; transaction facts and Protect timeline links remain.
 - **Role-bound sessions** — administrators can configure integrations and run
   manual syncs; view-only accounts can use the dashboard, transaction feed,
   CSV export, thumbnails, and footage links without changing configuration.
@@ -153,7 +157,10 @@ Then:
    Square once after upgrading so webhook events can be bound to that merchant.
 4. **Settings → POS camera** — pick the camera that watches each location's
    register.
-5. Open **Transactions** — press *Sync now* for an immediate backfill; the
+5. **Settings → Thumbnail storage** — optionally enable JPEG compression and
+   choose an age or total-size limit. Use *Optimize existing thumbnails now*
+   once to apply the active compression policy to already-captured files.
+6. Open **Transactions** — press *Sync now* for an immediate backfill; the
    poller (`SPI_POLL_INTERVAL`, default 60 s) keeps it current thereafter.
 6. Optional: use **Settings → App users** to add view-only staff accounts or
    another administrator. Password resets immediately revoke that user's
@@ -177,6 +184,8 @@ Then:
 | `SPI_COOKIE_SECURE` | `0` | Set `1` when serving over HTTPS |
 | `SPI_ENCRYPTION_KEY` | — | Fernet key overriding the on-disk key file |
 | `SPI_TLS` | `0` | Set `1` to serve HTTPS with an auto-generated self-signed certificate (via `python -m app` or the macOS launcher); enables Secure cookies automatically. |
+| `SPI_TLS_CERTFILE` | — | Absolute path to an administrator-managed PEM certificate or certificate chain. Requires `SPI_TLS=1` and `SPI_TLS_KEYFILE`. |
+| `SPI_TLS_KEYFILE` | — | Absolute path to the matching unencrypted PEM private key. The key must not be accessible to group or other users. |
 
 Every first-time setup requires the one-time secret. The configured bind host,
 socket peer, HTTP `Host`, optional `Origin`, and absence of forwarding headers
@@ -187,6 +196,14 @@ reverse/local proxies from removing the secret or transport requirements. The
 bundled runner retains Uvicorn's trusted-proxy defaults so login throttling can
 use a real forwarded client address from an explicitly trusted proxy, while
 bootstrap authorization remains independent and fail-closed.
+
+To replace the generated self-signed certificate with a certificate trusted by
+your LAN devices, set `SPI_TLS_CERTFILE` and `SPI_TLS_KEYFILE` to absolute paths
+and restart the service. The runner validates the certificate dates, matching
+private key, and private-key permissions before it opens a socket. Certificate
+renewal remains administrator-managed; restart the service after replacing the
+files so Uvicorn loads the renewed pair. If either path is missing or invalid,
+startup fails instead of silently falling back to another certificate.
 
 The app removes the plaintext bootstrap secret from its own process environment
 immediately after hashing it. The launching shell, service manager, or container
@@ -202,6 +219,16 @@ link**. Custom templates must use `https://` with `{host}` as the entire hostnam
 `{camera_id}` and `{ts_ms}`; leave the field blank to restore the built-in
 default (verified on Protect 7.1.87):
 `https://{host}/protect/timelapse/{camera_id}?start={ts_ms}`.
+
+Thumbnail compression and retention are disabled by default on upgrade. Under
+**Settings → Thumbnail storage**, compression affects new captures immediately;
+the explicit optimization button processes older files once per compression
+policy revision. A retention age of `0` keeps files forever and a storage limit
+of `0` is unlimited. Background Square polling, manual sync, settings changes,
+and application startup all schedule maintenance.
+The oldest JPEGs are retired first until both limits are satisfied. Retired
+transactions remain searchable and keep their Protect timeline links, and are
+marked so later Square overlap polls cannot recreate the deleted bytes.
 
 > **Note on historical thumbnails:** verified against a UNVR G2 running
 > Protect 7.1.87 — historical frames come from the `recording-snapshot`
@@ -248,7 +275,9 @@ default (verified on Protect 7.1.87):
   preventing a continuing search page from silently repeating or skipping rows.
 - **Webhooks verified** — Square's `x-square-hmacsha256-signature` is checked
   with a constant-time comparison; unsigned or forged deliveries are rejected,
-  and the endpoint is disabled until a signature key is configured.
+  the endpoint accepts only payment-created/payment-updated envelopes, and it is
+  disabled until a signature key is configured. Duplicate detection retains at
+  most 4,096 SHA-256 receipt keys; raw event IDs and payloads are not retained.
 - **Request bodies bounded** — general HTTP requests are capped at 1 MiB before
   routing, authentication, or JSON parsing, including streamed/chunked bodies;
   this leaves ample room for the maximum 500-entry camera mapping. Square

@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
-from . import deeplink, discovery, sync
+from . import deeplink, discovery, sync, thumbnail_storage, webhook_delivery
 from .body_limit import RequestBodyLimitMiddleware
 from .protect_client import (
     ProtectAuthError,
@@ -104,6 +104,20 @@ SQUARE_CLIENT_SETTING_KEYS = (
 SQUARE_ACCOUNT_SWITCH_CODE = "square_account_switch_confirmation_required"
 MAX_CAMERA_MAPPINGS = 500
 PRIVATE_NO_STORE = "private, no-store"
+SECURITY_RESPONSE_HEADERS = (
+    (
+        "Content-Security-Policy",
+        "default-src 'self'; base-uri 'none'; connect-src 'self'; "
+        "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+        "img-src 'self'; object-src 'none'; script-src 'self'; style-src 'self'",
+    ),
+    ("Cross-Origin-Resource-Policy", "same-origin"),
+    ("Permissions-Policy", "camera=(), geolocation=(), microphone=(), payment=(), usb=()"),
+    ("Referrer-Policy", "no-referrer"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("X-Permitted-Cross-Domain-Policies", "none"),
+)
 MIN_POLL_INTERVAL_SECONDS = 1.0
 BOOTSTRAP_SECRET_MIN_LENGTH = 32
 BOOTSTRAP_SECRET_MAX_LENGTH = 4096
@@ -443,6 +457,22 @@ class DeepLinkSettingsBody(BaseModel):
     template: str = Field(default="", max_length=2048)
 
 
+class ThumbnailStorageSettingsBody(BaseModel):
+    compression_enabled: bool = False
+    jpeg_quality: int = Field(
+        default=thumbnail_storage.DEFAULT_JPEG_QUALITY,
+        ge=30,
+        le=95,
+    )
+    max_dimension: int = Field(
+        default=thumbnail_storage.DEFAULT_MAX_DIMENSION,
+        ge=320,
+        le=3840,
+    )
+    retention_days: int = Field(default=0, ge=0, le=3650)
+    max_storage_mib: int = Field(default=0, ge=0, le=1_048_576)
+
+
 TransactionStatusFilter = Literal[
     "APPROVED",
     "PENDING",
@@ -490,6 +520,7 @@ def create_app(
     app.state.login_failures: dict[str, list[float]] = {}
     app.state.login_lock = threading.Lock()
     square_account_lock = threading.RLock()
+    sync_execution_lock = threading.Lock()
     # Single worker draining the durable thumbnail-retry queue: webhooks ack
     # before any Protect I/O and just nudge this drain, which the queue's
     # leases and backoff keep bounded and evidence-safe.
@@ -499,6 +530,22 @@ def create_app(
     drain_state_lock = threading.Lock()
     app.state.thumbnail_executor = thumbnail_executor
     app.state.thumbnail_drain_queued = False
+    thumbnail_maintenance_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="spi-thumbnail-maintenance"
+    )
+    thumbnail_maintenance_lock = threading.Lock()
+    app.state.thumbnail_maintenance_executor = thumbnail_maintenance_executor
+    app.state.thumbnail_maintenance_active = False
+    app.state.thumbnail_maintenance_pending = False
+    app.state.thumbnail_maintenance_optimize_requested = False
+    app.state.thumbnail_maintenance_status = {
+        "state": "idle",
+        "started_at_ms": None,
+        "completed_at_ms": None,
+        "optimize_existing": False,
+        "result": None,
+        "error": "",
+    }
 
     cookie_secure = os.environ.get("SPI_COOKIE_SECURE", "0") == "1"
     configured_bind_host = (
@@ -522,6 +569,8 @@ def create_app(
         response = await call_next(request)
         if request.url.path.startswith("/api/"):
             response.headers.setdefault("Cache-Control", PRIVATE_NO_STORE)
+        for name, value in SECURITY_RESPONSE_HEADERS:
+            response.headers.setdefault(name, value)
         return response
 
     # Register after the cache policy so this pure ASGI gate runs first. It
@@ -711,6 +760,105 @@ def create_app(
             # Shutting down — the durable queues retry on the next sync.
             with drain_state_lock:
                 app.state.thumbnail_drain_queued = False
+
+    def thumbnail_maintenance_status() -> dict:
+        with thumbnail_maintenance_lock:
+            status = app.state.thumbnail_maintenance_status
+            return {
+                **status,
+                "result": (
+                    dict(status["result"])
+                    if isinstance(status.get("result"), dict)
+                    else None
+                ),
+            }
+
+    def _run_thumbnail_maintenance_queue() -> None:
+        while True:
+            with thumbnail_maintenance_lock:
+                optimize_existing = bool(
+                    app.state.thumbnail_maintenance_optimize_requested
+                )
+                app.state.thumbnail_maintenance_optimize_requested = False
+                app.state.thumbnail_maintenance_pending = False
+                app.state.thumbnail_maintenance_status = {
+                    "state": "running",
+                    "started_at_ms": int(time.time() * 1000),
+                    "completed_at_ms": None,
+                    "optimize_existing": optimize_existing,
+                    "result": None,
+                    "error": "",
+                }
+            try:
+                result = thumbnail_storage.run_thumbnail_maintenance(
+                    store,
+                    sync.write_thumbnail,
+                    optimize_existing=optimize_existing,
+                )
+            except Exception:
+                logger.exception("Thumbnail storage maintenance failed")
+                state = "error"
+                result = None
+                error = "Thumbnail maintenance failed; see the server log"
+            else:
+                state = "complete"
+                error = ""
+            with thumbnail_maintenance_lock:
+                app.state.thumbnail_maintenance_status = {
+                    "state": state,
+                    "started_at_ms": app.state.thumbnail_maintenance_status[
+                        "started_at_ms"
+                    ],
+                    "completed_at_ms": int(time.time() * 1000),
+                    "optimize_existing": optimize_existing,
+                    "result": result,
+                    "error": error,
+                }
+                if (
+                    app.state.thumbnail_maintenance_pending
+                    or app.state.thumbnail_maintenance_optimize_requested
+                ):
+                    continue
+                app.state.thumbnail_maintenance_active = False
+                return
+
+    def schedule_thumbnail_maintenance(*, optimize_existing: bool = False) -> bool:
+        """Coalesce policy changes while never overlapping maintenance runs."""
+        with thumbnail_maintenance_lock:
+            if optimize_existing:
+                app.state.thumbnail_maintenance_optimize_requested = True
+            if app.state.thumbnail_maintenance_active:
+                app.state.thumbnail_maintenance_pending = True
+                return False
+            app.state.thumbnail_maintenance_active = True
+            app.state.thumbnail_maintenance_pending = False
+            app.state.thumbnail_maintenance_status = {
+                "state": "queued",
+                "started_at_ms": None,
+                "completed_at_ms": None,
+                "optimize_existing": optimize_existing,
+                "result": None,
+                "error": "",
+            }
+        try:
+            thumbnail_maintenance_executor.submit(
+                _run_thumbnail_maintenance_queue
+            )
+        except RuntimeError:
+            with thumbnail_maintenance_lock:
+                app.state.thumbnail_maintenance_active = False
+                app.state.thumbnail_maintenance_pending = False
+                app.state.thumbnail_maintenance_optimize_requested = False
+                app.state.thumbnail_maintenance_status = {
+                    "state": "error",
+                    "started_at_ms": None,
+                    "completed_at_ms": int(time.time() * 1000),
+                    "optimize_existing": optimize_existing,
+                    "result": None,
+                    "error": "Thumbnail maintenance is unavailable during shutdown",
+                }
+            return False
+        return True
 
     def require_square() -> SquareClient:
         client = build_square()
@@ -1392,6 +1540,59 @@ def create_app(
             store.set_setting("deep_link_template", template)
         return {"ok": True, **deep_link_settings_response()}
 
+    def thumbnail_storage_settings_response() -> dict:
+        policy = thumbnail_storage.load_policy(store)
+        return {
+            "compression_enabled": policy.compression_enabled,
+            "jpeg_quality": policy.jpeg_quality,
+            "max_dimension": policy.max_dimension,
+            "retention_days": policy.retention_days,
+            "max_storage_mib": policy.max_storage_mib,
+            "policy_revision": policy.revision,
+            "usage": store.thumbnail_storage_summary(),
+            "maintenance": thumbnail_maintenance_status(),
+        }
+
+    @app.get("/api/settings/thumbnail-storage")
+    def get_thumbnail_storage_settings(_=authed) -> dict:
+        return thumbnail_storage_settings_response()
+
+    @app.put("/api/settings/thumbnail-storage")
+    def set_thumbnail_storage_settings(
+        body: ThumbnailStorageSettingsBody,
+        _=authed,
+    ) -> dict:
+        requested = thumbnail_storage.ThumbnailPolicy(
+            compression_enabled=body.compression_enabled,
+            jpeg_quality=body.jpeg_quality,
+            max_dimension=body.max_dimension,
+            retention_days=body.retention_days,
+            max_storage_mib=body.max_storage_mib,
+            revision=0,
+        )
+        # Serialize policy commits with each evidence mutation. Maintenance
+        # revalidates this policy while holding the same cross-process writer,
+        # so relaxing retention cannot race one last stale deletion.
+        with store.integration_guard(exclusive=True):
+            store.update_thumbnail_storage_settings(
+                thumbnail_storage.policy_values(requested)
+            )
+        # A newly enabled quota must be evaluated after legacy thumbnails are
+        # compressed. Otherwise the first maintenance pass can permanently
+        # retire uncompressed evidence that would fit once the requested
+        # compression policy is applied.
+        schedule_thumbnail_maintenance(
+            optimize_existing=(
+                requested.compression_enabled and requested.max_storage_mib > 0
+            )
+        )
+        return {"ok": True, **thumbnail_storage_settings_response()}
+
+    @app.post("/api/settings/thumbnail-storage/maintenance")
+    def optimize_thumbnail_storage(_=authed) -> dict:
+        schedule_thumbnail_maintenance(optimize_existing=True)
+        return {"ok": True, **thumbnail_storage_settings_response()}
+
     WEBHOOK_SUBSCRIPTION_NAME = "square-unifi-protect"
 
     @app.post("/api/settings/square/webhook/register")
@@ -1932,6 +2133,8 @@ def create_app(
                 link = None
         if txn.get("thumbnail_path"):
             thumbnail_status = "ready"
+        elif txn.get("thumbnail_retired_at") is not None:
+            thumbnail_status = "expired"
         elif not txn.get("camera_id"):
             thumbnail_status = "unmapped"
         elif int(txn.get("thumbnail_retry_attempts", 0)) > 0:
@@ -1962,6 +2165,8 @@ def create_app(
             ),
             "note": txn.get("note", ""),
             "note_revision": int(txn.get("note_revision", 0)),
+            "thumbnail_retired_at": txn.get("thumbnail_retired_at"),
+            "thumbnail_retired_reason": txn.get("thumbnail_retired_reason", ""),
         }
 
     @app.get("/api/dashboard")
@@ -2001,19 +2206,15 @@ def create_app(
             finally:
                 square_client.close()
 
-        webhook_settings = store.get_settings(
-            ("square.webhook_signature_key", "webhook.last_event_ms")
-        )
-        last_event_ms = None
-        raw_last = webhook_settings["webhook.last_event_ms"]
-        if raw_last:
-            try:
-                last_event_ms = int(raw_last)
-            except ValueError:
-                last_event_ms = None
+        webhook_settings = store.get_settings(("square.webhook_signature_key",))
+        webhook_metrics = store.square_webhook_metrics()
         webhook = {
             "configured": bool(webhook_settings["square.webhook_signature_key"]),
-            "last_event_ms": last_event_ms,
+            **{
+                key: value
+                for key, value in webhook_metrics.items()
+                if key != "retained_receipts"
+            },
         }
 
         queues = store.queue_depths()
@@ -2230,6 +2431,11 @@ def create_app(
     def thumbnail(txn_id: str, _=authed) -> Response:
         with store.integration_guard():
             txn = store.get_transaction(txn_id)
+            if txn and txn.get("thumbnail_retired_at") is not None:
+                raise HTTPException(
+                    status_code=410,
+                    detail="Thumbnail expired under the configured retention policy",
+                )
             if not txn or not txn.get("thumbnail_path"):
                 raise HTTPException(
                     status_code=404, detail="No thumbnail for this transaction"
@@ -2259,7 +2465,7 @@ def create_app(
                 headers={"Cache-Control": PRIVATE_NO_STORE},
             )
 
-    def run_sync() -> int:
+    def _run_sync() -> int:
         with square_account_lock:
             # Sync passes an account-fenced settings snapshot to build_square,
             # so refresh the OAuth grant before taking that snapshot. Otherwise
@@ -2313,14 +2519,30 @@ def create_app(
                     if protect:
                         protect.close()
 
+    def try_run_sync() -> int | None:
+        if not sync_execution_lock.acquire(blocking=False):
+            return None
+        try:
+            return _run_sync()
+        finally:
+            sync_execution_lock.release()
+
     @app.post("/api/sync")
     def manual_sync(_=admin_only) -> dict:
         try:
-            return {"ok": True, "ingested": run_sync()}
+            ingested = try_run_sync()
+            if ingested is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A sync is already in progress",
+                )
         except (SquareError, ProtectError) as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         except SquareAccountChanged as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+        finally:
+            schedule_thumbnail_maintenance()
+        return {"ok": True, "ingested": ingested}
 
     # -- Square webhook (unauthenticated; HMAC-verified) ---------------------------
 
@@ -2362,7 +2584,11 @@ def create_app(
             received += len(chunk)
         return bytes(body)
 
-    def process_square_webhook(body: bytes, signature: str) -> dict | None:
+    def process_square_webhook(
+        body: bytes,
+        signature: str,
+        received_at_ms: int,
+    ) -> tuple[dict | None, bool]:
         """Verify and ingest against one current account/settings snapshot."""
         with store.integration_guard():
             square_settings = store.get_settings(
@@ -2384,7 +2610,7 @@ def create_app(
                 raise HTTPException(status_code=401, detail="Invalid webhook signature")
             # Every validly signed delivery counts as webhook liveness for the
             # dashboard tile, including events ignored below.
-            store.set_setting("webhook.last_event_ms", str(int(time.time() * 1000)))
+            store.record_square_webhook_delivery(received_at_ms)
             try:
                 event = json.loads(body)
             except ValueError as exc:
@@ -2397,7 +2623,20 @@ def create_app(
                 or event.get("merchant_id")
                 != square_settings["square.merchant_id"]
             ):
-                return None
+                return None, False
+            event_type = event.get("type")
+            if event_type not in webhook_delivery.SUPPORTED_PAYMENT_EVENT_TYPES:
+                return None, False
+            event_key = webhook_delivery.receipt_key(event.get("event_id"), body)
+            event_created_at_ms = webhook_delivery.event_created_at_ms(event)
+            if store.square_webhook_receipt_exists(event_key):
+                store.record_square_webhook_receipt(
+                    event_key,
+                    event_type,
+                    received_at_ms,
+                    event_created_at_ms,
+                )
+                return None, True
             event_data = event.get("data")
             event_object = (
                 event_data.get("object")
@@ -2410,8 +2649,8 @@ def create_app(
                 else None
             )
             if not isinstance(payment, dict) or not payment:
-                return None
-            return sync.ingest_payment(
+                return None, False
+            transaction = sync.ingest_payment(
                 store,
                 payment,
                 None,
@@ -2423,14 +2662,25 @@ def create_app(
                     square_settings["square.account_revision"]
                 ),
             )
+            store.record_square_webhook_receipt(
+                event_key,
+                event_type,
+                received_at_ms,
+                event_created_at_ms,
+            )
+            return transaction, False
 
     @app.post("/webhooks/square")
     async def square_webhook(request: Request) -> JSONResponse:
+        received_at_ms = int(time.time() * 1000)
         body = await read_square_webhook_body(request)
         signature = request.headers.get("x-square-hmacsha256-signature", "")
         try:
-            txn = await run_in_threadpool(
-                process_square_webhook, body, signature
+            txn, duplicate = await run_in_threadpool(
+                process_square_webhook,
+                body,
+                signature,
+                received_at_ms,
             )
         except SquareAccountChanged:
             # A verified event can race an explicitly confirmed account
@@ -2439,6 +2689,11 @@ def create_app(
             return JSONResponse({"ok": True, "ignored": True})
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
+        if duplicate:
+            # A replayed Square delivery can be the earliest signal that a
+            # previous Protect snapshot/alarm failure is ready to retry.
+            nudge_protect_work_queue()
+            return JSONResponse({"ok": True, "ignored": True})
         if txn is None:
             return JSONResponse({"ok": True, "ignored": True})
         # Both alarm delivery and thumbnail capture are durable queue work;
@@ -2455,12 +2710,22 @@ def create_app(
 
     poller: sync.Poller | None = None
     if poll_interval is not None:
-        poller = sync.Poller(run_sync, interval_seconds=poll_interval)
+        def poll_and_maintain() -> int | None:
+            try:
+                return try_run_sync()
+            finally:
+                schedule_thumbnail_maintenance()
+
+        poller = sync.Poller(poll_and_maintain, interval_seconds=poll_interval)
         app.state.poller = poller
 
-        @app.on_event("startup")
-        def _start_poller() -> None:
+    @app.on_event("startup")
+    def _start_background_work() -> None:
+        if poller is not None:
             poller.start()
+        # Enforce a saved retention policy after every restart, including
+        # installations with Square polling disabled.
+        schedule_thumbnail_maintenance()
 
     @app.on_event("shutdown")
     def _shutdown_background_work() -> None:
@@ -2469,6 +2734,10 @@ def create_app(
         if poller is not None:
             poller.stop()
         thumbnail_executor.shutdown(wait=True, cancel_futures=True)
+        thumbnail_maintenance_executor.shutdown(
+            wait=True,
+            cancel_futures=True,
+        )
         store.close()
 
     return app

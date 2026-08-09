@@ -15,6 +15,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+import app.main as main_module
 from app.main import create_app
 from app.protect_client import ProtectClient
 from app.square_client import SquareClient, SquarePermissionError
@@ -1353,6 +1354,31 @@ def test_sync_ingests_square_payments(configured):
     assert first["card_last4"] == "4242"
     assert first["created_at"] == "2026-07-16T15:30:00.000Z"
     assert first["camera_id"] == CAM1
+
+
+def test_concurrent_manual_sync_returns_conflict(configured, monkeypatch):
+    sync_started = threading.Event()
+    release_sync = threading.Event()
+    original_sync_payments = main_module.sync.sync_payments
+
+    def blocking_sync_payments(*args, **kwargs):
+        sync_started.set()
+        assert release_sync.wait(timeout=10)
+        return original_sync_payments(*args, **kwargs)
+
+    monkeypatch.setattr(main_module.sync, "sync_payments", blocking_sync_payments)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        first_future = executor.submit(configured.post, "/api/sync")
+        assert sync_started.wait(timeout=3)
+        try:
+            second = configured.post("/api/sync")
+        finally:
+            release_sync.set()
+        first = first_future.result(timeout=10)
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert second.json()["detail"] == "A sync is already in progress"
 
 def test_transaction_deep_link_points_at_protect_timeline(configured):
     configured.post("/api/sync")
@@ -3329,7 +3355,15 @@ def test_dashboard_unconfigured(authed):
     data = authed.get("/api/dashboard").json()
     assert data["protect"]["configured"] is False
     assert data["square"]["configured"] is False
-    assert data["webhook"] == {"configured": False, "last_event_ms": None}
+    assert data["webhook"] == {
+        "configured": False,
+        "last_event_ms": None,
+        "delivery_count": 0,
+        "last_payment_ms": None,
+        "last_delivery_lag_ms": None,
+        "accepted_payment_count": 0,
+        "duplicate_count": 0,
+    }
     assert data["queues"] == {"thumbnails_pending": 0, "alarms_pending": 0}
 
 def test_dashboard_connected_with_webhook_freshness(configured):
@@ -3347,6 +3381,8 @@ def test_dashboard_connected_with_webhook_freshness(configured):
     assert data["square"]["ok"] is True
     assert data["webhook"]["configured"] is True
     assert isinstance(data["webhook"]["last_event_ms"], int)
+    assert data["webhook"]["delivery_count"] == 1
+    assert data["webhook"]["accepted_payment_count"] == 1
     assert data["queues"]["thumbnails_pending"] == 0
 
 def test_dashboard_counts_pending_queue_work(authed):

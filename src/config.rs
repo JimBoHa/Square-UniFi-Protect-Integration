@@ -7,6 +7,7 @@ use std::{
 use crate::{AppError, AppResult};
 
 pub const MIN_POLL_INTERVAL_SECONDS: f64 = 1.0;
+pub const DEFAULT_PORT: u16 = 3546;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -32,7 +33,7 @@ impl Config {
         let bind_host = host_text.parse::<IpAddr>().map_err(|_| {
             AppError::BadRequest("SPI_HOST must be a literal IPv4 or IPv6 address".into())
         })?;
-        let port_text = env::var("SPI_PORT").unwrap_or_else(|_| "8000".into());
+        let port_text = env::var("SPI_PORT").unwrap_or_else(|_| DEFAULT_PORT.to_string());
         let port = parse_port(&port_text)?;
 
         let tls_enabled = env_flag("SPI_TLS");
@@ -140,6 +141,12 @@ mod tests {
         assert_eq!(parse_port("1").unwrap(), 1);
         assert_eq!(parse_port("8000").unwrap(), 8000);
         assert_eq!(parse_port("65535").unwrap(), 65535);
+    }
+
+    #[test]
+    fn default_port_uses_the_reserved_square_protect_range() {
+        assert_eq!(DEFAULT_PORT, 3546);
+        assert!((3500..=3600).contains(&DEFAULT_PORT));
     }
 
     #[test]

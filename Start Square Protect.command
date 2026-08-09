@@ -11,7 +11,7 @@ invalid_port() {
   exit 1
 }
 
-PORT="${SPI_PORT-8000}"
+PORT="${SPI_PORT-3546}"
 case "$PORT" in
   ""|*[!0-9]*) invalid_port ;;
 esac
@@ -24,8 +24,6 @@ done
 if [ "${#PORT}" -gt 5 ] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
   invalid_port
 fi
-PORT_START="$PORT"
-
 if [ -n "${SPI_LAUNCHER_BINARY:-}" ]; then
   BINARY="$SPI_LAUNCHER_BINARY"
   if [ ! -x "$BINARY" ]; then
@@ -48,21 +46,13 @@ fi
 # Lets automated checks verify setup without starting a browser or server.
 [ "${SPI_LAUNCHER_SETUP_ONLY:-0}" = "1" ] && exit 0
 
-PORT_CAP=$((PORT + 20))
-if [ "$PORT_CAP" -gt 65535 ]; then
-  PORT_CAP=65535
+# A stable port keeps Square and Protect webhook URLs valid across restarts.
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Square Protect requires fixed TCP port $PORT, but it is already in use." >&2
+  echo "Stop the service using it or set SPI_PORT explicitly before starting." >&2
+  read -r -p "Press Return to close..." _
+  exit 1
 fi
-# If the preferred port is taken (another copy running, or another app),
-# walk forward to the next free port instead of failing with a traceback.
-while lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; do
-  if [ "$PORT" -ge "$PORT_CAP" ]; then
-    echo "Could not find a free port between $PORT_START and $PORT_CAP."
-    read -r -p "Press Return to close..." _
-    exit 1
-  fi
-  echo "Port $PORT is in use; trying $((PORT + 1))..."
-  PORT=$((PORT + 1))
-done
 
 export SPI_DATA_DIR="${SPI_DATA_DIR:-$PWD/data}"
 

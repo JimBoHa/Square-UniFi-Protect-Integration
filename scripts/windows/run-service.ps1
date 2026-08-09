@@ -5,6 +5,9 @@ $Binary = "$Repo\target\release\square-unifi-protect.exe"
 $BootstrapSecretFile = Join-Path $Repo "data\bootstrap-secret.dpapi"
 $ServicePidFile = Join-Path $Repo "data\service-process.pid"
 $env:SPI_DATA_DIR = "$Repo\data"
+if ([string]::IsNullOrWhiteSpace($env:SPI_PORT)) {
+  $env:SPI_PORT = "3546"
+}
 $HasBootstrapSecret = Test-Path $BootstrapSecretFile
 $BootstrapSecret = $null
 

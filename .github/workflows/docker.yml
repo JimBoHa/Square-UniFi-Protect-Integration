@@ -20,9 +20,9 @@ jobs:
         run: docker build -t square-unifi-protect:ci .
       - name: Smoke test
         run: |
-          docker run -d --name spi -p 8000:8000 square-unifi-protect:ci
+          docker run -d --name spi -p 3546:3546 square-unifi-protect:ci
           for _ in $(seq 1 20); do
-            curl -kfs https://127.0.0.1:8000/api/status && exit 0
+            curl -kfs https://127.0.0.1:3546/api/status && exit 0
             sleep 1
           done
           docker logs spi

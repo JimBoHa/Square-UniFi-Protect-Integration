@@ -100,7 +100,7 @@ $Settings = New-ScheduledTaskSettingsSet `
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger `
   -Settings $Settings -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
-Write-Host "Installed. Dashboard: http://localhost:8000"
+Write-Host "Installed. Dashboard: http://localhost:3546"
 if ($null -ne $SetupSecret) {
   Write-Host "One-time setup secret: $SetupSecret"
   Write-Host "The encrypted handoff is deleted automatically after setup succeeds."

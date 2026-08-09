@@ -26,7 +26,7 @@ docker compose up -d
 docker compose logs square-protect
 ```
 
-Open `https://<host>:8000`, accept the one-time self-signed certificate
+Open `https://<host>:3546`, accept the one-time self-signed certificate
 warning, and enter the generated setup secret printed in the startup output.
 The container enables the app's built-in TLS by default because its wildcard
 bind is reachable from other devices. It deliberately does not retain a
@@ -72,13 +72,19 @@ Unsigned builds run via right-click → Open.
 - **Linux (Debian/Ubuntu/Raspberry Pi OS):** installs a `systemd` unit
   (`/etc/systemd/system/square-protect.service`), starts at boot. The service
   listens on the network with the app's built-in TLS; open
-  `https://<host>:8000`, accept the self-signed certificate warning, and run
+  `https://<host>:3546`, accept the self-signed certificate warning, and run
   `sudo journalctl -u square-protect -b --no-pager` to find the generated
   one-time setup secret. No plaintext secret is stored in the unit.
 
 Both compile the locked Rust release binary from the repo checkout;
 `--uninstall` reverses the service registration. Re-running the installer after
 an update rebuilds the binary before restarting the service.
+
+All packaged deployments reserve TCP port `3546`. They fail clearly rather
+than switching ports when it is occupied, because inbound Square and UniFi
+Protect webhook URLs require a stable address. Set `SPI_PORT` only when the
+deployment definition, firewall, bookmarks, and webhook URLs are changed
+together.
 
 ## 4. Windows
 

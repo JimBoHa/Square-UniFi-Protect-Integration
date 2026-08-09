@@ -15,7 +15,7 @@ pub mod thumbnail;
 pub mod tls;
 pub mod web;
 
-pub use config::Config;
+pub use config::{Config, DEFAULT_PORT};
 pub use error::{AppError, AppResult};
 pub use store::Store;
 pub use web::{AppState, build_router};

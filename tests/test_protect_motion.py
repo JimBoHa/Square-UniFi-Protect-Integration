@@ -495,6 +495,8 @@ def test_get_webhook_uses_lan_receipt_time_and_custom_or_bearer_token(
         headers={"Authorization": f"Bearer {token}"},
     )
     assert first.status_code == duplicate.status_code == 204
+    receipt = configured.get("/api/settings/protect/motion-webhook").json()
+    assert receipt["last_event_ms"] == int(now_seconds * 1000)
     events = configured.get("/api/motion-alerts?include_matched=true").json()[
         "events"
     ]

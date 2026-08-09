@@ -437,6 +437,62 @@ const loadDeepLinkSettings = createLatestDeepLinkSettingsLoader(
   ),
 );
 
+function formatStorageBytes(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value < 1024) return `${value} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let amount = value;
+  let unit = "B";
+  for (const candidate of units) {
+    amount /= 1024;
+    unit = candidate;
+    if (amount < 1024) break;
+  }
+  return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${unit}`;
+}
+
+function renderThumbnailStorageSettings(settings) {
+  $("#thumbnail-compression-enabled").checked = settings.compression_enabled;
+  $("#thumbnail-jpeg-quality").value = settings.jpeg_quality;
+  $("#thumbnail-max-dimension").value = settings.max_dimension;
+  $("#thumbnail-retention-days").value = settings.retention_days;
+  $("#thumbnail-max-storage-mib").value = settings.max_storage_mib;
+  const usage = settings.usage || {};
+  const maintenance = settings.maintenance || {};
+  const parts = [
+    `${usage.active_count || 0} thumbnail(s) using ${formatStorageBytes(usage.active_bytes)}`,
+    `${usage.retired_count || 0} expired`,
+  ];
+  if (["queued", "running"].includes(maintenance.state)) {
+    parts.push("maintenance running…");
+  } else if (maintenance.state === "error") {
+    parts.push(maintenance.error || "maintenance failed");
+  } else if (maintenance.result) {
+    parts.push(`${formatStorageBytes(maintenance.result.bytes_saved)} reclaimed last run`);
+  }
+  $("#thumbnail-storage-status").textContent = parts.join(" · ");
+}
+
+const loadThumbnailStorageSettings = createLatestSettingsLoader(
+  () => api("/api/settings/thumbnail-storage"),
+  renderThumbnailStorageSettings,
+);
+
+async function pollThumbnailMaintenance() {
+  try {
+    const settings = await api("/api/settings/thumbnail-storage");
+    renderThumbnailStorageSettings(settings);
+    if (["queued", "running"].includes(settings.maintenance?.state)) {
+      window.setTimeout(pollThumbnailMaintenance, 750);
+    } else {
+      $("#thumbnail-optimize-existing").disabled = false;
+    }
+  } catch (err) {
+    $("#thumbnail-optimize-existing").disabled = false;
+    message(err.message, "error");
+  }
+}
+
 $("#protect-discover").addEventListener("click", async () => {
   const button = $("#protect-discover");
   if (button.disabled) return;
@@ -641,7 +697,24 @@ function clearProtectMotionSettingsView() {
   $("#protect-motion-header").textContent = "";
   $("#protect-motion-token").textContent = "";
   $("#protect-motion-token-hint").textContent = "";
-  $("#protect-motion-last-event").textContent = "";
+  const lastEvent = $("#protect-motion-last-event");
+  lastEvent.removeAttribute("datetime");
+  lastEvent.textContent = "Checking for motion webhook activity…";
+  lastEvent.parentElement.dataset.received = "false";
+}
+
+function renderProtectMotionLastEvent(lastEventMs) {
+  const status = protectMotionReceiptStatus(lastEventMs);
+  const lastEvent = $("#protect-motion-last-event");
+  lastEvent.parentElement.dataset.received = String(status.received);
+  if (!status.received) {
+    lastEvent.removeAttribute("datetime");
+    lastEvent.textContent = status.relativeText;
+    return;
+  }
+  lastEvent.setAttribute("datetime", status.dateTime);
+  lastEvent.textContent =
+    `${new Date(status.timestampMs).toLocaleString()} · ${status.relativeText}`;
 }
 
 function renderProtectMotionSettings(payload, cameras) {
@@ -674,6 +747,7 @@ function renderProtectMotionSettings(payload, cameras) {
   $("#protect-motion-grace").value = settings.graceSeconds;
   $("#protect-motion-retention").value = settings.retentionDays;
   $("#protect-motion-rotate-token").checked = false;
+  renderProtectMotionLastEvent(settings.lastEventMs);
 
   const setup = $("#protect-motion-setup");
   setup.hidden = !settings.enabled;
@@ -687,10 +761,27 @@ function renderProtectMotionSettings(payload, cameras) {
   $("#protect-motion-token-hint").textContent = settings.webhookToken
     ? "Copy this value now. It is shown only when created or rotated."
     : "The token is stored securely. Select Rotate the webhook token and save to reveal a replacement.";
-  $("#protect-motion-last-event").textContent = settings.lastEventMs === null
-    ? "Waiting for the first authenticated motion webhook."
-    : `Last authenticated motion webhook: ${new Date(settings.lastEventMs).toLocaleString()}`;
 }
+
+const refreshProtectMotionLastEvent = createLatestStatusRefresher(
+  async () => {
+    try {
+      return {
+        loaded: true,
+        payload: await api("/api/settings/protect/motion-webhook"),
+      };
+    } catch {
+      return { loaded: false, payload: null };
+    }
+  },
+  (result) => {
+    if (result.loaded) {
+      renderProtectMotionLastEvent(
+        protectMotionSettings(result.payload).lastEventMs,
+      );
+    }
+  },
+);
 
 $("#protect-motion-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -727,6 +818,44 @@ $("#protect-motion-disable").addEventListener("click", async () => {
     void loadMotionAlerts();
   } catch (error) {
     message(error.message, "error");
+  }
+});
+
+$("#thumbnail-storage-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    const settings = await api("/api/settings/thumbnail-storage", {
+      method: "PUT",
+      body: JSON.stringify({
+        compression_enabled: $("#thumbnail-compression-enabled").checked,
+        jpeg_quality: Number($("#thumbnail-jpeg-quality").value),
+        max_dimension: Number($("#thumbnail-max-dimension").value),
+        retention_days: Number($("#thumbnail-retention-days").value),
+        max_storage_mib: Number($("#thumbnail-max-storage-mib").value),
+      }),
+    });
+    renderThumbnailStorageSettings(settings);
+    void pollThumbnailMaintenance();
+    message("Thumbnail storage controls saved.", "ok");
+  } catch (err) {
+    message(err.message, "error");
+  }
+});
+
+$("#thumbnail-optimize-existing").addEventListener("click", async () => {
+  const button = $("#thumbnail-optimize-existing");
+  button.disabled = true;
+  try {
+    const settings = await api(
+      "/api/settings/thumbnail-storage/maintenance",
+      { method: "POST" },
+    );
+    renderThumbnailStorageSettings(settings);
+    void pollThumbnailMaintenance();
+    message("Existing-thumbnail optimization started.", "ok");
+  } catch (err) {
+    button.disabled = false;
+    message(err.message, "error");
   }
 });
 
@@ -928,6 +1057,7 @@ async function fetchSettingsView() {
   // health request cannot overwrite the result of a newer settings load.
   void refreshSquareStatus();
   void refreshProtectStatus();
+  void loadThumbnailStorageSettings().catch(() => {});
   return fetchMappingData();
 }
 
@@ -1158,6 +1288,9 @@ function refreshTransactionsIfVisible() {
   }
   if (document.visibilityState === "visible" && !$("#nav").hidden) {
     void loadMotionAlerts();
+    if (isAdmin(currentUser) && !$("#view-settings").hidden) {
+      void refreshProtectMotionLastEvent();
+    }
   }
 }
 
@@ -1341,6 +1474,7 @@ function renderTransactions(
         unmapped: "camera not mapped",
         queued: "footage queued",
         retrying: "capture retrying",
+        expired: "thumbnail expired",
       };
       thumb.textContent = thumbnailLabels[txn.thumbnail_status] || "no footage";
       if (txn.deep_link) {
@@ -1509,10 +1643,18 @@ function renderDashboard(data) {
   if (!data.webhook.configured) {
     setTile("webhook", "idle", "Not configured",
       "Optional: real-time sales via Settings; polling still syncs every minute");
-  } else if (data.webhook.last_event_ms) {
-    const minutes = Math.round((Date.now() - data.webhook.last_event_ms) / 60000);
+  } else if (data.webhook.last_payment_ms || data.webhook.last_event_ms) {
+    const lastPayment = Boolean(data.webhook.last_payment_ms);
+    const eventTime = data.webhook.last_payment_ms || data.webhook.last_event_ms;
+    const minutes = Math.max(0, Math.round((Date.now() - eventTime) / 60000));
     const age = minutes < 1 ? "just now" : `${minutes} min ago`;
-    setTile("webhook", "ok", `Last event ${age}`, "");
+    const eventLabel = lastPayment ? "Last payment" : "Last event";
+    setTile(
+      "webhook",
+      "ok",
+      `${eventLabel} ${age}`,
+      webhookDeliveryHint(data.webhook),
+    );
   } else {
     setTile("webhook", "idle", "Waiting for first event",
       "Check the Square webhook subscription if sales are not arriving");
@@ -1713,7 +1855,10 @@ $("#txn-filter-clear").addEventListener("click", () => {
   $("#txn-query").focus();
 });
 
-$("#sync-now").addEventListener("click", async () => {
+const syncNowButton = $("#sync-now");
+syncNowButton.addEventListener("click", async () => {
+  if (syncNowButton.disabled) return;
+  syncNowButton.disabled = true;
   message("Syncing…", "");
   try {
     const result = await api("/api/sync", { method: "POST" });
@@ -1721,6 +1866,8 @@ $("#sync-now").addEventListener("click", async () => {
     await loadTransactions({ reset: true });
   } catch (err) {
     message(err.message, "error");
+  } finally {
+    syncNowButton.disabled = false;
   }
 });
 

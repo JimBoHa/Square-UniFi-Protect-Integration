@@ -626,7 +626,9 @@ def test_protect_cameras_with_console_identity_uses_one_bootstrap_request():
             },
         )
 
-    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    client = ProtectClient(
+        "u.local", "u", "p", transport=httpx.MockTransport(handler)
+    )
     cameras, console_identity = client.get_cameras_with_console_identity()
     client.close()
 
@@ -656,7 +658,9 @@ def test_protect_console_identity_is_optional_and_conservative(
             return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
         return httpx.Response(200, json={"cameras": [], "nvr": nvr})
 
-    client = ProtectClient("u.local", "u", "p", transport=httpx.MockTransport(handler))
+    client = ProtectClient(
+        "u.local", "u", "p", transport=httpx.MockTransport(handler)
+    )
     cameras, console_identity = client.get_cameras_with_console_identity()
     client.close()
 
@@ -671,6 +675,83 @@ def test_protect_bad_credentials():
     with pytest.raises(ProtectAuthError):
         client.get_cameras()
     client.close()
+
+
+def test_protect_login_retries_rate_limit_until_success(monkeypatch):
+    login_requests = 0
+    delays = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal login_requests
+        if request.url.path == "/api/auth/login":
+            login_requests += 1
+            if login_requests < 3:
+                return httpx.Response(429, headers={"Retry-After": "0.25"})
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        return httpx.Response(200, json={"cameras": []})
+
+    monkeypatch.setattr("app.protect_client.time.sleep", delays.append)
+    client = ProtectClient(
+        "u.local", "u", "p", transport=httpx.MockTransport(handler)
+    )
+    try:
+        assert client.get_cameras() == []
+    finally:
+        client.close()
+
+    assert login_requests == 3
+    assert delays == [0.25, 0.25]
+
+
+def test_protect_login_rate_limit_retries_are_bounded_and_jittered(monkeypatch):
+    login_requests = 0
+    delays = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal login_requests
+        assert request.url.path == "/api/auth/login"
+        login_requests += 1
+        return httpx.Response(429)
+
+    monkeypatch.setattr("app.protect_client.time.sleep", delays.append)
+    monkeypatch.setattr("app.protect_client.random.uniform", lambda _low, high: high)
+    client = ProtectClient(
+        "u.local", "u", "p", transport=httpx.MockTransport(handler)
+    )
+    try:
+        with pytest.raises(ProtectError, match=r"login failed \(HTTP 429\)"):
+            client.get_cameras()
+    finally:
+        client.close()
+
+    assert login_requests == 4
+    assert delays == [1.25, 2.5, 5.0]
+
+
+def test_protect_login_rate_limit_caps_retry_after(monkeypatch):
+    login_requests = 0
+    delays = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal login_requests
+        if request.url.path == "/api/auth/login":
+            login_requests += 1
+            if login_requests == 1:
+                return httpx.Response(429, headers={"Retry-After": "3600"})
+            return httpx.Response(200, headers={"x-csrf-token": "c"}, json={})
+        return httpx.Response(200, json={"cameras": []})
+
+    monkeypatch.setattr("app.protect_client.time.sleep", delays.append)
+    client = ProtectClient(
+        "u.local", "u", "p", transport=httpx.MockTransport(handler)
+    )
+    try:
+        assert client.get_cameras() == []
+    finally:
+        client.close()
+
+    assert login_requests == 2
+    assert delays == [10.0]
 
 
 def test_protect_login_transport_error_is_normalized():

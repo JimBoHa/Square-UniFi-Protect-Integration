@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from .security import CredentialCipher, hash_session_token
+from .webhook_delivery import SUPPORTED_PAYMENT_EVENT_TYPES
 
 try:  # POSIX advisory locks.
     import fcntl as _fcntl
@@ -69,6 +70,16 @@ ALARM_SENT = "sent"
 ALARM_CLAIM_LEASE_SECONDS = 60
 ALARM_ENABLED_AFTER_SETTING = "protect.alarm_enabled_after_ms"
 SQUARE_POLL_WATERMARK_TABLE = "square_poll_watermarks"
+SQUARE_WEBHOOK_RECEIPTS_TABLE = "square_webhook_receipts"
+MAX_SQUARE_WEBHOOK_RECEIPTS = 4096
+SQUARE_WEBHOOK_METRIC_SETTING_KEYS = (
+    "webhook.last_event_ms",
+    "webhook.delivery_count",
+    "webhook.last_payment_ms",
+    "webhook.last_delivery_lag_ms",
+    "webhook.accepted_payment_count",
+    "webhook.duplicate_count",
+)
 PROTECT_EVIDENCE_RETIRED_TABLE = "protect_evidence_retired"
 SQUARE_ACCOUNT_REVISION_SETTING = "square.account_revision"
 SQUARE_OAUTH_APP_SETTING_KEYS = (
@@ -110,6 +121,20 @@ PROTECT_CONSOLE_GENERATION_SETTING = "protect.console_generation"
 PROTECT_CONSOLE_ID_SETTING = "protect.console_id"
 PROTECT_SWITCH_TOKEN_TTL_SECONDS = 5 * 60
 ORPHAN_THUMBNAIL_CLEANUP_SETTING = "maintenance.orphan_thumbnail_cleanup_pending"
+THUMBNAIL_COMPRESSION_ENABLED_SETTING = "thumbnail.compression_enabled"
+THUMBNAIL_JPEG_QUALITY_SETTING = "thumbnail.jpeg_quality"
+THUMBNAIL_MAX_DIMENSION_SETTING = "thumbnail.max_dimension"
+THUMBNAIL_RETENTION_DAYS_SETTING = "thumbnail.retention_days"
+THUMBNAIL_MAX_STORAGE_MIB_SETTING = "thumbnail.max_storage_mib"
+THUMBNAIL_POLICY_REVISION_SETTING = "thumbnail.policy_revision"
+THUMBNAIL_STORAGE_SETTING_KEYS = (
+    THUMBNAIL_COMPRESSION_ENABLED_SETTING,
+    THUMBNAIL_JPEG_QUALITY_SETTING,
+    THUMBNAIL_MAX_DIMENSION_SETTING,
+    THUMBNAIL_RETENTION_DAYS_SETTING,
+    THUMBNAIL_MAX_STORAGE_MIB_SETTING,
+    THUMBNAIL_POLICY_REVISION_SETTING,
+)
 SQUARE_OAUTH_STATE_TTL_SECONDS = 10 * 60
 MAX_PENDING_SQUARE_OAUTH_STATES = 16
 _NO_EXPECTED_PROTECT_HOST = object()
@@ -195,6 +220,10 @@ CREATE TABLE IF NOT EXISTS transactions (
     thumbnail_path TEXT,
     note TEXT NOT NULL DEFAULT '' CHECK (length(note) <= 2000),
     note_revision INTEGER NOT NULL DEFAULT 0 CHECK (note_revision >= 0),
+    thumbnail_bytes INTEGER CHECK (thumbnail_bytes IS NULL OR thumbnail_bytes >= 0),
+    thumbnail_policy_revision INTEGER NOT NULL DEFAULT 0,
+    thumbnail_retired_at INTEGER,
+    thumbnail_retired_reason TEXT NOT NULL DEFAULT '',
     raw TEXT NOT NULL DEFAULT '{}',
     alarm_state TEXT NOT NULL DEFAULT 'idle',
     alarm_claim_token TEXT,
@@ -212,6 +241,18 @@ CREATE TABLE IF NOT EXISTS square_poll_watermarks (
     location_id TEXT PRIMARY KEY,
     polled_through_ms INTEGER NOT NULL CHECK (polled_through_ms >= 0)
 );
+CREATE TABLE IF NOT EXISTS square_webhook_receipts (
+    event_key TEXT PRIMARY KEY CHECK (length(event_key) = 64),
+    event_type TEXT NOT NULL CHECK (
+        event_type IN ('payment.created', 'payment.updated')
+    ),
+    received_at_ms INTEGER NOT NULL CHECK (received_at_ms >= 0),
+    event_created_at_ms INTEGER CHECK (
+        event_created_at_ms IS NULL OR event_created_at_ms >= 0
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_square_webhook_receipts_received
+    ON square_webhook_receipts (received_at_ms DESC);
 CREATE TABLE IF NOT EXISTS transaction_feed_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     order_revision INTEGER NOT NULL DEFAULT 0
@@ -561,18 +602,21 @@ class Store:
                 self._migrate_alarms()
                 self._ensure_protect_console_generation_locked()
                 self._clear_missing_thumbnail_references_locked()
+                self._backfill_thumbnail_sizes_locked()
                 # Upgrade existing databases: any transaction that already
                 # missed its thumbnail must enter the durable retry queue.
                 self._db.execute(
                     "INSERT OR IGNORE INTO thumbnail_retries (transaction_id) "
                     "SELECT id FROM transactions "
-                    "WHERE camera_id IS NOT NULL AND thumbnail_path IS NULL"
+                    "WHERE camera_id IS NOT NULL AND thumbnail_path IS NULL "
+                    "AND thumbnail_retired_at IS NULL"
                 )
                 self._db.execute(
                     "DELETE FROM thumbnail_retries WHERE NOT EXISTS ("
                     "SELECT 1 FROM transactions t "
                     "WHERE t.id = thumbnail_retries.transaction_id "
-                    "AND t.camera_id IS NOT NULL AND t.thumbnail_path IS NULL)"
+                    "AND t.camera_id IS NOT NULL AND t.thumbnail_path IS NULL "
+                    "AND t.thumbnail_retired_at IS NULL)"
                 )
                 self._release_expired_alarm_claims_locked()
                 # The former single plaintext state had no issue time. It
@@ -677,8 +721,11 @@ class Store:
             yield
 
     def _thumbnail_file_exists(self, name: str) -> bool:
-        path = (self.thumbnail_dir / name).resolve()
-        return self.thumbnail_dir.resolve() in path.parents and path.is_file()
+        relative = Path(name)
+        if relative.name != name:
+            return False
+        path = self.thumbnail_dir / relative
+        return path.is_file() and not path.is_symlink()
 
     def _clear_missing_thumbnail_references_locked(self) -> None:
         rows = self._db.execute(
@@ -696,9 +743,33 @@ class Store:
             )
             camera_id = mapping["camera_id"] if mapping else None
             self._db.execute(
-                "UPDATE transactions SET camera_id = ?, thumbnail_path = NULL "
+                "UPDATE transactions SET camera_id = ?, thumbnail_path = NULL, "
+                "thumbnail_bytes = NULL, thumbnail_policy_revision = 0 "
                 "WHERE id = ?",
                 (camera_id, row["id"]),
+            )
+
+    def _backfill_thumbnail_sizes_locked(self) -> None:
+        """Record sizes for evidence created before storage accounting existed."""
+        rows = self._db.execute(
+            "SELECT id, thumbnail_path FROM transactions "
+            "WHERE thumbnail_path IS NOT NULL AND thumbnail_bytes IS NULL"
+        ).fetchall()
+        for row in rows:
+            relative = Path(row["thumbnail_path"])
+            if relative.name != row["thumbnail_path"]:
+                continue
+            path = self.thumbnail_dir / relative
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                size = path.stat().st_size
+            except OSError:
+                continue
+            self._db.execute(
+                "UPDATE transactions SET thumbnail_bytes = ? "
+                "WHERE id = ? AND thumbnail_path = ?",
+                (size, row["id"], row["thumbnail_path"]),
             )
 
     def _migrate_alarms(self) -> None:
@@ -820,6 +891,24 @@ class Store:
         if "device_name" not in transaction_columns:
             self._db.execute(
                 "ALTER TABLE transactions ADD COLUMN device_name "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if "thumbnail_bytes" not in transaction_columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN thumbnail_bytes INTEGER"
+            )
+        if "thumbnail_policy_revision" not in transaction_columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN thumbnail_policy_revision "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        if "thumbnail_retired_at" not in transaction_columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN thumbnail_retired_at INTEGER"
+            )
+        if "thumbnail_retired_reason" not in transaction_columns:
+            self._db.execute(
+                "ALTER TABLE transactions ADD COLUMN thumbnail_retired_reason "
                 "TEXT NOT NULL DEFAULT ''"
             )
         self._backfill_transaction_devices()
@@ -1300,7 +1389,8 @@ class Store:
                     )
                     self._db.execute(
                         "UPDATE transactions SET camera_id = NULL, "
-                        "thumbnail_path = NULL "
+                        "thumbnail_path = NULL, thumbnail_bytes = NULL, "
+                        "thumbnail_policy_revision = 0 "
                         "WHERE camera_id IS NOT NULL OR thumbnail_path IS NOT NULL"
                     )
                     self._db.execute(
@@ -1506,6 +1596,52 @@ class Store:
                 else row["value"]
             )
         return values
+
+    def update_thumbnail_storage_settings(self, values: dict[str, str]) -> int:
+        """Save a complete storage policy and return its monotonic revision."""
+        editable_keys = set(THUMBNAIL_STORAGE_SETTING_KEYS) - {
+            THUMBNAIL_POLICY_REVISION_SETTING
+        }
+        if set(values) != editable_keys:
+            raise ValueError("A complete thumbnail storage policy is required")
+        compression_keys = (
+            THUMBNAIL_COMPRESSION_ENABLED_SETTING,
+            THUMBNAIL_JPEG_QUALITY_SETTING,
+            THUMBNAIL_MAX_DIMENSION_SETTING,
+        )
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                current = {
+                    key: self._setting_value_locked(key)
+                    for key in THUMBNAIL_STORAGE_SETTING_KEYS
+                }
+                try:
+                    revision = max(
+                        0,
+                        int(current[THUMBNAIL_POLICY_REVISION_SETTING] or "0"),
+                    )
+                except ValueError:
+                    revision = 0
+                if any(current[key] != values[key] for key in compression_keys):
+                    revision += 1
+                rows = [
+                    (key, value, 0)
+                    for key, value in values.items()
+                ]
+                rows.append(
+                    (THUMBNAIL_POLICY_REVISION_SETTING, str(revision), 0)
+                )
+                self._db.executemany(
+                    "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=0",
+                    rows,
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return revision
 
     def delete_setting(self, key: str) -> None:
         with self._lock:
@@ -1996,6 +2132,14 @@ class Store:
         ).fetchone()
         return row is not None
 
+    def _clear_square_webhook_state_locked(self) -> None:
+        if self._table_exists_locked(SQUARE_WEBHOOK_RECEIPTS_TABLE):
+            self._db.execute(f"DELETE FROM {SQUARE_WEBHOOK_RECEIPTS_TABLE}")
+        self._db.executemany(
+            "DELETE FROM settings WHERE key = ?",
+            ((key,) for key in SQUARE_WEBHOOK_METRIC_SETTING_KEYS),
+        )
+
     def _has_square_account_data_locked(self) -> bool:
         """Detect legacy account data that has no merchant identity setting."""
         placeholders = ", ".join("?" for _ in SQUARE_INSTALLATION_SETTING_KEYS)
@@ -2010,6 +2154,7 @@ class Store:
                 return True
         for table_name in (
             SQUARE_POLL_WATERMARK_TABLE,
+            SQUARE_WEBHOOK_RECEIPTS_TABLE,
             PROTECT_EVIDENCE_RETIRED_TABLE,
         ):
             if self._table_exists_locked(table_name) and self._db.execute(
@@ -2307,6 +2452,7 @@ class Store:
                         self._db.execute(
                             f"DELETE FROM {SQUARE_POLL_WATERMARK_TABLE}"
                         )
+                    self._clear_square_webhook_state_locked()
                     # Webhook signatures and any future Square-owned state
                     # must never cross merchant boundaries. Submitted webhook
                     # credentials below are inserted for the new account.
@@ -2331,6 +2477,7 @@ class Store:
                         "DELETE FROM settings WHERE key IN (?, ?)",
                         ("square.webhook_signature_key", "square.webhook_url"),
                     )
+                    self._clear_square_webhook_state_locked()
 
                 if clear_oauth_pending:
                     self._db.executemany(
@@ -2473,6 +2620,176 @@ class Store:
                     self._db.rollback()
                     raise
 
+    def _set_plain_setting_locked(self, key: str, value: int) -> None:
+        self._db.execute(
+            "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, 0) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=0",
+            (key, str(int(value))),
+        )
+
+    def _increment_plain_setting_locked(self, key: str) -> None:
+        self._db.execute(
+            "INSERT INTO settings (key, value, encrypted) VALUES (?, '1', 0) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value=CAST(settings.value AS INTEGER) + 1, encrypted=0",
+            (key,),
+        )
+
+    def _set_max_plain_setting_locked(self, key: str, value: int) -> None:
+        self._db.execute(
+            "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, 0) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value=MAX(CAST(settings.value AS INTEGER), "
+            "CAST(excluded.value AS INTEGER)), encrypted=0",
+            (key, str(int(value))),
+        )
+
+    def record_square_webhook_delivery(self, received_at_ms: int) -> None:
+        """Record one validly signed delivery without retaining its payload."""
+        received_at_ms = int(received_at_ms)
+        if received_at_ms < 0:
+            raise ValueError("Invalid webhook receipt time")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._set_max_plain_setting_locked(
+                    "webhook.last_event_ms",
+                    received_at_ms,
+                )
+                self._increment_plain_setting_locked("webhook.delivery_count")
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def square_webhook_receipt_exists(self, event_key: str) -> bool:
+        if len(event_key) != 64 or any(
+            character not in "0123456789abcdef" for character in event_key
+        ):
+            raise ValueError("Invalid webhook receipt key")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM square_webhook_receipts WHERE event_key = ?",
+                (event_key,),
+            ).fetchone()
+        return row is not None
+
+    def record_square_webhook_receipt(
+        self,
+        event_key: str,
+        event_type: str,
+        received_at_ms: int,
+        event_created_at_ms: int | None,
+    ) -> bool:
+        """Record accepted payment event; return False for a duplicate."""
+        if len(event_key) != 64 or any(
+            character not in "0123456789abcdef" for character in event_key
+        ):
+            raise ValueError("Invalid webhook receipt key")
+        if event_type not in SUPPORTED_PAYMENT_EVENT_TYPES:
+            raise ValueError("Invalid Square payment webhook type")
+        received_at_ms = int(received_at_ms)
+        if received_at_ms < 0:
+            raise ValueError("Invalid webhook receipt time")
+        if event_created_at_ms is not None:
+            event_created_at_ms = int(event_created_at_ms)
+            if event_created_at_ms < 0:
+                raise ValueError("Invalid Square event time")
+
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                inserted = self._db.execute(
+                    "INSERT OR IGNORE INTO square_webhook_receipts "
+                    "(event_key, event_type, received_at_ms, event_created_at_ms) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        event_key,
+                        event_type,
+                        received_at_ms,
+                        event_created_at_ms,
+                    ),
+                ).rowcount == 1
+                if inserted:
+                    current_last_payment = self._setting_value_locked(
+                        "webhook.last_payment_ms"
+                    )
+                    try:
+                        is_latest = (
+                            current_last_payment is None
+                            or received_at_ms >= int(current_last_payment)
+                        )
+                    except ValueError:
+                        is_latest = True
+                    if is_latest:
+                        self._set_plain_setting_locked(
+                            "webhook.last_payment_ms",
+                            received_at_ms,
+                        )
+                        if event_created_at_ms is not None:
+                            self._set_plain_setting_locked(
+                                "webhook.last_delivery_lag_ms",
+                                received_at_ms - event_created_at_ms,
+                            )
+                        else:
+                            self._db.execute(
+                                "DELETE FROM settings WHERE key = ?",
+                                ("webhook.last_delivery_lag_ms",),
+                            )
+                    self._increment_plain_setting_locked(
+                        "webhook.accepted_payment_count"
+                    )
+                    self._db.execute(
+                        "DELETE FROM square_webhook_receipts WHERE rowid IN ("
+                        "SELECT rowid FROM square_webhook_receipts "
+                        "ORDER BY received_at_ms DESC, rowid DESC "
+                        "LIMIT -1 OFFSET ?)",
+                        (MAX_SQUARE_WEBHOOK_RECEIPTS,),
+                    )
+                else:
+                    self._increment_plain_setting_locked(
+                        "webhook.duplicate_count"
+                    )
+                self._db.commit()
+                return inserted
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def square_webhook_metrics(self) -> dict[str, int | None]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT key, value, encrypted FROM settings WHERE key IN "
+                f"({', '.join('?' for _ in SQUARE_WEBHOOK_METRIC_SETTING_KEYS)})",
+                SQUARE_WEBHOOK_METRIC_SETTING_KEYS,
+            ).fetchall()
+            retained_receipts = self._db.execute(
+                "SELECT COUNT(*) AS count FROM square_webhook_receipts"
+            ).fetchone()["count"]
+        values = {
+            row["key"]: row["value"]
+            for row in rows
+            if not row["encrypted"]
+        }
+
+        def parsed(key: str, default: int | None = None) -> int | None:
+            try:
+                return int(values[key])
+            except (KeyError, TypeError, ValueError):
+                return default
+
+        return {
+            "last_event_ms": parsed("webhook.last_event_ms"),
+            "delivery_count": parsed("webhook.delivery_count", 0),
+            "last_payment_ms": parsed("webhook.last_payment_ms"),
+            "last_delivery_lag_ms": parsed("webhook.last_delivery_lag_ms"),
+            "accepted_payment_count": parsed(
+                "webhook.accepted_payment_count", 0
+            ),
+            "duplicate_count": parsed("webhook.duplicate_count", 0),
+            "retained_receipts": int(retained_receipts),
+        }
+
     # -- camera mapping ----------------------------------------------------
 
     def set_camera_mapping(
@@ -2606,7 +2923,8 @@ class Store:
                 }
                 pending = self._db.execute(
                     "SELECT id, location_id, device_id, camera_id FROM transactions "
-                    "WHERE thumbnail_path IS NULL AND NOT EXISTS ("
+                    "WHERE thumbnail_path IS NULL "
+                    "AND thumbnail_retired_at IS NULL AND NOT EXISTS ("
                     "SELECT 1 FROM protect_evidence_retired r "
                     "WHERE r.transaction_id = transactions.id)"
                 ).fetchall()
@@ -2670,6 +2988,8 @@ class Store:
         values = {
             "camera_id": None,
             "thumbnail_path": None,
+            "thumbnail_bytes": None,
+            "thumbnail_policy_revision": 0,
             "location_id": "",
             "device_id": "",
             "device_name": "",
@@ -2710,22 +3030,38 @@ class Store:
                         # selected under another console must not reattach.
                         values["camera_id"] = None
                         values["thumbnail_path"] = None
+                        values["thumbnail_bytes"] = None
+                        values["thumbnail_policy_revision"] = 0
                         values["replace_evidence"] = 0
-                retired = self._db.execute(
+                protect_retired = self._db.execute(
                     "SELECT 1 FROM protect_evidence_retired "
                     "WHERE transaction_id = ?",
                     (txn["id"],),
                 ).fetchone()
-                if retired:
+                if protect_retired:
                     values["camera_id"] = None
                     values["thumbnail_path"] = None
+                    values["thumbnail_bytes"] = None
+                    values["thumbnail_policy_revision"] = 0
                     values["replace_evidence"] = 0
                 existing = self._db.execute(
                     "SELECT id, camera_id, ts_ms, updated_ts_ms, status, "
-                    "location_id, device_id, device_name, card_last4, thumbnail_path "
+                    "location_id, device_id, device_name, card_last4, thumbnail_path, "
+                    "thumbnail_bytes, thumbnail_policy_revision, thumbnail_retired_at "
                     "FROM transactions WHERE id = ?",
                     (txn["id"],),
                 ).fetchone()
+                storage_retired = bool(
+                    existing and existing["thumbnail_retired_at"] is not None
+                )
+                if storage_retired:
+                    # Retention is intentional, unlike a missing file. Preserve
+                    # the transaction/camera link but never let overlap polling
+                    # or a delayed webhook recreate the expired bytes.
+                    values["thumbnail_path"] = None
+                    values["thumbnail_bytes"] = None
+                    values["thumbnail_policy_revision"] = 0
+                    values["replace_evidence"] = 0
                 if enforce_current_mapping:
                     accepted_version = bool(
                         existing is None
@@ -2733,10 +3069,14 @@ class Store:
                         >= int(existing["updated_ts_ms"])
                     )
                     evidence_is_mutable = bool(
-                        existing is None
-                        or not existing["thumbnail_path"]
-                        or int(values["ts_ms"]) != int(existing["ts_ms"])
-                        or replace_evidence
+                        not storage_retired
+                        and not protect_retired
+                        and (
+                            existing is None
+                            or not existing["thumbnail_path"]
+                            or int(values["ts_ms"]) != int(existing["ts_ms"])
+                            or replace_evidence
+                        )
                     )
                     if accepted_version and evidence_is_mutable:
                         # Match the upsert's sparse-device semantics when choosing
@@ -2754,16 +3094,20 @@ class Store:
                             # before this transaction began. Leave it unattached;
                             # the caller removes it after seeing the winning row.
                             values["thumbnail_path"] = None
+                            values["thumbnail_bytes"] = None
+                            values["thumbnail_policy_revision"] = 0
                         values["camera_id"] = mapped_camera_id
                 applied = self._db.execute(
                     "INSERT INTO transactions (id, created_at, ts_ms, updated_at, updated_ts_ms, "
                     "amount, currency, refunded_amount, status, location_id, device_id, "
                     "device_name, card_last4, "
-                    "receipt_url, camera_id, thumbnail_path, raw) "
+                    "receipt_url, camera_id, thumbnail_path, thumbnail_bytes, "
+                    "thumbnail_policy_revision, raw) "
                     "VALUES (:id, :created_at, :ts_ms, :updated_at, "
                     ":updated_ts_ms, :amount, :currency, :refunded_amount, :status, "
                     ":location_id, :device_id, "
-                    ":device_name, :card_last4, :receipt_url, :camera_id, :thumbnail_path, :raw) "
+                    ":device_name, :card_last4, :receipt_url, :camera_id, :thumbnail_path, "
+                    ":thumbnail_bytes, :thumbnail_policy_revision, :raw) "
                     "ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at, "
                     "ts_ms=excluded.ts_ms, updated_at=excluded.updated_at, "
                     "updated_ts_ms=excluded.updated_ts_ms, amount=excluded.amount, "
@@ -2786,7 +3130,17 @@ class Store:
                     "thumbnail_path=CASE WHEN excluded.ts_ms != transactions.ts_ms "
                     "OR :replace_evidence = 1 "
                     "THEN excluded.thumbnail_path ELSE COALESCE(excluded.thumbnail_path, "
-                    "transactions.thumbnail_path) END "
+                    "transactions.thumbnail_path) END, "
+                    "thumbnail_bytes=CASE WHEN excluded.ts_ms != transactions.ts_ms "
+                    "OR :replace_evidence = 1 "
+                    "THEN excluded.thumbnail_bytes ELSE COALESCE(excluded.thumbnail_bytes, "
+                    "transactions.thumbnail_bytes) END, "
+                    "thumbnail_policy_revision=CASE WHEN excluded.ts_ms != transactions.ts_ms "
+                    "OR :replace_evidence = 1 "
+                    "THEN excluded.thumbnail_policy_revision "
+                    "WHEN excluded.thumbnail_path IS NOT NULL "
+                    "THEN excluded.thumbnail_policy_revision "
+                    "ELSE transactions.thumbnail_policy_revision END "
                     "WHERE excluded.updated_ts_ms >= transactions.updated_ts_ms",
                     values,
                 )
@@ -2801,7 +3155,7 @@ class Store:
                     )
                 current = self._db.execute(
                     "SELECT camera_id, ts_ms, status, location_id, device_id, "
-                    "device_name, card_last4, thumbnail_path "
+                    "device_name, card_last4, thumbnail_path, thumbnail_retired_at "
                     "FROM transactions WHERE id = ?",
                     (txn["id"],),
                 ).fetchone()
@@ -2877,7 +3231,12 @@ class Store:
                         or existing["ts_ms"] != current["ts_ms"]
                     )
                 )
-                if current and current["camera_id"] and not current["thumbnail_path"]:
+                if (
+                    current
+                    and current["camera_id"]
+                    and not current["thumbnail_path"]
+                    and current["thumbnail_retired_at"] is None
+                ):
                     if evidence_changed:
                         self._db.execute(
                             "INSERT INTO thumbnail_retries (transaction_id) VALUES (?) "
@@ -3005,8 +3364,10 @@ class Store:
                     self._db.commit()
                     return False
                 cursor = self._db.execute(
-                    "UPDATE transactions SET thumbnail_path = NULL "
-                    "WHERE id = ? AND thumbnail_path = ?",
+                    "UPDATE transactions SET thumbnail_path = NULL, "
+                    "thumbnail_bytes = NULL, thumbnail_policy_revision = 0 "
+                    "WHERE id = ? AND thumbnail_path = ? "
+                    "AND thumbnail_retired_at IS NULL",
                     (txn_id, expected_path),
                 )
                 if cursor.rowcount != 1:
@@ -3085,6 +3446,7 @@ class Store:
                     "FROM thumbnail_retries r "
                     "JOIN transactions t ON t.id = r.transaction_id "
                     "WHERE t.camera_id IS NOT NULL AND t.thumbnail_path IS NULL "
+                    "AND t.thumbnail_retired_at IS NULL "
                     "AND r.next_attempt_at <= ? "
                     "AND (r.lease_token IS NULL OR r.lease_expires_at <= ?) "
                     "ORDER BY r.next_attempt_at, t.ts_ms, r.transaction_id LIMIT ?",
@@ -3130,6 +3492,7 @@ class Store:
                 "SELECT 1 FROM thumbnail_retries r "
                 "JOIN transactions t ON t.id = r.transaction_id "
                 "WHERE t.camera_id IS NOT NULL AND t.thumbnail_path IS NULL "
+                "AND t.thumbnail_retired_at IS NULL "
                 "AND r.next_attempt_at <= ? "
                 "AND (r.lease_token IS NULL OR r.lease_expires_at <= ?) "
                 "LIMIT 1",
@@ -3144,6 +3507,8 @@ class Store:
         camera_id: str,
         ts_ms: int,
         thumbnail_path: str,
+        thumbnail_bytes: int | None = None,
+        thumbnail_policy_revision: int = 0,
     ) -> bool:
         """Attach retry evidence only when token, camera, and time still match."""
         with self._lock:
@@ -3159,10 +3524,18 @@ class Store:
                     return False
 
                 updated = self._db.execute(
-                    "UPDATE transactions SET thumbnail_path = ? "
+                    "UPDATE transactions SET thumbnail_path = ?, thumbnail_bytes = ?, "
+                    "thumbnail_policy_revision = ? "
                     "WHERE id = ? AND camera_id = ? AND ts_ms = ? "
-                    "AND thumbnail_path IS NULL",
-                    (thumbnail_path, transaction_id, camera_id, int(ts_ms)),
+                    "AND thumbnail_path IS NULL AND thumbnail_retired_at IS NULL",
+                    (
+                        thumbnail_path,
+                        thumbnail_bytes,
+                        max(0, int(thumbnail_policy_revision)),
+                        transaction_id,
+                        camera_id,
+                        int(ts_ms),
+                    ),
                 )
                 if updated.rowcount == 1:
                     self._db.execute(
@@ -3209,7 +3582,8 @@ class Store:
                     return False
 
                 txn = self._db.execute(
-                    "SELECT camera_id, ts_ms, thumbnail_path FROM transactions WHERE id = ?",
+                    "SELECT camera_id, ts_ms, thumbnail_path, thumbnail_retired_at "
+                    "FROM transactions WHERE id = ?",
                     (transaction_id,),
                 ).fetchone()
                 same_evidence = bool(
@@ -3217,6 +3591,7 @@ class Store:
                     and txn["camera_id"] == camera_id
                     and txn["ts_ms"] == int(ts_ms)
                     and not txn["thumbnail_path"]
+                    and txn["thumbnail_retired_at"] is None
                 )
                 if not same_evidence:
                     self._requeue_changed_thumbnail_locked(transaction_id, lease_token)
@@ -3251,10 +3626,16 @@ class Store:
     ) -> None:
         """Reset changed evidence immediately, or discard a finished/stale job."""
         txn = self._db.execute(
-            "SELECT camera_id, thumbnail_path FROM transactions WHERE id = ?",
+            "SELECT camera_id, thumbnail_path, thumbnail_retired_at "
+            "FROM transactions WHERE id = ?",
             (transaction_id,),
         ).fetchone()
-        if txn and txn["camera_id"] and not txn["thumbnail_path"]:
+        if (
+            txn
+            and txn["camera_id"]
+            and not txn["thumbnail_path"]
+            and txn["thumbnail_retired_at"] is None
+        ):
             self._db.execute(
                 "UPDATE thumbnail_retries SET attempts = 0, next_attempt_at = 0, "
                 "lease_token = NULL, lease_expires_at = NULL, last_error = '' "
@@ -3331,6 +3712,117 @@ class Store:
                 self._db.rollback()
                 raise
         return {"note": note, "note_revision": next_revision}
+
+    def list_thumbnail_assets(self) -> list[dict]:
+        """Return referenced local evidence, oldest transaction first."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, ts_ms, thumbnail_path, thumbnail_bytes, "
+                "thumbnail_policy_revision FROM transactions "
+                "WHERE thumbnail_path IS NOT NULL "
+                "ORDER BY ts_ms, id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def thumbnail_storage_summary(self) -> dict[str, int]:
+        """Return accounted evidence usage without reading image content."""
+        with self._lock:
+            active = self._db.execute(
+                "SELECT COUNT(*) AS count, "
+                "COALESCE(SUM(COALESCE(thumbnail_bytes, 0)), 0) AS bytes "
+                "FROM transactions WHERE thumbnail_path IS NOT NULL"
+            ).fetchone()
+            retired = self._db.execute(
+                "SELECT COUNT(*) AS count FROM transactions "
+                "WHERE thumbnail_retired_at IS NOT NULL"
+            ).fetchone()
+        return {
+            "active_count": int(active["count"]),
+            "active_bytes": int(active["bytes"]),
+            "retired_count": int(retired["count"]),
+        }
+
+    def update_thumbnail_metadata(
+        self,
+        transaction_id: str,
+        expected_path: str,
+        thumbnail_bytes: int,
+        policy_revision: int,
+        *,
+        expected_policy_revision: int | None = None,
+    ) -> bool:
+        """Update accounting only while the same evidence version is attached."""
+        parameters: list[object] = [
+            max(0, int(thumbnail_bytes)),
+            max(0, int(policy_revision)),
+            transaction_id,
+            expected_path,
+        ]
+        revision_clause = ""
+        if expected_policy_revision is not None:
+            revision_clause = " AND thumbnail_policy_revision = ?"
+            parameters.append(max(0, int(expected_policy_revision)))
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE transactions SET thumbnail_bytes = ?, "
+                "thumbnail_policy_revision = ? WHERE id = ? "
+                "AND thumbnail_path = ? AND thumbnail_retired_at IS NULL"
+                + revision_clause,
+                parameters,
+            )
+            self._db.commit()
+        return cursor.rowcount == 1
+
+    def retire_thumbnail(
+        self,
+        transaction_id: str,
+        expected_path: str,
+        reason: str,
+        *,
+        retired_at_ms: int,
+    ) -> bool:
+        """Expire JPEG bytes while retaining transaction and camera facts."""
+        if reason not in {"age", "quota"}:
+            raise ValueError("Invalid thumbnail retirement reason")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                updated = self._db.execute(
+                    "UPDATE transactions SET thumbnail_path = NULL, "
+                    "thumbnail_bytes = NULL, thumbnail_policy_revision = 0, "
+                    "thumbnail_retired_at = ?, thumbnail_retired_reason = ? "
+                    "WHERE id = ? AND thumbnail_path = ? "
+                    "AND thumbnail_retired_at IS NULL",
+                    (
+                        max(0, int(retired_at_ms)),
+                        reason,
+                        transaction_id,
+                        expected_path,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    self._db.commit()
+                    return False
+                self._db.execute(
+                    "DELETE FROM thumbnail_retries WHERE transaction_id = ?",
+                    (transaction_id,),
+                )
+                # A crash after this commit but before unlink leaves a safe,
+                # unreferenced file. Persist a startup cleanup scan first.
+                self._db.execute(
+                    "INSERT INTO settings (key, value, encrypted) VALUES (?, '1', 0) "
+                    "ON CONFLICT(key) DO UPDATE SET value='1', encrypted=0",
+                    (ORPHAN_THUMBNAIL_CLEANUP_SETTING,),
+                )
+                self._db.commit()
+                return True
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def delete_unreferenced_thumbnail(self, thumbnail_path: str) -> bool:
+        """Public, reference-checked wrapper used by storage maintenance."""
+        return self._unlink_thumbnail_if_unreferenced(thumbnail_path)
 
     def _delete_transaction_snapshots_locked(self, snapshot_ids: list[int]) -> None:
         if not snapshot_ids:

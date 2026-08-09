@@ -17,6 +17,8 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
+import stat
 import tempfile
 import threading
 import time
@@ -31,6 +33,8 @@ from cryptography.x509.oid import NameOID
 
 CERT_FILENAME = "tls-cert.pem"
 KEY_FILENAME = "tls-key.pem"
+CUSTOM_CERT_ENV = "SPI_TLS_CERTFILE"
+CUSTOM_KEY_ENV = "SPI_TLS_KEYFILE"
 _VALIDITY = datetime.timedelta(days=3650)
 _RENEWAL_MARGIN = datetime.timedelta(days=30)
 _GENERATIONS_DIRNAME = ".tls-material"
@@ -216,6 +220,18 @@ def _publish_pair(
 
 
 def _local_ip() -> str | None:
+    # A host with multiple interfaces (or a VPN) can route the UDP probe over
+    # a different address than the one Uvicorn is configured to serve.  Prefer
+    # an explicit IP bind so the generated certificate always covers the URL
+    # clients actually use.  Wildcard and hostname binds still need discovery.
+    configured_host = os.environ.get("SPI_HOST", "").strip().strip("[]")
+    try:
+        configured_ip = ipaddress.ip_address(configured_host)
+    except ValueError:
+        configured_ip = None
+    if configured_ip is not None and not configured_ip.is_unspecified:
+        return str(configured_ip)
+
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         probe.connect(("198.51.100.1", 9))  # no packets are sent
@@ -226,8 +242,55 @@ def _local_ip() -> str | None:
         probe.close()
 
 
+def _local_ips() -> tuple[str, ...]:
+    """Return concrete addresses the configured listener can serve.
+
+    A concrete IP bind has exactly one address. Wildcard and hostname binds
+    resolve the machine name on every startup, so a DHCP change rotates the
+    generated certificate without requiring a configuration edit.
+    """
+    configured_host = os.environ.get("SPI_HOST", "").strip().strip("[]")
+    try:
+        configured_ip = ipaddress.ip_address(configured_host)
+    except ValueError:
+        configured_ip = None
+    if configured_ip is not None and not configured_ip.is_unspecified:
+        local_ip = _local_ip()
+        return (local_ip,) if local_ip else ()
+
+    resolution_target = configured_host or socket.gethostname()
+    if configured_ip is not None and configured_ip.is_unspecified:
+        resolution_target = socket.gethostname()
+    addresses: set[str] = set()
+    try:
+        resolved = socket.getaddrinfo(
+            resolution_target,
+            None,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError:
+        resolved = ()
+    for family, _socket_type, _protocol, _canonical_name, sockaddr in resolved:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        address_text = str(sockaddr[0]).partition("%")[0]
+        try:
+            address = ipaddress.ip_address(address_text)
+        except ValueError:
+            continue
+        if address.is_unspecified or address.is_loopback or address.is_multicast:
+            continue
+        addresses.add(str(address))
+    if not addresses:
+        local_ip = _local_ip()
+        if local_ip:
+            addresses.add(local_ip)
+    return tuple(sorted(addresses))
+
+
 def _existing_pair_is_reusable(
-    cert_path: Path, key_path: Path, local_ip: str | None
+    cert_path: Path, key_path: Path, local_ips: tuple[str, ...]
 ) -> bool:
     """Return whether existing material is safe to reuse for this startup."""
     try:
@@ -241,12 +304,15 @@ def _existing_pair_is_reusable(
             return False
         if cert.not_valid_after_utc <= now + _RENEWAL_MARGIN:
             return False
-        if local_ip is not None:
+        if local_ips:
             sans = cert.extensions.get_extension_for_class(
                 x509.SubjectAlternativeName
             ).value
             addresses = sans.get_values_for_type(x509.IPAddress)
-            if ipaddress.ip_address(local_ip) not in addresses:
+            if any(
+                ipaddress.ip_address(local_ip) not in addresses
+                for local_ip in local_ips
+            ):
                 return False
         public_format = serialization.PublicFormat.SubjectPublicKeyInfo
         cert_public_key = cert.public_key().public_bytes(
@@ -283,11 +349,11 @@ def ensure_self_signed_cert(data_dir: Path) -> tuple[Path, Path]:
     with _generation_lock(data_dir):
         _remove_incomplete_publications(data_dir)
         cert_path, key_path = _current_pair(data_dir)
-        local_ip = _local_ip()
+        local_ips = _local_ips()
         if (
             cert_path.is_file()
             and key_path.is_file()
-            and _existing_pair_is_reusable(cert_path, key_path, local_ip)
+            and _existing_pair_is_reusable(cert_path, key_path, local_ips)
         ):
             return cert_path, key_path
 
@@ -300,8 +366,11 @@ def ensure_self_signed_cert(data_dir: Path) -> tuple[Path, Path]:
             x509.DNSName("square-unifi-protect.local"),
             x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
         ]
-        if local_ip:
-            alt_names.append(x509.IPAddress(ipaddress.ip_address(local_ip)))
+        alt_names.extend(
+            x509.IPAddress(ipaddress.ip_address(local_ip))
+            for local_ip in local_ips
+            if local_ip != "127.0.0.1"
+        )
         now = datetime.datetime.now(datetime.timezone.utc)
         cert = (
             x509.CertificateBuilder()
@@ -327,9 +396,53 @@ def ensure_self_signed_cert(data_dir: Path) -> tuple[Path, Path]:
         return _publish_pair(data_dir, cert_bytes, key_bytes)
 
 
+def _custom_tls_pair() -> tuple[Path, Path] | None:
+    """Validate an administrator-managed certificate and private key pair."""
+    cert_value = os.environ.get(CUSTOM_CERT_ENV, "").strip()
+    key_value = os.environ.get(CUSTOM_KEY_ENV, "").strip()
+    if not cert_value and not key_value:
+        return None
+    if not cert_value or not key_value:
+        raise ValueError(
+            f"{CUSTOM_CERT_ENV} and {CUSTOM_KEY_ENV} must be configured together"
+        )
+    cert_path = Path(cert_value).expanduser()
+    key_path = Path(key_value).expanduser()
+    if not cert_path.is_absolute() or not key_path.is_absolute():
+        raise ValueError("Custom TLS certificate and key paths must be absolute")
+    if not cert_path.is_file():
+        raise ValueError(f"Custom TLS certificate is not a file: {cert_path}")
+    if not key_path.is_file():
+        raise ValueError(f"Custom TLS private key is not a file: {key_path}")
+    if os.name == "posix" and stat.S_IMODE(key_path.stat().st_mode) & 0o077:
+        raise ValueError(
+            "Custom TLS private key must not be accessible to group or other users"
+        )
+    try:
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise ValueError("Custom TLS certificate is not valid PEM") from exc
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if cert.not_valid_before_utc > now:
+        raise ValueError("Custom TLS certificate is not valid yet")
+    if cert.not_valid_after_utc <= now:
+        raise ValueError("Custom TLS certificate has expired")
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert_path, key_path)
+    except (OSError, ssl.SSLError) as exc:
+        raise ValueError(
+            "Custom TLS certificate and private key could not be loaded as a pair"
+        ) from exc
+    return cert_path, key_path
+
+
 def uvicorn_tls_kwargs(data_dir: Path, enabled: bool) -> dict:
     """Uvicorn ssl kwargs for the runner; empty when TLS is disabled."""
     if not enabled:
+        if os.environ.get(CUSTOM_CERT_ENV) or os.environ.get(CUSTOM_KEY_ENV):
+            raise ValueError("SPI_TLS must be 1 when custom TLS files are configured")
         return {}
-    cert_path, key_path = ensure_self_signed_cert(data_dir)
+    custom_pair = _custom_tls_pair()
+    cert_path, key_path = custom_pair or ensure_self_signed_cert(data_dir)
     return {"ssl_certfile": str(cert_path), "ssl_keyfile": str(key_path)}

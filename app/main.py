@@ -98,6 +98,20 @@ SQUARE_CLIENT_SETTING_KEYS = (
 SQUARE_ACCOUNT_SWITCH_CODE = "square_account_switch_confirmation_required"
 MAX_CAMERA_MAPPINGS = 500
 PRIVATE_NO_STORE = "private, no-store"
+SECURITY_RESPONSE_HEADERS = (
+    (
+        "Content-Security-Policy",
+        "default-src 'self'; base-uri 'none'; connect-src 'self'; "
+        "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+        "img-src 'self'; object-src 'none'; script-src 'self'; style-src 'self'",
+    ),
+    ("Cross-Origin-Resource-Policy", "same-origin"),
+    ("Permissions-Policy", "camera=(), geolocation=(), microphone=(), payment=(), usb=()"),
+    ("Referrer-Policy", "no-referrer"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("X-Permitted-Cross-Domain-Policies", "none"),
+)
 MIN_POLL_INTERVAL_SECONDS = 1.0
 BOOTSTRAP_SECRET_MIN_LENGTH = 32
 BOOTSTRAP_SECRET_MAX_LENGTH = 4096
@@ -503,6 +517,8 @@ def create_app(
         response = await call_next(request)
         if request.url.path.startswith("/api/"):
             response.headers.setdefault("Cache-Control", PRIVATE_NO_STORE)
+        for name, value in SECURITY_RESPONSE_HEADERS:
+            response.headers.setdefault(name, value)
         return response
 
     # Register after the cache policy so this pure ASGI gate runs first. It

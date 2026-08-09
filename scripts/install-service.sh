@@ -38,6 +38,8 @@ case "$(uname -s)" in
   <key>WorkingDirectory</key><string>$REPO</string>
   <key>EnvironmentVariables</key><dict>
     <key>SPI_DATA_DIR</key><string>$REPO/data</string>
+    <key>SPI_HOST</key><string>0.0.0.0</string>
+    <key>SPI_TLS</key><string>1</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -47,7 +49,9 @@ case "$(uname -s)" in
 PLIST_EOF
     launchctl unload "$PLIST" 2>/dev/null || true
     launchctl load "$PLIST"
-    echo "Installed. The app starts at login; dashboard: http://localhost:8000"
+    echo "Installed. The app starts at login; dashboard: https://<this-host>:8000"
+    echo "The certificate refreshes when this computer's LAN IP changes."
+    echo "Accept the self-signed certificate warning in your browser."
     ;;
   Linux)
     UNIT=/etc/systemd/system/square-protect.service

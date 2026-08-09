@@ -76,10 +76,225 @@ def test_cert_generated_once_with_private_key_permissions(tmp_path):
     assert again_cert.read_bytes() == cert_path.read_bytes()
 
 
+def test_cert_covers_explicit_bind_ip_instead_of_default_route(
+    tmp_path, monkeypatch
+):
+    import app.tls as tls
+    import ipaddress
+
+    monkeypatch.setenv("SPI_HOST", "192.0.2.44")
+    monkeypatch.setattr(
+        tls.socket,
+        "socket",
+        lambda *_args, **_kwargs: pytest.fail("default route must not be probed"),
+    )
+
+    cert_path, _ = tls.ensure_self_signed_cert(tmp_path)
+    cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    sans = cert.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName
+    ).value
+
+    assert ipaddress.ip_address("192.0.2.44") in sans.get_values_for_type(
+        x509.IPAddress
+    )
+
+
+def test_wildcard_bind_certificate_tracks_resolved_lan_addresses(
+    tmp_path, monkeypatch
+):
+    import app.tls as tls
+    import ipaddress
+
+    monkeypatch.setenv("SPI_HOST", "0.0.0.0")
+    monkeypatch.setattr(tls.socket, "gethostname", lambda: "register-host")
+    monkeypatch.setattr(
+        tls.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (tls.socket.AF_INET, tls.socket.SOCK_STREAM, 6, "", ("192.0.2.10", 0)),
+            (tls.socket.AF_INET, tls.socket.SOCK_STREAM, 6, "", ("192.0.2.11", 0)),
+            (tls.socket.AF_INET, tls.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0)),
+        ],
+    )
+    monkeypatch.setattr(
+        tls.socket,
+        "socket",
+        lambda *_args, **_kwargs: pytest.fail("route fallback must not be probed"),
+    )
+
+    cert_path, _ = tls.ensure_self_signed_cert(tmp_path)
+    cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    sans = cert.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName
+    ).value.get_values_for_type(x509.IPAddress)
+
+    assert ipaddress.ip_address("192.0.2.10") in sans
+    assert ipaddress.ip_address("192.0.2.11") in sans
+    assert ipaddress.ip_address("0.0.0.0") not in sans
+
+
+def test_wildcard_bind_certificate_rotates_after_dhcp_change(tmp_path, monkeypatch):
+    import app.tls as tls
+    import ipaddress
+
+    monkeypatch.setenv("SPI_HOST", "0.0.0.0")
+    current_address = ["192.0.2.10"]
+    monkeypatch.setattr(tls.socket, "gethostname", lambda: "register-host")
+    monkeypatch.setattr(
+        tls.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (
+                tls.socket.AF_INET,
+                tls.socket.SOCK_STREAM,
+                6,
+                "",
+                (current_address[0], 0),
+            )
+        ],
+    )
+
+    original, _ = tls.ensure_self_signed_cert(tmp_path)
+    current_address[0] = "192.0.2.99"
+    regenerated, _ = tls.ensure_self_signed_cert(tmp_path)
+
+    assert regenerated != original
+    cert = x509.load_pem_x509_certificate(regenerated.read_bytes())
+    sans = cert.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName
+    ).value.get_values_for_type(x509.IPAddress)
+    assert ipaddress.ip_address("192.0.2.99") in sans
+    assert ipaddress.ip_address("192.0.2.10") not in sans
+
+
 def test_uvicorn_kwargs_disabled_and_enabled(tmp_path):
     assert uvicorn_tls_kwargs(tmp_path, False) == {}
     kwargs = uvicorn_tls_kwargs(tmp_path, True)
     assert set(kwargs) == {"ssl_certfile", "ssl_keyfile"}
+
+
+def test_uvicorn_uses_valid_administrator_tls_pair(tmp_path, monkeypatch):
+    import app.tls as tls
+
+    generated_dir = tmp_path / "generated"
+    cert_path, key_path = tls.ensure_self_signed_cert(generated_dir)
+    monkeypatch.setenv(tls.CUSTOM_CERT_ENV, str(cert_path))
+    monkeypatch.setenv(tls.CUSTOM_KEY_ENV, str(key_path))
+
+    kwargs = tls.uvicorn_tls_kwargs(tmp_path / "unused", True)
+
+    assert kwargs == {
+        "ssl_certfile": str(cert_path),
+        "ssl_keyfile": str(key_path),
+    }
+    assert not (tmp_path / "unused").exists()
+
+
+@pytest.mark.parametrize(
+    ("cert_value", "key_value"),
+    (("/tmp/cert.pem", ""), ("", "/tmp/key.pem")),
+)
+def test_custom_tls_requires_certificate_and_key_together(
+    tmp_path, monkeypatch, cert_value, key_value
+):
+    import app.tls as tls
+
+    monkeypatch.setenv(tls.CUSTOM_CERT_ENV, cert_value)
+    monkeypatch.setenv(tls.CUSTOM_KEY_ENV, key_value)
+
+    with pytest.raises(ValueError, match="must be configured together"):
+        tls.uvicorn_tls_kwargs(tmp_path, True)
+
+
+def test_custom_tls_paths_must_be_absolute(tmp_path, monkeypatch):
+    import app.tls as tls
+
+    monkeypatch.setenv(tls.CUSTOM_CERT_ENV, "cert.pem")
+    monkeypatch.setenv(tls.CUSTOM_KEY_ENV, "key.pem")
+
+    with pytest.raises(ValueError, match="paths must be absolute"):
+        tls.uvicorn_tls_kwargs(tmp_path, True)
+
+
+@pytest.mark.parametrize(
+    ("missing_name", "message"),
+    (("cert.pem", "certificate is not a file"), ("key.pem", "key is not a file")),
+)
+def test_custom_tls_files_must_exist(tmp_path, monkeypatch, missing_name, message):
+    import app.tls as tls
+
+    cert_path, key_path = tls.ensure_self_signed_cert(tmp_path / "generated")
+    missing_path = tmp_path / missing_name
+    if missing_name == "cert.pem":
+        cert_path = missing_path
+    else:
+        key_path = missing_path
+    monkeypatch.setenv(tls.CUSTOM_CERT_ENV, str(cert_path))
+    monkeypatch.setenv(tls.CUSTOM_KEY_ENV, str(key_path))
+
+    with pytest.raises(ValueError, match=message):
+        tls.uvicorn_tls_kwargs(tmp_path / "unused", True)
+
+
+def test_custom_tls_rejects_mismatched_pair(tmp_path, monkeypatch):
+    import app.tls as tls
+
+    cert_path, _ = tls.ensure_self_signed_cert(tmp_path / "first")
+    _, key_path = tls.ensure_self_signed_cert(tmp_path / "second")
+    monkeypatch.setenv(tls.CUSTOM_CERT_ENV, str(cert_path))
+    monkeypatch.setenv(tls.CUSTOM_KEY_ENV, str(key_path))
+
+    with pytest.raises(ValueError, match="could not be loaded as a pair"):
+        tls.uvicorn_tls_kwargs(tmp_path / "unused", True)
+
+
+@pytest.mark.parametrize(
+    ("not_before", "not_after", "message"),
+    ((-2, -1, "has expired"), (1, 2, "is not valid yet")),
+)
+def test_custom_tls_rejects_invalid_certificate_dates(
+    tmp_path, monkeypatch, not_before, not_after, message
+):
+    import app.tls as tls
+
+    cert_path, key_path = tls.ensure_self_signed_cert(tmp_path / "generated")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    _replace_certificate(
+        cert_path,
+        key_path,
+        not_valid_before=now + datetime.timedelta(days=not_before),
+        not_valid_after=now + datetime.timedelta(days=not_after),
+    )
+    monkeypatch.setenv(tls.CUSTOM_CERT_ENV, str(cert_path))
+    monkeypatch.setenv(tls.CUSTOM_KEY_ENV, str(key_path))
+
+    with pytest.raises(ValueError, match=message):
+        tls.uvicorn_tls_kwargs(tmp_path / "unused", True)
+
+
+def test_custom_tls_rejects_insecure_private_key_permissions(tmp_path, monkeypatch):
+    import app.tls as tls
+
+    if os.name != "posix":
+        pytest.skip("POSIX permission bits required")
+    cert_path, key_path = tls.ensure_self_signed_cert(tmp_path / "generated")
+    key_path.chmod(0o644)
+    monkeypatch.setenv(tls.CUSTOM_CERT_ENV, str(cert_path))
+    monkeypatch.setenv(tls.CUSTOM_KEY_ENV, str(key_path))
+
+    with pytest.raises(ValueError, match="group or other users"):
+        tls.uvicorn_tls_kwargs(tmp_path / "unused", True)
+
+
+def test_custom_tls_configuration_requires_tls_enabled(tmp_path, monkeypatch):
+    import app.tls as tls
+
+    monkeypatch.setenv(tls.CUSTOM_CERT_ENV, "/tmp/cert.pem")
+    monkeypatch.setenv(tls.CUSTOM_KEY_ENV, "/tmp/key.pem")
+
+    with pytest.raises(ValueError, match="SPI_TLS must be 1"):
+        tls.uvicorn_tls_kwargs(tmp_path, False)
 
 
 def test_cert_regenerated_when_lan_ip_leaves_sans(tmp_path, monkeypatch):

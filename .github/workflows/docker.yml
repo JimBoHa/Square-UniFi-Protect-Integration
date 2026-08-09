@@ -8,6 +8,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
+      - name: Check Rust formatting
+        run: rustup run 1.88.0 cargo fmt --all -- --check
+      - name: Lint Rust backend
+        run: rustup run 1.88.0 cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test Rust backend
+        run: rustup run 1.88.0 cargo test --locked --all-targets
       - name: Build image
         run: docker build -t square-unifi-protect:ci .
       - name: Smoke test
@@ -19,3 +27,13 @@ jobs:
           done
           docker logs spi
           exit 1
+  macos-app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
+      - name: Test native menu-bar wrapper
+        run: rustup run 1.88.0 cargo test --locked --features menubar --bin square-protect-menubar
+      - name: Build and validate unsigned DMG
+        run: RUSTUP_TOOLCHAIN=1.88.0 scripts/macos/build_dmg.sh

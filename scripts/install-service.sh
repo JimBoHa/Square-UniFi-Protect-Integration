@@ -7,13 +7,15 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 UNINSTALL="${1:-}"
 
 if [ "$UNINSTALL" != "--uninstall" ]; then
-  if [ ! -x "$REPO/.venv/bin/python" ]; then
-    echo "Setting up the Python environment..."
-    python3 -m venv "$REPO/.venv"
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "Rust/Cargo is required. Install it from https://rustup.rs and run this installer again." >&2
+    exit 1
   fi
-  "$REPO/.venv/bin/python" "$REPO/scripts/ensure_dependencies.py" \
-    "$REPO" "$REPO/.venv"
+  echo "Building the Rust service..."
+  cargo build --manifest-path "$REPO/Cargo.toml" --locked --release
 fi
+
+BINARY="$REPO/target/release/square-unifi-protect"
 
 case "$(uname -s)" in
   Darwin)
@@ -32,8 +34,7 @@ case "$(uname -s)" in
 <plist version="1.0"><dict>
   <key>Label</key><string>com.squareprotect.app</string>
   <key>ProgramArguments</key><array>
-    <string>$REPO/.venv/bin/python</string>
-    <string>-m</string><string>app</string>
+    <string>$BINARY</string>
   </array>
   <key>WorkingDirectory</key><string>$REPO</string>
   <key>EnvironmentVariables</key><dict>
@@ -74,7 +75,7 @@ WorkingDirectory=$REPO
 Environment=SPI_DATA_DIR=$REPO/data
 Environment=SPI_HOST=0.0.0.0
 Environment=SPI_TLS=1
-ExecStart=$REPO/.venv/bin/python -m app
+ExecStart=$BINARY
 Restart=on-failure
 
 [Install]

@@ -30,16 +30,12 @@ def _ready_launcher_environment(tmp_path: Path, *, port_in_use: bool = False):
     shutil.copy2(ROOT / launcher.name, launcher)
     port_marker = tmp_path / "server-port"
     open_marker = tmp_path / "browser-url"
+    binary = tmp_path / "square-unifi-protect"
     _write_executable(
-        tmp_path / ".venv" / "bin" / "python",
+        binary,
         "#!/bin/sh\n"
-        'if [ "$1" = "scripts/ensure_dependencies.py" ]; then exit 0; fi\n'
-        'if [ "$1" = "-c" ]; then exit 0; fi\n'
-        'if [ "$1" = "-m" ] && [ "$2" = "app" ]; then\n'
-        '  printf "%s" "$SPI_PORT" > "$PORT_MARKER"\n'
-        "  exit 0\n"
-        "fi\n"
-        "exit 1\n",
+        'printf "%s" "$SPI_PORT" > "$PORT_MARKER"\n'
+        "exit 0\n",
     )
     fake_bin = tmp_path / "fake-bin"
     _write_executable(
@@ -57,30 +53,33 @@ def _ready_launcher_environment(tmp_path: Path, *, port_in_use: bool = False):
         "OPEN_MARKER": str(open_marker),
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
         "PORT_MARKER": str(port_marker),
+        "SPI_LAUNCHER_BINARY": str(binary),
         "SPI_LAUNCHER_SETUP_ONLY": "0",
         "SPI_TLS": "0",
     }
     return launcher, environment, port_marker, open_marker
 
 
-def test_launcher_checks_dependencies_in_existing_environment(tmp_path):
+def test_launcher_builds_the_locked_rust_release(tmp_path):
     launcher = tmp_path / "Start Square Protect.command"
     shutil.copy2(ROOT / launcher.name, launcher)
-    python = tmp_path / ".venv" / "bin" / "python"
-    python.parent.mkdir(parents=True)
-    python.write_text(
+    fake_bin = tmp_path / "fake-bin"
+    cargo = fake_bin / "cargo"
+    cargo.parent.mkdir(parents=True)
+    cargo.write_text(
         "#!/bin/sh\n"
-        "if [ \"$1\" = \"scripts/ensure_dependencies.py\" ]; then\n"
-        "  : > \"$DEPENDENCY_CHECK_MARKER\"\n"
-        "  exit 0\n"
-        "fi\n"
-        "exit 1\n"
+        'printf "%s" "$*" > "$CARGO_MARKER"\n'
+        "mkdir -p target/release\n"
+        ": > target/release/square-unifi-protect\n"
+        "chmod +x target/release/square-unifi-protect\n"
+        "exit 0\n"
     )
-    python.chmod(0o755)
-    dependency_check_marker = tmp_path / "dependency-check-was-run"
+    cargo.chmod(0o755)
+    cargo_marker = tmp_path / "cargo-was-run"
     environment = {
         **os.environ,
-        "DEPENDENCY_CHECK_MARKER": str(dependency_check_marker),
+        "CARGO_MARKER": str(cargo_marker),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
         "SPI_LAUNCHER_SETUP_ONLY": "1",
     }
 
@@ -95,7 +94,7 @@ def test_launcher_checks_dependencies_in_existing_environment(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert dependency_check_marker.is_file()
+    assert cargo_marker.read_text() == "build --locked --release"
 
 
 @pytest.mark.parametrize(
@@ -120,7 +119,7 @@ def test_launcher_rejects_invalid_port_before_setup(tmp_path, value):
 
     assert result.returncode == 1
     assert "SPI_PORT must be a whole number from 1 to 65535" in result.stderr
-    assert not (tmp_path / ".venv").exists()
+    assert not (tmp_path / "target").exists()
 
 
 def test_launcher_browser_and_runner_use_same_normalized_port(tmp_path):

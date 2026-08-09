@@ -16,7 +16,9 @@ server process is installed, started, and kept running.
 
 ## 1. Docker (the universal answer)
 
-`Dockerfile` builds a slim image; `docker-compose.yml` runs it with a
+`Dockerfile` compiles the Rust backend in a pinned builder and copies only the
+native binary, browser assets, and CA roots into a slim runtime image;
+`docker-compose.yml` runs it with a
 persistent `./data` volume:
 
 ```bash
@@ -42,18 +44,20 @@ alongside Homebridge on the Pi; or use the systemd installer below.
 
 ## 2. macOS menu-bar app (.dmg)
 
-`scripts/macos/menubar_app.py` wraps the server in a native menu-bar app
-(status icon, Open Dashboard, Start at Login hint, Quit). Build:
+The `square-protect-menubar` Rust binary wraps the Rust server in a native
+menu-bar app (status icon, Open Dashboard, Open Data Folder, one-time setup
+secret, and Quit). Build:
 
 ```bash
 scripts/macos/build_dmg.sh          # → dist/SquareProtect.dmg
 ```
 
-The script bundles with PyInstaller (`LSUIElement` set so there is no Dock
-icon), verifies the app boots and serves the dashboard, then wraps it in a
-drag-to-Applications dmg. For a signed release, set `MACOS_SIGNING_IDENTITY`
-to the Developer ID Application identity when running the build script; the
-app is signed before it enters the dmg. Then notarize with
+The script compiles both locked Rust release binaries, assembles a native
+`LSUIElement` app bundle without Python or PyInstaller, validates its embedded
+server and browser assets, and wraps the signed app in a drag-to-Applications
+dmg. For a signed release, set `MACOS_SIGNING_IDENTITY` to the Developer ID
+Application identity when running the build script; the nested binaries and
+app are signed before entering the dmg. Then notarize with
 `xcrun notarytool submit`, staple, and attach the dmg to a GitHub release.
 Unsigned builds run via right-click → Open.
 
@@ -72,18 +76,20 @@ Unsigned builds run via right-click → Open.
   `sudo journalctl -u square-protect -b --no-pager` to find the generated
   one-time setup secret. No plaintext secret is stored in the unit.
 
-Both use the repo checkout + its venv; `--uninstall` reverses everything.
+Both compile the locked Rust release binary from the repo checkout;
+`--uninstall` reverses the service registration. Re-running the installer after
+an update rebuilds the binary before restarting the service.
 
 ## 4. Windows
 
-`scripts/windows/install-service.ps1` creates the venv and registers a
-Task Scheduler job that starts the server at logon (no third-party service
-wrapper needed). When secure first-run setup is available, the installer
-prints its one-time secret and hands it to the hidden task through a
+`scripts/windows/install-service.ps1` compiles the locked Rust release and
+registers a Task Scheduler job that starts it at logon (no third-party service
+wrapper needed). On first run, the installer prints its one-time secret and
+hands it to the hidden task through a
 DPAPI-protected, current-user-only file. The runner removes that encrypted
 handoff automatically after setup succeeds; the task definition never stores
 the plaintext secret. Docker Desktop users should prefer the compose file.
-Future work: a signed MSI built with WiX + a pythonw-based tray icon,
+Future work: a signed MSI built with WiX + a native tray icon,
 mirroring the macOS menu-bar app.
 
 ## 5. Release automation (future)

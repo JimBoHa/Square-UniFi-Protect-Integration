@@ -87,24 +87,28 @@ URL Protect's own event links use on that version:
 ## Quick start
 
 **macOS:** double-click `Start Square Protect.command` in this folder. It sets
-up everything on first run, starts the app, and opens the dashboard in your
+up the Rust build on first run, starts the app, and opens the dashboard in your
 browser. Keep the Terminal window it opens in the background; closing it stops
 the app.
 
 **Linux or macOS (terminal):**
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m app
+cargo run --locked --release
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
-.\.venv\Scripts\python.exe -m app
+cargo run --locked --release
 ```
+
+Install the current stable Rust toolchain from [rustup.rs](https://rustup.rs/)
+if `cargo` is not already available. The former Python backend remains in the
+repository only as a rollback and behavioral-contract implementation. The
+primary server, provider clients, security layer, SQLite store, synchronization
+engine, webhooks, TLS, thumbnail pipeline, macOS menu-bar app, and supported
+installers use native Rust binaries.
 
 The bundled runner binds only to `127.0.0.1` by default. On first start it
 prints a generated one-time bootstrap secret in the server console. Copy that
@@ -119,9 +123,9 @@ installation on the network:
 
 ```bash
 export SPI_TLS=1
-export SPI_BOOTSTRAP_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export SPI_BOOTSTRAP_SECRET="$(openssl rand -base64 32)"
 export SPI_HOST=0.0.0.0
-.venv/bin/python -m app
+cargo run --locked --release
 ```
 
 Only after those settings are active, open `https://<server-ip>:8000` from the
@@ -189,12 +193,12 @@ Then:
 | `SPI_DATA_DIR` | `./data` | SQLite DB, encryption key/HMAC salt, thumbnails |
 | `SPI_HOST` | `127.0.0.1` | Server bind address. Wildcard and non-loopback values require TLS plus a bootstrap secret for first setup. |
 | `SPI_PORT` | `8000` | Port used by `Start Square Protect.command` |
-| `SPI_BOOTSTRAP_SECRET` | generated at startup | Random 32–4096 character one-time secret required when creating the first admin password; generate with `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`. Missing or invalid values are replaced with an ephemeral secret printed once to the server console. Only its digest remains in memory, and it is never written to the data directory. |
+| `SPI_BOOTSTRAP_SECRET` | generated at startup | Random 32–4096 character one-time secret required when creating the first admin password; generate with `openssl rand -base64 32`. Missing or invalid values are replaced with an ephemeral secret printed once to the server console. Only its digest remains in memory, and it is never written to the data directory. |
 | `SPI_POLL_INTERVAL` | `60` | Seconds between Square polls |
 | `SPI_DISABLE_POLLER` | `0` | Set `1` to disable background polling |
 | `SPI_COOKIE_SECURE` | `0` | Set `1` when serving over HTTPS |
 | `SPI_ENCRYPTION_KEY` | — | Fernet key overriding the on-disk key file |
-| `SPI_TLS` | `0` | Set `1` to serve HTTPS with an auto-generated self-signed certificate (via `python -m app` or the macOS launcher); enables Secure cookies automatically. |
+| `SPI_TLS` | `0` | Set `1` to serve HTTPS with an auto-generated self-signed certificate; enables Secure cookies automatically. |
 | `SPI_TLS_CERTFILE` | — | Absolute path to an administrator-managed PEM certificate or certificate chain. Requires `SPI_TLS=1` and `SPI_TLS_KEYFILE`. |
 | `SPI_TLS_KEYFILE` | — | Absolute path to the matching unencrypted PEM private key. The key must not be accessible to group or other users. |
 
@@ -203,17 +207,16 @@ socket peer, HTTP `Host`, optional `Origin`, and absence of forwarding headers
 must all indicate loopback before HTTP is allowed. All other requests require
 the app's built-in TLS (`SPI_TLS=1`); request URL schemes and
 `X-Forwarded-Proto` never satisfy that rule. This keeps DNS rebinding and
-reverse/local proxies from removing the secret or transport requirements. The
-bundled runner retains Uvicorn's trusted-proxy defaults so login throttling can
-use a real forwarded client address from an explicitly trusted proxy, while
-bootstrap authorization remains independent and fail-closed.
+reverse/local proxies from removing the secret or transport requirements.
+Login throttling uses the directly observed socket address, while bootstrap
+authorization remains independent and fail-closed.
 
 To replace the generated self-signed certificate with a certificate trusted by
 your LAN devices, set `SPI_TLS_CERTFILE` and `SPI_TLS_KEYFILE` to absolute paths
 and restart the service. The runner validates the certificate dates, matching
 private key, and private-key permissions before it opens a socket. Certificate
 renewal remains administrator-managed; restart the service after replacing the
-files so Uvicorn loads the renewed pair. If either path is missing or invalid,
+files so the Rust TLS server loads the renewed pair. If either path is missing or invalid,
 startup fails instead of silently falling back to another certificate.
 
 The app removes the plaintext bootstrap secret from its own process environment

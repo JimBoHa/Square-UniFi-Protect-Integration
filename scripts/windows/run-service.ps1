@@ -1,9 +1,10 @@
 # Start the scheduled Windows service and retire its DPAPI-protected setup secret.
 $ErrorActionPreference = "Stop"
 $Repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$Python = "$Repo\.venv\Scripts\python.exe"
+$Binary = "$Repo\target\release\square-unifi-protect.exe"
 $BootstrapSecretFile = Join-Path $Repo "data\bootstrap-secret.dpapi"
 $ServicePidFile = Join-Path $Repo "data\service-process.pid"
+$env:SPI_DATA_DIR = "$Repo\data"
 $HasBootstrapSecret = Test-Path $BootstrapSecretFile
 $BootstrapSecret = $null
 
@@ -28,8 +29,8 @@ if ($HasBootstrapSecret) {
 }
 
 $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
-$StartInfo.FileName = $Python
-$StartInfo.Arguments = "-m app"
+$StartInfo.FileName = $Binary
+$StartInfo.Arguments = ""
 $StartInfo.WorkingDirectory = $Repo
 $StartInfo.UseShellExecute = $false
 $StartInfo.CreateNoWindow = $true
@@ -47,7 +48,8 @@ try {
   if ($HasBootstrapSecret) {
     while (-not $Process.HasExited) {
       Start-Sleep -Seconds 2
-      & $Python "$Repo\scripts\windows\setup_complete.py" "$Repo\data"
+      $env:SPI_DATA_DIR = "$Repo\data"
+      & $Binary --setup-complete
       if ($LASTEXITCODE -eq 0) {
         Remove-Item $BootstrapSecretFile -Force -ErrorAction SilentlyContinue
         break

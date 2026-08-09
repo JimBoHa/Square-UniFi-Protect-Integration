@@ -5,3 +5,7 @@ tests
 *.dmg
 build
 dist
+target
+.venv
+__pycache__
+*.pyc

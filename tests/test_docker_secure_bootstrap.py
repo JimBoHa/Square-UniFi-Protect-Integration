@@ -14,7 +14,10 @@ def test_container_enables_builtin_tls_for_wildcard_bind():
     assert "SPI_TLS=1" in dockerfile
     assert 'SPI_TLS: "1"' in compose
     assert "SPI_BOOTSTRAP_SECRET" not in compose
-    assert 'CMD ["python", "-m", "app.healthcheck"]' in dockerfile
+    assert (
+        'CMD ["gosu", "square-protect", "square-unifi-protect", "--healthcheck"]'
+        in dockerfile
+    )
 
 
 def test_docker_smoke_probe_uses_the_tls_endpoint():

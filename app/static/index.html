@@ -242,6 +242,11 @@
         <button type="submit">Add user</button>
       </form>
       <div id="user-list" class="user-list" aria-live="polite"></div>
+
+      <h2>Login history</h2>
+      <p class="hint">Successful sign-ins are retained as an append-only record with the account role and client IP observed by the server.</p>
+      <div id="login-audit-list" class="login-audit-list" aria-live="polite"></div>
+      <button type="button" id="login-audit-more" hidden>Load older logins</button>
     </section>
 
     <!-- Transactions -->
@@ -306,6 +311,7 @@
   <script src="/webhook-delivery.js"></script>
   <script src="/roles.js"></script>
   <script src="/user-management.js"></script>
+  <script src="/login-audit.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

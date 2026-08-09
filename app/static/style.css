@@ -78,6 +78,13 @@ button[type="submit"], #save-mapping, #sync-now, #export-csv {
   align-items: end; gap: 0.5rem; max-width: none; margin: 0.75rem 0 0;
 }
 .user-reset-form button { min-height: 2.35rem; }
+.login-audit-list { display: grid; gap: 0.5rem; margin-bottom: 0.75rem; }
+.login-audit-row {
+  display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
+  border-bottom: 1px solid var(--border); padding: 0.45rem 0;
+}
+.login-audit-row .hint { margin: 0; }
+#login-audit-more { margin-bottom: 2rem; }
 
 .txn {
   display: flex; gap: 1rem; align-items: center;

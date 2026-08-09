@@ -293,6 +293,26 @@ CREATE TABLE IF NOT EXISTS sessions (
     expires_at REAL NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS login_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    username TEXT NOT NULL CHECK (length(username) BETWEEN 1 AND 64),
+    role TEXT NOT NULL CHECK (role IN ('admin', 'viewer')),
+    client_ip TEXT NOT NULL CHECK (length(client_ip) BETWEEN 1 AND 128),
+    logged_in_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_login_audit_user
+    ON login_audit (user_id, id DESC);
+CREATE TRIGGER IF NOT EXISTS login_audit_prevent_update
+BEFORE UPDATE ON login_audit
+BEGIN
+    SELECT RAISE(ABORT, 'login audit is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS login_audit_prevent_delete
+BEFORE DELETE ON login_audit
+BEGIN
+    SELECT RAISE(ABORT, 'login audit is append-only');
+END;
 CREATE TABLE IF NOT EXISTS square_oauth_states (
     state_hash TEXT PRIMARY KEY,
     created_at REAL NOT NULL,
@@ -3795,7 +3815,11 @@ class Store:
         token: str,
         user_id: int,
         expected_auth_revision: int,
+        client_ip: str = "unknown",
     ) -> dict:
+        client_ip = str(client_ip).strip()
+        if not 1 <= len(client_ip) <= 128:
+            raise ValueError("Invalid login client address")
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -3815,11 +3839,61 @@ class Store:
                         time.time() + SESSION_TTL_SECONDS,
                     ),
                 )
+                self._db.execute(
+                    "INSERT INTO login_audit "
+                    "(user_id, username, role, client_ip, logged_in_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        int(user["id"]),
+                        user["username"],
+                        user["role"],
+                        client_ip,
+                        time.time(),
+                    ),
+                )
                 self._db.commit()
             except Exception:
                 self._db.rollback()
                 raise
         return dict(user)
+
+    def list_login_audit(
+        self,
+        *,
+        limit: int = 100,
+        before_id: int | None = None,
+    ) -> tuple[list[dict], int | None]:
+        if not 1 <= int(limit) <= 250:
+            raise ValueError("Invalid login audit limit")
+        if before_id is not None and int(before_id) < 1:
+            raise ValueError("Invalid login audit cursor")
+        parameters: list[int] = []
+        where = ""
+        if before_id is not None:
+            where = "WHERE id < ?"
+            parameters.append(int(before_id))
+        parameters.append(int(limit) + 1)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, user_id, username, role, client_ip, logged_in_at "
+                f"FROM login_audit {where} ORDER BY id DESC LIMIT ?",
+                parameters,
+            ).fetchall()
+        has_more = len(rows) > int(limit)
+        rows = rows[: int(limit)]
+        events = [
+            {
+                "id": int(row["id"]),
+                "user_id": int(row["user_id"]),
+                "username": row["username"],
+                "role": row["role"],
+                "client_ip": row["client_ip"],
+                "logged_in_at": float(row["logged_in_at"]),
+            }
+            for row in rows
+        ]
+        next_before_id = events[-1]["id"] if has_more and events else None
+        return events, next_before_id
 
     def session_user(self, token: str) -> dict | None:
         now = time.time()

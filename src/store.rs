@@ -2800,7 +2800,7 @@ fn increment_plain_setting(transaction: &Transaction<'_>, key: &str) -> AppResul
 fn max_plain_setting(transaction: &Transaction<'_>, key: &str, value: i64) -> AppResult<()> {
     transaction.execute(
         "INSERT INTO settings (key, value, encrypted) VALUES (?, ?, 0) \
-         ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(settings.value AS INTEGER), excluded.value), encrypted=0",
+         ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(settings.value AS INTEGER), CAST(excluded.value AS INTEGER)), encrypted=0",
         params![key, value.to_string()],
     )?;
     Ok(())

@@ -1449,7 +1449,15 @@ def create_app(
             store.update_thumbnail_storage_settings(
                 thumbnail_storage.policy_values(requested)
             )
-        schedule_thumbnail_maintenance()
+        # A newly enabled quota must be evaluated after legacy thumbnails are
+        # compressed. Otherwise the first maintenance pass can permanently
+        # retire uncompressed evidence that would fit once the requested
+        # compression policy is applied.
+        schedule_thumbnail_maintenance(
+            optimize_existing=(
+                requested.compression_enabled and requested.max_storage_mib > 0
+            )
+        )
         return {"ok": True, **thumbnail_storage_settings_response()}
 
     @app.post("/api/settings/thumbnail-storage/maintenance")

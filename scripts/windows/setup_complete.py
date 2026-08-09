@@ -13,9 +13,21 @@ def setup_complete(data_dir: Path) -> bool:
         with sqlite3.connect(
             f"{database.resolve().as_uri()}?mode=ro", uri=True, timeout=0.2
         ) as connection:
-            row = connection.execute(
-                "SELECT value FROM settings WHERE key = 'admin.password_hash'"
+            users_table = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'users'"
             ).fetchone()
+            if users_table:
+                row = connection.execute(
+                    "SELECT 1 FROM users "
+                    "WHERE role = 'admin' AND enabled = 1 LIMIT 1"
+                ).fetchone()
+            else:
+                # Permit setup detection while upgrading a pre-roles release.
+                row = connection.execute(
+                    "SELECT value FROM settings "
+                    "WHERE key = 'admin.password_hash'"
+                ).fetchone()
     except sqlite3.Error:
         return False
     return bool(row and row[0])

@@ -10,8 +10,9 @@
   <header>
     <h1>Square × UniFi Protect</h1>
     <nav id="nav" hidden>
+      <span id="session-identity" class="session-identity"></span>
       <button data-view="transactions" class="active">Transactions</button>
-      <button data-view="settings">Settings</button>
+      <button data-view="settings" data-admin-only hidden>Settings</button>
       <button id="logout-btn">Log out</button>
     </nav>
   </header>
@@ -26,10 +27,10 @@
 
     <!-- First-run setup -->
     <section id="view-setup" hidden>
-      <h2>Create admin password</h2>
-      <p>This password protects the integration's settings and transaction feed.</p>
+      <h2>Create administrator account</h2>
+      <p>The initial username is <strong>admin</strong>. This account protects the integration's settings and transaction feed.</p>
       <form id="setup-form">
-        <label>Password (min 8 chars) <input type="password" id="setup-password" minlength="8" required></label>
+        <label>Password (min 8 chars) <input type="password" id="setup-password" minlength="8" autocomplete="new-password" required></label>
         <label>One-time bootstrap secret
           <input type="password" id="setup-bootstrap-secret" minlength="32"
                  maxlength="4096" required autocomplete="off"
@@ -46,7 +47,8 @@
     <section id="view-login" hidden>
       <h2>Log in</h2>
       <form id="login-form">
-        <label>Password <input type="password" id="login-password" required></label>
+        <label>Username <input id="login-username" value="admin" maxlength="64" autocomplete="username" required></label>
+        <label>Password <input type="password" id="login-password" autocomplete="current-password" required></label>
         <button type="submit">Log in</button>
       </form>
     </section>
@@ -239,7 +241,7 @@
         <div class="toolbar-actions">
           <a id="export-csv" href="/api/transactions/export.csv"
              download="square-protect-transactions.csv">Download CSV</a>
-          <button id="sync-now">Sync now</button>
+          <button id="sync-now" data-admin-only hidden>Sync now</button>
         </div>
       </div>
       <p class="hint">Click a thumbnail to open the UniFi Protect timeline at the moment of the transaction.</p>
@@ -286,6 +288,7 @@
   <script src="/nav-view.js"></script>
   <script src="/transaction-filters.js"></script>
   <script src="/webhook-delivery.js"></script>
+  <script src="/roles.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

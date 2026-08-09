@@ -191,6 +191,7 @@ pub fn write_thumbnail(path: &Path, bytes: &[u8]) -> AppResult<()> {
 mod tests {
     use super::*;
     use image::{ImageBuffer, Rgb};
+    use std::sync::{Arc, Barrier};
 
     fn noisy_jpeg(width: u32, height: u32) -> Vec<u8> {
         let image = ImageBuffer::from_fn(width, height, |x, y| {
@@ -249,5 +250,126 @@ mod tests {
         assert!(!prepared.changed);
         assert_eq!(prepared.policy_revision, 4);
         assert!(prepared.error.is_some());
+    }
+
+    #[test]
+    fn disabled_compression_never_decodes_or_changes_input() {
+        let original = b"not-even-a-jpeg";
+        let policy = ThumbnailPolicy {
+            compression_enabled: false,
+            jpeg_quality: 1,
+            max_dimension: 1,
+            retention_days: 45,
+            max_storage_mib: 100,
+            revision: 99,
+        };
+        let prepared = prepare_thumbnail(original, &policy);
+        assert_eq!(prepared.data, original);
+        assert_eq!(prepared.policy_revision, 0);
+        assert!(!prepared.changed);
+        assert!(prepared.error.is_none());
+    }
+
+    #[test]
+    fn policy_loader_defaults_and_clamps_corrupt_stored_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        assert_eq!(
+            load_policy(&store).unwrap(),
+            ThumbnailPolicy {
+                compression_enabled: false,
+                jpeg_quality: 72,
+                max_dimension: 960,
+                retention_days: 0,
+                max_storage_mib: 0,
+                revision: 0,
+            }
+        );
+        for (key, value) in [
+            ("thumbnail.compression_enabled", "1"),
+            ("thumbnail.jpeg_quality", "999"),
+            ("thumbnail.max_dimension", "2"),
+            ("thumbnail.retention_days", "-5"),
+            ("thumbnail.max_storage_mib", "999999999"),
+            ("thumbnail.policy_revision", "not-a-number"),
+        ] {
+            store.set_setting(key, value, false).unwrap();
+        }
+        let policy = load_policy(&store).unwrap();
+        assert!(policy.compression_enabled);
+        assert_eq!(policy.jpeg_quality, 95);
+        assert_eq!(policy.max_dimension, 320);
+        assert_eq!(policy.retention_days, 0);
+        assert_eq!(policy.max_storage_mib, 1_048_576);
+        assert_eq!(policy.revision, 0);
+    }
+
+    #[test]
+    fn thumbnail_write_is_atomic_private_and_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("thumbnail.jpg");
+        write_thumbnail(&path, b"first-published-image").unwrap();
+        assert_eq!(read_thumbnail(&path).unwrap(), b"first-published-image");
+        write_thumbnail(&path, b"replacement-image").unwrap();
+        assert_eq!(read_thumbnail(&path).unwrap(), b"replacement-image");
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .count(),
+            0
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_thumbnail_writes_never_publish_mixed_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("race.jpg");
+        let first = vec![b'A'; 256 * 1024];
+        let second = vec![b'B'; 256 * 1024];
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [first.clone(), second.clone()]
+            .into_iter()
+            .map(|bytes| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_thumbnail(&path, &bytes).unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let published = read_thumbnail(&path).unwrap();
+        assert!(published == first || published == second);
+    }
+
+    #[test]
+    fn thumbnail_reader_rejects_directories_and_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read_thumbnail(temp.path()),
+            Err(AppError::BadRequest(_))
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let target = temp.path().join("target.jpg");
+            let link = temp.path().join("link.jpg");
+            fs::write(&target, b"image").unwrap();
+            symlink(&target, &link).unwrap();
+            assert!(matches!(
+                read_thumbnail(&link),
+                Err(AppError::BadRequest(_))
+            ));
+        }
     }
 }

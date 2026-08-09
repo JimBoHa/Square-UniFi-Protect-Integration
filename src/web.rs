@@ -2641,6 +2641,33 @@ mod tests {
             .to_owned()
     }
 
+    fn authenticated_state(data_dir: PathBuf) -> (AppState, String) {
+        let state = test_state(data_dir);
+        assert!(
+            state
+                .store
+                .create_initial_admin("test-only-password-hash")
+                .unwrap()
+        );
+        let admin = state.store.user_for_login("admin").unwrap().unwrap();
+        let token = "direct-admin-session-token";
+        state
+            .store
+            .create_session(token, admin.id, admin.auth_revision, "127.0.0.1")
+            .unwrap();
+        (state, format!("{SESSION_COOKIE}={token}"))
+    }
+
+    async fn response_bytes(response: Response) -> Vec<u8> {
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
+    }
+
     #[test]
     fn spreadsheet_cells_are_formula_safe() {
         assert_eq!(safe_csv_cell("=1+1"), "'=1+1");
@@ -2653,6 +2680,228 @@ mod tests {
         assert!(is_trusted_lan("10.1.2.3".parse().unwrap()));
         assert!(is_trusted_lan(IpAddr::V6(Ipv6Addr::LOCALHOST)));
         assert!(!is_trusted_lan("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_lan_covers_private_link_local_and_mapped_addresses() {
+        for address in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "127.0.0.1",
+            "fd00::1",
+            "fe80::1",
+            "::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(is_trusted_lan(address.parse().unwrap()), "{address}");
+        }
+        for address in ["1.1.1.1", "8.8.8.8", "2001:4860:4860::8888"] {
+            assert!(!is_trusted_lan(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[test]
+    fn host_and_origin_parsing_fail_closed_at_authority_boundaries() {
+        for (authority, expected) in [
+            ("localhost", Some("localhost")),
+            ("localhost:8000", Some("localhost")),
+            ("127.0.0.1:443", Some("127.0.0.1")),
+            ("[::1]:8000", Some("::1")),
+        ] {
+            assert_eq!(authority_host(authority), expected);
+        }
+        for invalid in [
+            "localhost:65536",
+            "localhost/path",
+            "user@localhost",
+            "localhost?x=1",
+            "localhost #fragment",
+            "[::1",
+            "[::1]:bad",
+        ] {
+            assert!(authority_host(invalid).is_none(), "{invalid:?}");
+        }
+        assert!(loopback_origin("http://localhost:8000"));
+        assert!(loopback_origin("https://127.0.0.1"));
+        assert!(!loopback_origin("https://10.0.0.1"));
+        assert!(!loopback_origin("file:///tmp/index.html"));
+    }
+
+    #[test]
+    fn deep_link_templates_require_https_host_and_bounded_placeholders() {
+        for valid in [
+            DEFAULT_DEEP_LINK_TEMPLATE,
+            "https://{host}/protect/{camera_id}/timeline?time={ts_ms}",
+        ] {
+            validate_deep_link_template(valid).unwrap();
+        }
+        for invalid in [
+            "http://{host}/{camera_id}?t={ts_ms}",
+            "https://example.test/{camera_id}?t={ts_ms}",
+            "https://{host}/timeline?t={ts_ms}",
+            "https://{host}/timeline/{camera_id}",
+            "https://{host}.{host}/{camera_id}?t={ts_ms}",
+            "javascript:https://{host}/{camera_id}/{ts_ms}",
+        ] {
+            assert!(matches!(
+                validate_deep_link_template(invalid),
+                Err(AppError::Unprocessable(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn csv_formula_neutralization_preserves_rfc4180_newlines() {
+        for dangerous in [
+            "+1",
+            "-2",
+            "@SUM(A:A)",
+            "\tformula",
+            "\nformula",
+            " \u{feff}=1",
+        ] {
+            assert!(safe_csv_cell(dangerous).starts_with('\''), "{dangerous:?}");
+        }
+        assert_eq!(safe_csv_cell("line1\nline2"), "line1\r\nline2");
+        assert_eq!(safe_csv_cell("line1\rline2"), "line1\r\nline2");
+    }
+
+    #[test]
+    fn content_type_accepts_json_suffixes_only() {
+        for value in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "application/problem+json",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(value).unwrap());
+            require_json_content_type(&headers, "json required").unwrap();
+        }
+        for value in ["", "text/json", "text/plain", "application/jsonp"] {
+            let mut headers = HeaderMap::new();
+            if !value.is_empty() {
+                headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(value).unwrap());
+            }
+            assert!(matches!(
+                require_json_content_type(&headers, "json required"),
+                Err(AppError::UnsupportedMediaType(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn motion_tokens_accept_one_header_form_and_reject_ambiguity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-spi-webhook-token",
+            HeaderValue::from_static("custom-token"),
+        );
+        assert_eq!(motion_token(&headers).unwrap(), "custom-token");
+        headers.clear();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer bearer-token"),
+        );
+        assert_eq!(motion_token(&headers).unwrap(), "bearer-token");
+        headers.insert(
+            "x-spi-webhook-token",
+            HeaderValue::from_static("other-token"),
+        );
+        assert!(matches!(
+            motion_token(&headers),
+            Err(AppError::Unauthorized(_))
+        ));
+        headers.insert(
+            "x-spi-webhook-token",
+            HeaderValue::from_static("bearer-token"),
+        );
+        assert_eq!(motion_token(&headers).unwrap(), "bearer-token");
+    }
+
+    #[test]
+    fn motion_payload_is_normalized_deduped_and_time_bounded() {
+        let received = 1_800_000_000_000;
+        let body = json!({
+            "timestamp": received - 1_000,
+            "alarm": {
+                "name": "Register motion",
+                "conditions": [{"condition": {"source": "motion"}}],
+                "triggers": [
+                    {"key": "motion", "device": "sensor-2"},
+                    {"key": "motion", "device": "sensor-1"},
+                    {"key": "motion", "device": "sensor-1"}
+                ]
+            }
+        });
+        let parsed = parse_motion_payload(
+            &serde_json::to_vec(&body).unwrap(),
+            received,
+            received - 86_400_000,
+        )
+        .unwrap();
+        assert_eq!(parsed.timestamp, received - 1_000);
+        assert_eq!(parsed.alarm_name, "Register motion");
+        assert_eq!(parsed.devices, ["sensor-2", "sensor-1"]);
+        assert!(parsed.event_key.starts_with("post:"));
+        assert_eq!(parsed.event_key.len(), 69);
+
+        for invalid in [
+            json!({}),
+            json!({"timestamp": received - 86_400_001, "alarm": {"conditions": [{"condition": {"source": "motion"}}]}}),
+            json!({"timestamp": received + 300_001, "alarm": {"conditions": [{"condition": {"source": "motion"}}]}}),
+            json!({"timestamp": received, "alarm": {"conditions": []}}),
+            json!({"timestamp": received, "alarm": {"conditions": "motion"}}),
+        ] {
+            assert!(matches!(
+                parse_motion_payload(
+                    &serde_json::to_vec(&invalid).unwrap(),
+                    received,
+                    received - 86_400_000
+                ),
+                Err(AppError::Unprocessable(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn webhook_receipt_key_prefers_safe_event_id_and_falls_back_to_body() {
+        let body = br#"{"type":"payment.updated"}"#;
+        let first = webhook_receipt_key(Some(&json!("event-1")), body);
+        let second = webhook_receipt_key(Some(&json!("event-1")), b"different");
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert_ne!(webhook_receipt_key(Some(&json!("event-2")), body), first);
+        assert_eq!(
+            webhook_receipt_key(Some(&json!("")), body),
+            webhook_receipt_key(None, body)
+        );
+    }
+
+    #[test]
+    fn discovery_parser_accepts_console_tlv_and_rejects_truncation() {
+        fn field(kind: u8, value: &str) -> Vec<u8> {
+            let mut bytes = vec![kind];
+            bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+            bytes
+        }
+        let mut payload = Vec::new();
+        payload.extend(field(0x06, "Barn UNVR"));
+        payload.extend(field(0x0b, "barn-unvr"));
+        payload.extend(field(0x0c, "UNVRPRO"));
+        payload.extend(field(0x03, "4.1.22"));
+        let mut response = vec![1, 0];
+        response.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        response.extend(payload);
+        let parsed = parse_discovery_response(&response, "10.0.0.20".parse().unwrap()).unwrap();
+        assert_eq!(parsed["ip"], "10.0.0.20");
+        assert_eq!(parsed["name"], "Barn UNVR");
+        assert_eq!(parsed["model"], "UNVRPRO");
+        assert_eq!(parsed["is_console"], true);
+        assert!(parse_discovery_response(b"garbage", "10.0.0.20".parse().unwrap()).is_none());
+        response.pop();
+        assert!(parse_discovery_response(&response, "10.0.0.20".parse().unwrap()).is_none());
     }
 
     #[tokio::test]
@@ -2757,6 +3006,462 @@ mod tests {
             .unwrap();
         assert_eq!(readable.status(), StatusCode::OK);
         assert!(response_json_value(readable).await.is_array());
+    }
+
+    #[tokio::test]
+    async fn every_private_read_and_action_rejects_missing_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = build_router(test_state(temp.path().to_owned()));
+        for (method, path) in [
+            ("GET", "/api/session"),
+            ("POST", "/api/logout"),
+            ("GET", "/api/users"),
+            ("GET", "/api/login-audit"),
+            ("GET", "/api/settings/protect/alarm"),
+            ("DELETE", "/api/settings/protect/alarm"),
+            ("POST", "/api/settings/protect/alarm/test"),
+            ("GET", "/api/settings/deep-link"),
+            ("GET", "/api/settings/protect/motion-webhook"),
+            ("DELETE", "/api/settings/protect/motion-webhook"),
+            ("GET", "/api/settings/thumbnail-storage"),
+            ("POST", "/api/settings/thumbnail-storage/maintenance"),
+            ("GET", "/oauth/square/start"),
+            ("DELETE", "/api/settings/square/oauth-switch"),
+            ("GET", "/api/health/protect"),
+            ("GET", "/api/cameras"),
+            ("GET", "/api/health/square"),
+            ("GET", "/api/locations"),
+            ("GET", "/api/pos-devices"),
+            ("GET", "/api/camera-preview/abc123"),
+            ("GET", "/api/camera-mapping"),
+            ("GET", "/api/dashboard"),
+            ("GET", "/api/motion-alerts"),
+            ("GET", "/api/transactions/export.csv"),
+            ("GET", "/api/transactions"),
+            ("GET", "/api/thumbnails/PAY_1"),
+            ("POST", "/api/sync"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(http_request(method, path, json!({}), None))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-store"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn security_headers_cover_static_api_and_missing_responses() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = build_router(test_state(temp.path().to_owned()));
+        for path in ["/", "/api/status", "/missing"] {
+            let response = app
+                .clone()
+                .oneshot(http_request("GET", path, json!({}), None))
+                .await
+                .unwrap();
+            for name in [
+                "content-security-policy",
+                "cross-origin-resource-policy",
+                "permissions-policy",
+                "referrer-policy",
+                "x-content-type-options",
+                "x-frame-options",
+                "x-permitted-cross-domain-policies",
+            ] {
+                assert!(response.headers().contains_key(name), "{path}: {name}");
+            }
+            assert_eq!(response.headers()["x-frame-options"], "DENY");
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_validates_secret_password_and_single_use_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = build_router(test_state(temp.path().to_owned()));
+        for (password, secret, expected) in [
+            (
+                "short",
+                TEST_BOOTSTRAP_SECRET,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                ADMIN_PASSWORD,
+                "wrong-bootstrap-secret-that-is-long-enough",
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(http_request(
+                    "POST",
+                    "/api/setup",
+                    json!({"password": password, "bootstrap_secret": secret}),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let setup = app
+            .clone()
+            .oneshot(http_request(
+                "POST",
+                "/api/setup",
+                json!({"password": ADMIN_PASSWORD, "bootstrap_secret": TEST_BOOTSTRAP_SECRET}),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(setup.status(), StatusCode::OK);
+        let repeated = app
+            .oneshot(http_request(
+                "POST",
+                "/api/setup",
+                json!({"password": ADMIN_PASSWORD, "bootstrap_secret": TEST_BOOTSTRAP_SECRET}),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn direct_session_logout_invalidates_only_current_cookie() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, cookie) = authenticated_state(temp.path().to_owned());
+        let app = build_router(state);
+        let session = app
+            .clone()
+            .oneshot(http_request(
+                "GET",
+                "/api/session",
+                json!({}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(session.status(), StatusCode::OK);
+        assert_eq!(
+            response_json_value(session).await["user"]["role"],
+            ROLE_ADMIN
+        );
+        let logout = app
+            .clone()
+            .oneshot(http_request(
+                "POST",
+                "/api/logout",
+                json!({}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::OK);
+        assert!(
+            logout.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+        let expired = app
+            .oneshot(http_request(
+                "GET",
+                "/api/session",
+                json!({}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_user_routes_create_list_reset_and_never_return_passwords() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, cookie) = authenticated_state(temp.path().to_owned());
+        let app = build_router(state);
+        let created = app
+            .clone()
+            .oneshot(http_request(
+                "POST",
+                "/api/users",
+                json!({"username": "barn.viewer", "password": "viewer-password", "role": "viewer"}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body = response_json_value(created).await;
+        let user_id = created_body["user"]["id"].as_i64().unwrap();
+        assert!(!created_body.to_string().contains("viewer-password"));
+        let listed = app
+            .clone()
+            .oneshot(http_request("GET", "/api/users", json!({}), Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = response_json_value(listed).await;
+        assert_eq!(listed_body["users"].as_array().unwrap().len(), 2);
+        assert!(!listed_body.to_string().contains("password"));
+        let reset = app
+            .oneshot(http_request(
+                "PUT",
+                &format!("/api/users/{user_id}/password"),
+                json!({"password": "replacement-password"}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reset.status(), StatusCode::OK);
+        assert!(
+            !response_json_value(reset)
+                .await
+                .to_string()
+                .contains("replacement-password")
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_health_dashboard_and_settings_are_explicit() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, cookie) = authenticated_state(temp.path().to_owned());
+        let app = build_router(state);
+        for path in ["/api/health/protect", "/api/health/square"] {
+            let response = app
+                .clone()
+                .oneshot(http_request("GET", path, json!({}), Some(&cookie)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json_value(response).await;
+            assert_eq!(body["configured"], false);
+            assert_eq!(body["ok"], false);
+            assert_eq!(body["detail"], "Not configured");
+        }
+        let dashboard = app
+            .clone()
+            .oneshot(http_request(
+                "GET",
+                "/api/dashboard",
+                json!({}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let body = response_json_value(dashboard).await;
+        assert_eq!(body["protect"]["configured"], false);
+        assert_eq!(body["square"]["configured"], false);
+        assert!(body.get("webhook").is_some());
+        assert!(body.get("motion").is_some());
+        assert!(body.get("queues").is_some());
+
+        let storage = app
+            .oneshot(http_request(
+                "GET",
+                "/api/settings/thumbnail-storage",
+                json!({}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let body = response_json_value(storage).await;
+        assert_eq!(body["jpeg_quality"], 72);
+        assert_eq!(body["max_dimension"], 960);
+        assert_eq!(body["usage"]["active_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn deep_link_settings_roundtrip_and_invalid_template_preserves_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, cookie) = authenticated_state(temp.path().to_owned());
+        let app = build_router(state);
+        let initial = app
+            .clone()
+            .oneshot(http_request(
+                "GET",
+                "/api/settings/deep-link",
+                json!({}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let initial = response_json_value(initial).await;
+        assert_eq!(initial["template"], "");
+        assert_eq!(initial["default_template"], DEFAULT_DEEP_LINK_TEMPLATE);
+        let custom = "https://{host}/protect/{camera_id}/timeline?start={ts_ms}";
+        let saved = app
+            .clone()
+            .oneshot(http_request(
+                "PUT",
+                "/api/settings/deep-link",
+                json!({"template": format!("  {custom}  ")}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert_eq!(response_json_value(saved).await["template"], custom);
+        let invalid = app
+            .clone()
+            .oneshot(http_request(
+                "PUT",
+                "/api/settings/deep-link",
+                json!({"template": "javascript:{host}/{camera_id}/{ts_ms}"}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let current = app
+            .oneshot(http_request(
+                "GET",
+                "/api/settings/deep-link",
+                json!({}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response_json_value(current).await["template"], custom);
+    }
+
+    #[tokio::test]
+    async fn transaction_query_note_and_export_hit_the_native_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, cookie) = authenticated_state(temp.path().to_owned());
+        state
+            .store
+            .set_setting("protect.host", "protect.lan", false)
+            .unwrap();
+        state
+            .store
+            .replace_camera_mappings(&[CameraMappingEntry {
+                location_id: "=LOC".into(),
+                device_id: String::new(),
+                device_name: String::new(),
+                camera_id: "abc123".into(),
+                camera_name: "Counter".into(),
+            }])
+            .unwrap();
+        state
+            .store
+            .upsert_payment(&PaymentFacts {
+                id: "=PAY_FORMULA".into(),
+                created_at: "2027-01-15T08:00:00.000Z".into(),
+                ts_ms: 1_800_000_000_000,
+                updated_at: "2027-01-15T08:00:00.000Z".into(),
+                updated_ts_ms: 1_800_000_000_000,
+                amount: 99,
+                currency: "USD".into(),
+                status: "COMPLETED".into(),
+                location_id: "=LOC".into(),
+                card_last4: "@4242".into(),
+                ..PaymentFacts::default()
+            })
+            .unwrap();
+        let app = build_router(state);
+        let query = app
+            .clone()
+            .oneshot(http_request(
+                "POST",
+                "/api/transactions",
+                json!({"limit": 50, "offset": 0, "q": "PAY_FORMULA", "status": "COMPLETED"}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(query.status(), StatusCode::OK);
+        let payload = response_json_value(query).await;
+        assert_eq!(payload.as_array().unwrap().len(), 1);
+        assert!(
+            payload[0]["deep_link"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://protect.lan/")
+        );
+        let note = app
+            .clone()
+            .oneshot(http_request(
+                "PUT",
+                "/api/transactions/=PAY_FORMULA/note",
+                json!({"note": "=review this", "revision": 0}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(note.status(), StatusCode::OK);
+        assert_eq!(response_json_value(note).await["note_revision"], 1);
+        let export = app
+            .oneshot(http_request(
+                "GET",
+                "/api/transactions/export.csv",
+                json!({}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(export.status(), StatusCode::OK);
+        assert!(
+            export.headers()[header::CONTENT_DISPOSITION]
+                .to_str()
+                .unwrap()
+                .contains("square-protect-transactions.csv")
+        );
+        let csv = String::from_utf8(response_bytes(export).await).unwrap();
+        assert!(csv.contains("'=PAY_FORMULA"));
+        assert!(csv.contains("'@4242"));
+        assert!(csv.contains("'=review this"));
+        assert!(!csv.contains("raw"));
+    }
+
+    #[tokio::test]
+    async fn square_webhook_fails_closed_before_configuration_and_signature() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(temp.path().to_owned());
+        let app = build_router(state.clone());
+        let unconfigured = app
+            .clone()
+            .oneshot(http_request(
+                "POST",
+                "/webhooks/square",
+                json!({"type": "payment.updated"}),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unconfigured.status(), StatusCode::FORBIDDEN);
+        state
+            .store
+            .update_settings(
+                &[
+                    ("square.webhook_signature_key", "webhook-key", true),
+                    (
+                        "square.webhook_url",
+                        "https://example.test/webhooks/square",
+                        false,
+                    ),
+                    ("square.merchant_id", "MERCHANT_1", false),
+                ],
+                &[],
+            )
+            .unwrap();
+        let unsigned = app
+            .oneshot(http_request(
+                "POST",
+                "/webhooks/square",
+                json!({"merchant_id": "MERCHANT_1", "type": "payment.updated"}),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

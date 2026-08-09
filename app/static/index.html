@@ -141,6 +141,27 @@
         <button type="submit">Save timeline link</button>
       </form>
 
+      <h3>Thumbnail storage</h3>
+      <form id="thumbnail-storage-form">
+        <label class="check"><input type="checkbox" id="thumbnail-compression-enabled"> Compress new thumbnails</label>
+        <label>JPEG quality
+          <input type="number" id="thumbnail-jpeg-quality" min="30" max="95" value="72" required>
+        </label>
+        <label>Maximum image edge (pixels)
+          <input type="number" id="thumbnail-max-dimension" min="320" max="3840" value="960" required>
+        </label>
+        <label>Retain thumbnails for days (0 = forever)
+          <input type="number" id="thumbnail-retention-days" min="0" max="3650" value="0" required>
+        </label>
+        <label>Maximum thumbnail storage (MiB; 0 = unlimited)
+          <input type="number" id="thumbnail-max-storage-mib" min="0" max="1048576" value="0" required>
+        </label>
+        <p class="hint">Age and storage limits permanently remove only thumbnail JPEGs, oldest first. Transaction details and UniFi Protect timeline links remain available.</p>
+        <p id="thumbnail-storage-status" class="hint" role="status"></p>
+        <button type="submit">Save storage controls</button>
+        <button type="button" id="thumbnail-optimize-existing">Optimize existing thumbnails now</button>
+      </form>
+
       <h2>Square account
         <span id="square-status" class="conn-status" role="status" hidden>
           <span class="conn-dot"></span><span class="conn-text"></span>

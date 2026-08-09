@@ -43,6 +43,9 @@ timeline near that timestamp.
   by update time. The dashboard reports measured Square-to-app delivery lag and
   safely ignores duplicate event IDs. Missed thumbnails persist in a durable
   retry queue with backoff, so a Protect outage never permanently loses evidence.
+- **Bounded thumbnail storage** — optionally resize/re-encode new or existing
+  JPEGs, expire thumbnails by age, and cap total thumbnail storage. Expiration
+  removes only image bytes; transaction facts and Protect timeline links remain.
 - **Role-bound sessions** — administrators can configure integrations and run
   manual syncs; view-only accounts can use the dashboard, transaction feed,
   CSV export, thumbnails, and footage links without changing configuration.
@@ -144,7 +147,10 @@ Then:
    Square once after upgrading so webhook events can be bound to that merchant.
 4. **Settings → POS camera** — pick the camera that watches each location's
    register.
-5. Open **Transactions** — press *Sync now* for an immediate backfill; the
+5. **Settings → Thumbnail storage** — optionally enable JPEG compression and
+   choose an age or total-size limit. Use *Optimize existing thumbnails now*
+   once to apply the active compression policy to already-captured files.
+6. Open **Transactions** — press *Sync now* for an immediate backfill; the
    poller (`SPI_POLL_INTERVAL`, default 60 s) keeps it current thereafter.
 
 ## Configuration
@@ -195,6 +201,16 @@ link**. Custom templates must use `https://` with `{host}` as the entire hostnam
 `{camera_id}` and `{ts_ms}`; leave the field blank to restore the built-in
 default (verified on Protect 7.1.87):
 `https://{host}/protect/timelapse/{camera_id}?start={ts_ms}`.
+
+Thumbnail compression and retention are disabled by default on upgrade. Under
+**Settings → Thumbnail storage**, compression affects new captures immediately;
+the explicit optimization button processes older files once per compression
+policy revision. A retention age of `0` keeps files forever and a storage limit
+of `0` is unlimited. Background Square polling, manual sync, settings changes,
+and application startup all schedule maintenance.
+The oldest JPEGs are retired first until both limits are satisfied. Retired
+transactions remain searchable and keep their Protect timeline links, and are
+marked so later Square overlap polls cannot recreate the deleted bytes.
 
 > **Note on historical thumbnails:** verified against a UNVR G2 running
 > Protect 7.1.87 — historical frames come from the `recording-snapshot`

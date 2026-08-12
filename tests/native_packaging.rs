@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, net::Ipv4Addr, path::PathBuf};
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -122,6 +122,11 @@ fn unix_service_build_is_skipped_during_uninstall() {
 #[test]
 fn unix_lan_services_enable_tls_without_hard_coded_host_ip() {
     let installer = source("scripts/install-service.sh");
+    let concrete_ipv4_literals = installer
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .filter_map(|candidate| candidate.parse::<Ipv4Addr>().ok())
+        .filter(|address| !address.is_unspecified())
+        .collect::<Vec<_>>();
     assert!(installer.contains("<key>SPI_HOST</key><string>0.0.0.0</string>"));
     assert!(installer.contains("Environment=SPI_HOST=0.0.0.0"));
     assert!(installer.contains("<key>SPI_PORT</key><string>3546</string>"));
@@ -129,7 +134,10 @@ fn unix_lan_services_enable_tls_without_hard_coded_host_ip() {
     assert!(installer.contains("<key>SPI_TLS</key><string>1</string>"));
     assert!(installer.contains("Environment=SPI_TLS=1"));
     assert!(installer.contains("https://<this-host>:3546"));
-    assert!(!installer.contains("10.0.7.215"));
+    assert!(
+        concrete_ipv4_literals.is_empty(),
+        "installer hard-codes concrete IPv4 addresses: {concrete_ipv4_literals:?}"
+    );
 }
 
 #[test]

@@ -3237,16 +3237,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .set_transaction_note("PAY_1", "barn review", 0)
+                .set_transaction_note("PAY_1", "manual review", 0)
                 .unwrap(),
-            Some(("barn review".into(), 1))
+            Some(("manual review".into(), 1))
         );
         assert!(matches!(
             store.set_transaction_note("PAY_1", "stale", 0),
             Err(AppError::Conflict(_))
         ));
         let (rows, _) = store
-            .list_transactions_page(50, 0, None, "barn", "")
+            .list_transactions_page(50, 0, None, "manual", "")
             .unwrap();
         assert_eq!(rows.len(), 1);
     }
@@ -3949,7 +3949,7 @@ mod tests {
             status: "PENDING".into(),
             location_id: "LOC_1".into(),
             device_id: "DEVICE_1".into(),
-            device_name: "Barn East".into(),
+            device_name: "Register One".into(),
             card_last4: "4242".into(),
             ..PaymentFacts::default()
         };
@@ -3966,7 +3966,7 @@ mod tests {
         store.upsert_payment(&update).unwrap();
         let transaction = store.get_transaction("PAY_FILTER").unwrap().unwrap();
         assert_eq!(transaction.device_id, "DEVICE_1");
-        assert_eq!(transaction.device_name, "Barn East");
+        assert_eq!(transaction.device_name, "Register One");
         assert!(matches!(
             store.list_transactions_page(50, 0, Some(snapshot), "", "PENDING"),
             Err(AppError::Conflict(_))
@@ -4006,7 +4006,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path()).unwrap();
         let (_, token) = store
-            .configure_motion(TEST_CAMERA_ID, "Barn East", 1, 0, 1, true)
+            .configure_motion(TEST_CAMERA_ID, "Checkout Camera", 1, 0, 1, true)
             .unwrap();
         let token = token.unwrap();
         store
@@ -4026,7 +4026,7 @@ mod tests {
                 device_id: String::new(),
                 device_name: String::new(),
                 camera_id: TEST_CAMERA_ID.into(),
-                camera_name: "Barn East".into(),
+                camera_name: "Checkout Camera".into(),
             }])
             .unwrap();
         store
@@ -4062,7 +4062,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path()).unwrap();
         let (_, token) = store
-            .configure_motion(TEST_CAMERA_ID, "Barn East", 1, 0, 1, true)
+            .configure_motion(TEST_CAMERA_ID, "Checkout Camera", 1, 0, 1, true)
             .unwrap();
         let token = token.unwrap();
         for index in 0..300 {

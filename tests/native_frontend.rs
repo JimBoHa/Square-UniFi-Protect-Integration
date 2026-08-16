@@ -336,8 +336,8 @@ try{m.protectMotionWebhookUrl("https://app.lan","https://attacker.example/hook")
 return {
  urls:[m.protectMotionWebhookUrl("https://10.23.45.67:8000","/webhooks/protect/motion"),m.protectMotionWebhookUrl("https://app.lan:9443","/webhooks/protect/motion")],
  crossOrigin,
- settings:m.protectMotionSettings({enabled:true,camera_id:"barn",camera_name:"Barn",match_window_seconds:12,grace_seconds:75,retention_days:45,token_configured:true,last_event_ms:event}),
- request:m.protectMotionSettingsRequest({cameraId:"barn",matchWindowSeconds:"15",graceSeconds:"90",retentionDays:"30",rotateToken:true}),
+ settings:m.protectMotionSettings({enabled:true,camera_id:"counter",camera_name:"Counter",match_window_seconds:12,grace_seconds:75,retention_days:45,token_configured:true,last_event_ms:event}),
+ request:m.protectMotionSettingsRequest({cameraId:"counter",matchWindowSeconds:"15",graceSeconds:"90",retentionDays:"30",rotateToken:true}),
  ages:[m.protectMotionReceiptStatus(event,event+90000),m.protectMotionReceiptStatus(event,event+7200000).relativeText,m.protectMotionReceiptStatus(null,event)],
  states:[m.protectMotionStateText({state:"pending"}),m.protectMotionStateText({state:"flagged"}),m.protectMotionStateText({state:"matched"}),m.protectMotionAlert({state:"unsafe"}).state]
 };"#,

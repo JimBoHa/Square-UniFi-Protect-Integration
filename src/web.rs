@@ -2913,8 +2913,8 @@ mod tests {
             bytes
         }
         let mut payload = Vec::new();
-        payload.extend(field(0x06, "Barn UNVR"));
-        payload.extend(field(0x0b, "barn-unvr"));
+        payload.extend(field(0x06, "Example UNVR"));
+        payload.extend(field(0x0b, "example-unvr"));
         payload.extend(field(0x0c, "UNVRPRO"));
         payload.extend(field(0x03, "4.1.22"));
         let mut response = vec![1, 0];
@@ -2922,7 +2922,7 @@ mod tests {
         response.extend(payload);
         let parsed = parse_discovery_response(&response, "10.0.0.20".parse().unwrap()).unwrap();
         assert_eq!(parsed["ip"], "10.0.0.20");
-        assert_eq!(parsed["name"], "Barn UNVR");
+        assert_eq!(parsed["name"], "Example UNVR");
         assert_eq!(parsed["model"], "UNVRPRO");
         assert_eq!(parsed["is_console"], true);
         assert!(parse_discovery_response(b"garbage", "10.0.0.20".parse().unwrap()).is_none());
@@ -2986,7 +2986,7 @@ mod tests {
                 "POST",
                 "/api/users",
                 json!({
-                    "username": "barn.viewer",
+                    "username": "audit.viewer",
                     "password": "viewer-test-password",
                     "role": "viewer",
                 }),
@@ -3001,7 +3001,7 @@ mod tests {
             .oneshot(http_request(
                 "POST",
                 "/api/login",
-                json!({"username": "barn.viewer", "password": "viewer-test-password"}),
+                json!({"username": "audit.viewer", "password": "viewer-test-password"}),
                 None,
             ))
             .await
@@ -3219,7 +3219,7 @@ mod tests {
             .oneshot(http_request(
                 "POST",
                 "/api/users",
-                json!({"username": "barn.viewer", "password": "viewer-password", "role": "viewer"}),
+                json!({"username": "audit.viewer", "password": "viewer-password", "role": "viewer"}),
                 Some(&cookie),
             ))
             .await

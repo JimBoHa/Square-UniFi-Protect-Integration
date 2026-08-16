@@ -23,8 +23,6 @@ use square_unifi_protect::{
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const CAMERA_NAME: &str = "barn east";
-
 fn required_secret(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| {
         panic!(
@@ -51,7 +49,8 @@ fn app_state(store: Store, data_dir: PathBuf) -> AppState {
     )
 }
 
-async fn barn_east_camera() -> Value {
+async fn configured_camera() -> Value {
+    let camera_name = required_secret("SPI_TEST_PROTECT_CAMERA_NAME");
     let client = ProtectClient::new(
         &required_secret("SPI_TEST_PROTECT_HOST"),
         &required_secret("SPI_TEST_PROTECT_USERNAME"),
@@ -69,16 +68,16 @@ async fn barn_east_camera() -> Value {
             camera
                 .get("name")
                 .and_then(Value::as_str)
-                .is_some_and(|name| name.trim().eq_ignore_ascii_case(CAMERA_NAME))
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case(&camera_name))
         })
-        .unwrap_or_else(|| panic!("Protect camera {CAMERA_NAME:?} was not found"))
+        .unwrap_or_else(|| panic!("The configured Protect camera was not found"))
 }
 
 fn motion_request(token: &str, camera_id: &str, timestamp: i64) -> Request<Body> {
     let payload = json!({
         "timestamp": timestamp,
         "alarm": {
-            "name": "Barn East register motion live test",
+            "name": "Configured camera motion live test",
             "conditions": [{"condition": {"source": "motion"}}],
             "triggers": [{"key": "motion", "device": camera_id}],
         },
@@ -203,8 +202,8 @@ async fn square_sandbox_round_trips_ten_transactions() {
 
 #[tokio::test]
 #[ignore = "contacts a live Protect console and requires credentials"]
-async fn protect_barn_east_motion_matches_a_transaction() {
-    let camera = barn_east_camera().await;
+async fn configured_protect_camera_motion_matches_a_transaction() {
+    let camera = configured_camera().await;
     let camera_id = camera.get("id").and_then(Value::as_str).unwrap();
     let camera_name = camera.get("name").and_then(Value::as_str).unwrap();
     let temp = tempfile::tempdir().unwrap();
@@ -249,8 +248,8 @@ async fn protect_barn_east_motion_matches_a_transaction() {
 
 #[tokio::test]
 #[ignore = "contacts a live Protect console and requires credentials"]
-async fn protect_barn_east_motion_without_a_transaction_is_flagged() {
-    let camera = barn_east_camera().await;
+async fn configured_protect_camera_motion_without_a_transaction_is_flagged() {
+    let camera = configured_camera().await;
     let camera_id = camera.get("id").and_then(Value::as_str).unwrap();
     let camera_name = camera.get("name").and_then(Value::as_str).unwrap();
     let temp = tempfile::tempdir().unwrap();

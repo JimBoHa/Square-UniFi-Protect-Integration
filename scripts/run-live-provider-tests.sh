@@ -30,6 +30,7 @@ prompt_value SPI_TEST_SQUARE_ACCESS_TOKEN "Square Sandbox access token" 1
 prompt_value SPI_TEST_PROTECT_HOST "UniFi Protect host or IP"
 prompt_value SPI_TEST_PROTECT_USERNAME "UniFi Protect local username"
 prompt_value SPI_TEST_PROTECT_PASSWORD "UniFi Protect local password" 1
+prompt_value SPI_TEST_PROTECT_CAMERA_NAME "UniFi Protect camera name"
 
 echo "Running opt-in live tests. This creates 10 completed Square Sandbox payments."
 cargo test --locked --test live_provider_flows -- --ignored --test-threads=1 --nocapture

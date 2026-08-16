@@ -1119,7 +1119,7 @@ mod tests {
     #[test]
     fn protect_host_accepts_runtime_hosts_and_rejects_url_injection() {
         for (input, expected) in [
-            ("10.255.8.123", "10.255.8.123"),
+            ("192.0.2.123", "192.0.2.123"),
             (" protect.lan ", "protect.lan"),
             ("protect.lan:7443", "protect.lan:7443"),
             ("[fd00::1234]:443", "[fd00::1234]:443"),

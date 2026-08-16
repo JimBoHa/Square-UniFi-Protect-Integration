@@ -1,5 +1,35 @@
+# Runtime state and build output
 data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 .DS_Store
 build/
 dist/
 target/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.secrets/
+secrets/
+credentials/
+
+# Per-installation certificates and private keys
+acme/
+certbot/
+letsencrypt/
+certs/
+*.cer
+*.crt
+*.csr
+*.der
+*.jks
+*.key
+*.keystore
+*.p12
+*.pem
+*.pfx

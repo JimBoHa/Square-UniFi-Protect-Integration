@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, net::Ipv4Addr, path::PathBuf};
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -71,7 +71,18 @@ fn docker_lan_bootstrap_uses_builtin_tls_and_native_healthcheck() {
 #[test]
 fn docker_context_excludes_local_state_and_test_artifacts() {
     let ignore = source(".dockerignore");
-    for item in ["data", "tests", ".git", "target"] {
+    for item in [
+        "data",
+        "tests",
+        ".git",
+        ".env",
+        ".secrets",
+        "secrets",
+        "credentials",
+        "*.key",
+        "*.pem",
+        "target",
+    ] {
         assert!(ignore.lines().any(|line| line == item), "missing {item}");
     }
 }
@@ -88,6 +99,29 @@ fn github_ci_runs_native_rust_and_container_smoke_tests() {
         "curl -kfs https://127.0.0.1:3546/api/status",
     ] {
         assert!(workflow.contains(command), "missing CI command: {command}");
+    }
+    assert!(workflow.contains("gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7"));
+    assert!(workflow.contains("GITLEAKS_CONFIG: .gitleaks.toml"));
+    assert!(workflow.contains("GITLEAKS_ENABLE_UPLOAD_ARTIFACT: \"false\""));
+}
+
+#[test]
+fn repository_enforces_public_secret_boundary() {
+    let agents = source("AGENTS.md");
+    let policy = source("SECURITY.md");
+    let scanner = source("scripts/check-secrets.sh");
+    let config = source(".gitleaks.toml");
+    let ignore = source(".gitignore");
+
+    assert!(agents.contains("Never publish deployment data"));
+    assert!(agents.contains("./scripts/check-secrets.sh"));
+    assert!(policy.contains("Public-repository boundary"));
+    assert!(policy.contains("Deleting the current file"));
+    assert!(scanner.contains("--log-opts=\"--all\""));
+    assert!(scanner.contains("git ls-files -co --exclude-standard -z"));
+    assert!(config.contains("useDefault = true"));
+    for item in ["data/", ".env", ".secrets/", "*.key", "*.pem"] {
+        assert!(ignore.lines().any(|line| line == item), "missing {item}");
     }
 }
 
@@ -122,6 +156,11 @@ fn unix_service_build_is_skipped_during_uninstall() {
 #[test]
 fn unix_lan_services_enable_tls_without_hard_coded_host_ip() {
     let installer = source("scripts/install-service.sh");
+    let concrete_ipv4_literals = installer
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .filter_map(|candidate| candidate.parse::<Ipv4Addr>().ok())
+        .filter(|address| !address.is_unspecified())
+        .collect::<Vec<_>>();
     assert!(installer.contains("<key>SPI_HOST</key><string>0.0.0.0</string>"));
     assert!(installer.contains("Environment=SPI_HOST=0.0.0.0"));
     assert!(installer.contains("<key>SPI_PORT</key><string>3546</string>"));
@@ -129,7 +168,10 @@ fn unix_lan_services_enable_tls_without_hard_coded_host_ip() {
     assert!(installer.contains("<key>SPI_TLS</key><string>1</string>"));
     assert!(installer.contains("Environment=SPI_TLS=1"));
     assert!(installer.contains("https://<this-host>:3546"));
-    assert!(!installer.contains("10.0.7.215"));
+    assert!(
+        concrete_ipv4_literals.is_empty(),
+        "installer hard-codes concrete IPv4 addresses: {concrete_ipv4_literals:?}"
+    );
 }
 
 #[test]

@@ -419,6 +419,26 @@ security, packaging, browser-contract, TLS, and concurrency tests run locally
 without real Square or UniFi credentials. Passing tests do not validate
 firmware-specific snapshot or timeline behavior on real hardware.
 
+The opt-in live-provider suite creates exactly ten completed Square Sandbox
+payments and verifies both motion-correlation outcomes using a camera selected
+at runtime. The Protect tests confirm that the configured credentials can list
+that camera, then inject a webhook directly into the in-process application.
+They do not test outbound delivery from the Protect console, DNS, routing, TLS,
+firewall rules, or the header configured in Protect. Run the suite
+interactively so missing values are requested without echoing passwords or
+writing them to disk:
+
+```bash
+scripts/run-live-provider-tests.sh
+```
+
+The live tests are ignored by the normal `cargo test` commands. They accept
+`SPI_TEST_SQUARE_ACCESS_TOKEN`, `SPI_TEST_PROTECT_HOST`,
+`SPI_TEST_PROTECT_USERNAME`, `SPI_TEST_PROTECT_PASSWORD`, and
+`SPI_TEST_PROTECT_CAMERA_NAME` from the process environment when a
+non-interactive secret runner already provides them. Never put those values in
+a tracked file.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

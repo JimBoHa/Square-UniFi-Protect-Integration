@@ -26,7 +26,7 @@ fn payment(id: &str, offset_ms: i64) -> PaymentFacts {
         status: "COMPLETED".into(),
         location_id: "LOC_1".into(),
         device_id: "DEVICE_1".into(),
-        device_name: "Barn East".into(),
+        device_name: "Register One".into(),
         card_last4: "4242".into(),
         receipt_url: "https://square.example/receipt".into(),
     }
@@ -177,7 +177,7 @@ fn initial_admin_has_one_atomic_winner() {
 fn username_and_role_validation_are_case_insensitive_and_bounded() {
     for (input, expected) in [
         ("admin", "admin"),
-        (" Barn.Viewer ", "Barn.Viewer"),
+        (" Audit.Viewer ", "Audit.Viewer"),
         ("user-name_2", "user-name_2"),
     ] {
         assert_eq!(normalize_username(input).unwrap(), expected);
@@ -196,11 +196,11 @@ fn username_and_role_validation_are_case_insensitive_and_bounded() {
     let temp = tempfile::tempdir().unwrap();
     let store = Store::open(temp.path()).unwrap();
     let viewer = store
-        .create_user("Barn.Viewer", "hash", ROLE_VIEWER)
+        .create_user("Audit.Viewer", "hash", ROLE_VIEWER)
         .unwrap();
     assert_eq!(viewer.role, ROLE_VIEWER);
     assert!(matches!(
-        store.create_user("barn.viewer", "hash", ROLE_ADMIN),
+        store.create_user("audit.viewer", "hash", ROLE_ADMIN),
         Err(AppError::Conflict(_))
     ));
     assert!(matches!(
@@ -381,7 +381,7 @@ fn payment_updates_are_newest_wins_sparse_safe_and_refund_monotonic() {
     assert_eq!(stored.amount, 109);
     assert_eq!(stored.refunded_amount, 25);
     assert_eq!(stored.device_id, "DEVICE_1");
-    assert_eq!(stored.device_name, "Barn East");
+    assert_eq!(stored.device_name, "Register One");
 
     let mut stale = original;
     stale.amount = 1;
@@ -537,13 +537,13 @@ fn motion_token_rotates_dedupes_and_moves_pending_to_flagged() {
     let temp = tempfile::tempdir().unwrap();
     let store = Store::open(temp.path()).unwrap();
     let (config, first) = store
-        .configure_motion(CAMERA_A, "Barn East", 15, 90, 30, false)
+        .configure_motion(CAMERA_A, "Checkout Camera", 15, 90, 30, false)
         .unwrap();
     let first = first.unwrap();
     assert!(config.enabled);
     assert!(store.authenticate_motion(&first).is_ok());
     let (_, not_revealed) = store
-        .configure_motion(CAMERA_A, "Barn East", 15, 90, 30, false)
+        .configure_motion(CAMERA_A, "Checkout Camera", 15, 90, 30, false)
         .unwrap();
     assert!(not_revealed.is_none());
     assert!(
@@ -604,12 +604,12 @@ fn motion_configuration_and_event_inputs_are_bounded() {
         (15, 90, 366),
     ] {
         assert!(matches!(
-            store.configure_motion(CAMERA_A, "Barn", window, grace, retention, false),
+            store.configure_motion(CAMERA_A, "Camera", window, grace, retention, false),
             Err(AppError::Unprocessable(_))
         ));
     }
     let (_, token) = store
-        .configure_motion(CAMERA_A, "Barn", 15, 0, 1, false)
+        .configure_motion(CAMERA_A, "Camera", 15, 0, 1, false)
         .unwrap();
     let token = token.unwrap();
     for (key, method, event_ts, received) in [

@@ -17,8 +17,8 @@ use square_unifi_protect::{
 };
 use tower::ServiceExt;
 
-const BARN_EAST_CAMERA_ID: &str = "cam1aaaaaaaaaaaaaaaaaaaa";
-const LOCATION_ID: &str = "SANDBOX_BARN";
+const CAMERA_ID: &str = "cam1aaaaaaaaaaaaaaaaaaaa";
+const LOCATION_ID: &str = "SANDBOX_LOCATION";
 
 fn app_state(store: Store, data_dir: PathBuf) -> AppState {
     AppState::new(
@@ -42,9 +42,9 @@ fn motion_request(token: &str, timestamp: i64) -> Request<Body> {
     let payload = json!({
         "timestamp": timestamp,
         "alarm": {
-            "name": "Barn East register motion",
+            "name": "Test camera register motion",
             "conditions": [{"condition": {"source": "motion"}}],
-            "triggers": [{"key": "motion", "device": BARN_EAST_CAMERA_ID}],
+            "triggers": [{"key": "motion", "device": CAMERA_ID}],
         },
     });
     let mut request = Request::builder()
@@ -124,7 +124,7 @@ async fn protect_motion_webhook_matches_a_following_transaction() {
     let temp = tempfile::tempdir().unwrap();
     let store = Store::open(temp.path()).unwrap();
     let (_, token) = store
-        .configure_motion(BARN_EAST_CAMERA_ID, "Barn East", 15, 30, 1, true)
+        .configure_motion(CAMERA_ID, "Checkout Camera", 15, 30, 1, true)
         .unwrap();
     let token = token.unwrap();
     let event_timestamp = now_millis();
@@ -145,8 +145,8 @@ async fn protect_motion_webhook_matches_a_following_transaction() {
             location_id: LOCATION_ID.into(),
             device_id: String::new(),
             device_name: String::new(),
-            camera_id: BARN_EAST_CAMERA_ID.into(),
-            camera_name: "Barn East".into(),
+            camera_id: CAMERA_ID.into(),
+            camera_name: "Checkout Camera".into(),
         }])
         .unwrap();
     store
@@ -173,7 +173,7 @@ async fn protect_motion_without_a_transaction_becomes_flagged_after_grace() {
     let temp = tempfile::tempdir().unwrap();
     let store = Store::open(temp.path()).unwrap();
     let (_, token) = store
-        .configure_motion(BARN_EAST_CAMERA_ID, "Barn East", 15, 1, 1, true)
+        .configure_motion(CAMERA_ID, "Checkout Camera", 15, 1, 1, true)
         .unwrap();
     let token = token.unwrap();
     let event_timestamp = now_millis();

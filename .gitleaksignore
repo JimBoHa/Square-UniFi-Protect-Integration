@@ -1,0 +1,6 @@
+# Deterministic fake values in historical, deleted test harnesses. Each finding
+# was manually reviewed. Never add a real credential here.
+c3000532cdba5ef79de0e1143de46c5a312cec8e:tests/test_macos_bootstrap_packaging.py:generic-api-key:77
+e2e4b141158ef7f052152068b7828ca62e261aa3:tests/conftest.py:generic-api-key:21
+bd82b7777a6dc402ac261458a61bbaefac5f0a48:tests/conftest.py:generic-api-key:16
+bd69e3465d8137e0a79d3f0b6bda9d5eae775d3c:tests/test_square_oauth.py:square-application-id:14

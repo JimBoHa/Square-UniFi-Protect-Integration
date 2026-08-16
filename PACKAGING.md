@@ -54,11 +54,23 @@ scripts/macos/build_dmg.sh          # → dist/SquareProtect.dmg
 
 The script compiles both locked Rust release binaries, assembles a native
 `LSUIElement` app bundle without Python or PyInstaller, validates its embedded
-server and browser assets, and wraps the signed app in a drag-to-Applications
-dmg. For a signed release, set `MACOS_SIGNING_IDENTITY` to the Developer ID
-Application identity when running the build script; the nested binaries and
-app are signed before entering the dmg. Then notarize with
-`xcrun notarytool submit`, staple, and attach the dmg to a GitHub release.
+server and browser assets, and wraps the code-signed app in a
+drag-to-Applications dmg. Local and pull-request builds use an ad-hoc code
+signature. For a public release, set `MACOS_SIGNING_IDENTITY` to a Developer ID
+Application identity, add a secure timestamp, sign the completed disk image,
+submit it with `xcrun notarytool`, and staple the accepted ticket before
+publishing it.
+
+Developer ID signing and Apple notarization make the download acceptable to
+macOS Gatekeeper; they do **not** create a TLS server certificate trusted by a
+Protect console. The current motion webhook requires a reachable listener, and
+an HTTPS webhook requires a per-installation hostname, private key, and trusted
+certificate. The preferred product target instead connects outward to each
+store's local Protect event WebSocket, avoiding app-side certificate and DNS
+setup for motion. The current DMG wrapper starts on loopback, so neither LAN
+mode is available from a Finder launch yet. See
+[Protect event delivery and TLS trust](TLS.md) for the trust boundaries,
+fallbacks, and implementation order.
 Unsigned builds run via right-click → Open.
 
 ## 3. Install as a service (auto-start at boot)
@@ -102,4 +114,7 @@ mirroring the macOS menu-bar app.
 
 One GitHub Actions release workflow producing: the Docker image (GHCR),
 the signed/notarized dmg (needs Apple credentials as repo secrets), and a
-source tarball; versioned by git tag.
+source tarball; versioned by git tag. Signing credentials must be restricted to
+the release environment and remain completely separate from per-installation
+TLS keys and ACME/DNS credentials. The release and runtime acceptance criteria
+are detailed in [TLS.md](TLS.md).

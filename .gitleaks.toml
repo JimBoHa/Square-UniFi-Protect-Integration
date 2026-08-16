@@ -1,0 +1,23 @@
+title = "Square UniFi Protect secret detection"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "square-access-token"
+description = "Square access token"
+regex = '''\bEAAA[A-Za-z0-9_-]{20,}\b'''
+keywords = ["EAAA"]
+
+[[rules]]
+id = "square-application-id"
+description = "Deployment-specific Square application identifier"
+regex = '''\b(?:sandbox-)?sq0id[bp]-[A-Za-z0-9_-]{10,}\b'''
+keywords = ["sq0idb-", "sq0idp-"]
+
+[[rules]]
+id = "spi-or-dns-token"
+description = "Square Protect webhook token or DNS provider token"
+regex = '''(?i)(?:x-spi-webhook-token|spi[_-]?webhook[_-]?token|godaddy[_-]?(?:pat|token))[A-Za-z0-9_ .-]{0,30}(?:=|:)[ \t]*["']?([A-Za-z0-9_.~+/=-]{20,})'''
+secretGroup = 1
+keywords = ["x-spi-webhook-token", "webhook_token", "godaddy_pat", "godaddy_token"]

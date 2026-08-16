@@ -229,9 +229,8 @@ startup fails instead of silently falling back to another certificate.
 Apple Developer ID signing and notarization secure distribution of the macOS
 app but cannot authenticate this HTTPS listener to Protect. Do not embed the
 Developer ID key or a shared TLS key in the dmg. See
-[TLS trust and macOS distribution](TLS.md) for the immediate public-CA setup
-and the proposed signed-DMG, certificate-import, ACME renewal, and diagnostic
-implementation plan.
+[Protect event delivery and TLS trust](TLS.md) for the unconfirmed webhook
+diagnosis, the recommended local event-stream design, and webhook fallbacks.
 
 The app removes the plaintext bootstrap secret from its own process environment
 immediately after hashing it. The launching shell, service manager, or container

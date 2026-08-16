@@ -63,12 +63,14 @@ publishing it.
 
 Developer ID signing and Apple notarization make the download acceptable to
 macOS Gatekeeper; they do **not** create a TLS server certificate trusted by a
-Protect console. Each installed app still needs a per-installation hostname,
-private key, and public-CA certificate for its HTTPS listener. The current DMG
-wrapper also starts on loopback and does not yet forward the custom certificate
-paths to its embedded server. See [TLS trust and macOS distribution](TLS.md)
-for the exact trust boundary, an immediate service deployment, and the proposed
-DMG, certificate-import, renewal, and diagnostic workstreams.
+Protect console. The current motion webhook requires a reachable listener, and
+an HTTPS webhook requires a per-installation hostname, private key, and trusted
+certificate. The preferred product target instead connects outward to each
+store's local Protect event WebSocket, avoiding app-side certificate and DNS
+setup for motion. The current DMG wrapper starts on loopback, so neither LAN
+mode is available from a Finder launch yet. See
+[Protect event delivery and TLS trust](TLS.md) for the trust boundaries,
+fallbacks, and implementation order.
 Unsigned builds run via right-click → Open.
 
 ## 3. Install as a service (auto-start at boot)

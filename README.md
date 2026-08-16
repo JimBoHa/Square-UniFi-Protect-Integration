@@ -390,6 +390,15 @@ The two are separate environments with separate tokens.
 
 ## Development
 
+Read [SECURITY.md](SECURITY.md) before contributing. Never use deployment
+credentials, private keys, merchant data, camera names, or real site addresses
+in code, tests, documentation, commits, issues, or pull requests. Run the
+repository secret check before every commit:
+
+```bash
+./scripts/check-secrets.sh
+```
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings

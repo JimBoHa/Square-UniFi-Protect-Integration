@@ -71,7 +71,18 @@ fn docker_lan_bootstrap_uses_builtin_tls_and_native_healthcheck() {
 #[test]
 fn docker_context_excludes_local_state_and_test_artifacts() {
     let ignore = source(".dockerignore");
-    for item in ["data", "tests", ".git", "target"] {
+    for item in [
+        "data",
+        "tests",
+        ".git",
+        ".env",
+        ".secrets",
+        "secrets",
+        "credentials",
+        "*.key",
+        "*.pem",
+        "target",
+    ] {
         assert!(ignore.lines().any(|line| line == item), "missing {item}");
     }
 }
@@ -88,6 +99,29 @@ fn github_ci_runs_native_rust_and_container_smoke_tests() {
         "curl -kfs https://127.0.0.1:3546/api/status",
     ] {
         assert!(workflow.contains(command), "missing CI command: {command}");
+    }
+    assert!(workflow.contains("gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7"));
+    assert!(workflow.contains("GITLEAKS_CONFIG: .gitleaks.toml"));
+    assert!(workflow.contains("GITLEAKS_ENABLE_UPLOAD_ARTIFACT: \"false\""));
+}
+
+#[test]
+fn repository_enforces_public_secret_boundary() {
+    let agents = source("AGENTS.md");
+    let policy = source("SECURITY.md");
+    let scanner = source("scripts/check-secrets.sh");
+    let config = source(".gitleaks.toml");
+    let ignore = source(".gitignore");
+
+    assert!(agents.contains("Never publish deployment data"));
+    assert!(agents.contains("./scripts/check-secrets.sh"));
+    assert!(policy.contains("Public-repository boundary"));
+    assert!(policy.contains("Deleting the current file"));
+    assert!(scanner.contains("--log-opts=\"--all\""));
+    assert!(scanner.contains("git ls-files -co --exclude-standard -z"));
+    assert!(config.contains("useDefault = true"));
+    for item in ["data/", ".env", ".secrets/", "*.key", "*.pem"] {
+        assert!(ignore.lines().any(|line| line == item), "missing {item}");
     }
 }
 

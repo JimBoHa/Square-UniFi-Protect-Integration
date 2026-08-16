@@ -1152,7 +1152,7 @@ mod tests {
     fn alarm_trigger_ids_allow_admin_labels_but_reject_controls_and_bounds() {
         for value in [
             "sale",
-            "Barn East Sale",
+            "Checkout Camera Sale",
             "motion/webhook:flag",
             " webhook id ",
         ] {
@@ -1223,14 +1223,14 @@ mod tests {
         let mut payment = base_payment();
         payment["total_money"] = json!({"amount": 124, "currency": "USD"});
         payment["card_details"] = json!({"card": {"last_4": "4242", "cardholder_name": "Private"}});
-        payment["device_details"] = json!({"device_id": "DEVICE_1", "device_name": "Barn East"});
+        payment["device_details"] = json!({"device_id": "DEVICE_1", "device_name": "Register One"});
         payment["receipt_url"] = json!("https://square.example/receipt");
         let facts = parse_payment(&payment).unwrap();
         assert_eq!(facts.amount, 124);
         assert_eq!(facts.currency, "USD");
         assert_eq!(facts.card_last4, "4242");
         assert_eq!(facts.device_id, "DEVICE_1");
-        assert_eq!(facts.device_name, "Barn East");
+        assert_eq!(facts.device_name, "Register One");
         assert_eq!(facts.receipt_url, "https://square.example/receipt");
     }
 
@@ -1432,7 +1432,7 @@ mod tests {
                 axum::Json(json!({
                     "locations": [{
                         "id": "LOC_1",
-                        "name": "Barn East",
+                        "name": "Example Location",
                         "status": "ACTIVE",
                         "address": {"private": "not returned"}
                     }]
@@ -1443,7 +1443,7 @@ mod tests {
         let locations = client.list_locations().await.unwrap();
         assert_eq!(
             locations,
-            [json!({"id": "LOC_1", "name": "Barn East", "status": "ACTIVE"})]
+            [json!({"id": "LOC_1", "name": "Example Location", "status": "ACTIVE"})]
         );
         let observed = observed.lock().unwrap();
         assert_eq!(observed[0].0, "/v2/locations");
@@ -1664,7 +1664,7 @@ mod tests {
                             axum::Json(json!({
                                 "nvr": {"id": "CONSOLE_1"},
                                 "cameras": [
-                                    {"id": "abc123", "name": "Barn East", "state": "CONNECTED"},
+                                    {"id": "abc123", "name": "Checkout Camera", "state": "CONNECTED"},
                                     {"id": "def456", "name": "", "marketName": "G5 Dome"}
                                 ]
                             }))
@@ -1680,7 +1680,7 @@ mod tests {
         assert_eq!(logins.load(Ordering::SeqCst), 2);
         assert_eq!(bootstraps.load(Ordering::SeqCst), 2);
         assert_eq!(console.as_deref(), Some("CONSOLE_1"));
-        assert_eq!(cameras[0]["name"], "Barn East");
+        assert_eq!(cameras[0]["name"], "Checkout Camera");
         assert_eq!(cameras[1]["name"], "G5 Dome");
         assert!(
             csrf.lock()
@@ -1772,8 +1772,11 @@ mod tests {
             client.integration_info().await.unwrap()["applicationVersion"],
             "7.1.87"
         );
-        client.trigger_alarm(" Barn East/Sale ").await.unwrap();
-        client.trigger_alarm("Barn+East").await.unwrap();
+        client
+            .trigger_alarm(" Checkout Camera/Sale ")
+            .await
+            .unwrap();
+        client.trigger_alarm("Checkout+Camera").await.unwrap();
         let requests = requests.lock().unwrap();
         assert!(
             requests
@@ -1782,12 +1785,12 @@ mod tests {
         );
         assert!(requests.iter().all(|request| !request.2));
         assert!(
-            requests[1].0.ends_with("/Barn%20East%2FSale"),
+            requests[1].0.ends_with("/Checkout%20Camera%2FSale"),
             "unexpected alarm path: {:?}",
             requests[1].0
         );
         assert!(
-            requests[2].0.ends_with("/Barn%2BEast"),
+            requests[2].0.ends_with("/Checkout%2BCamera"),
             "unexpected literal-plus path: {:?}",
             requests[2].0
         );

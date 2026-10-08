@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Square × UniFi Protect</title>
-  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/style.css?v=2">
 </head>
 <body>
   <header>
@@ -18,6 +18,13 @@
   </header>
 
   <main>
+    <section id="view-loading" aria-live="polite">
+      <h2 id="startup-title">Loading application…</h2>
+      <p id="startup-detail">If this message remains, reload to fetch the latest application files.</p>
+      <a id="startup-reload" href="/?reload=1">Reload application</a>
+      <noscript><p>JavaScript must be enabled to use this application.</p></noscript>
+    </section>
+
     <!-- Startup error recovery -->
     <section id="view-boot-error" hidden>
       <h2>Could not load the application</h2>
@@ -217,33 +224,55 @@
           <span class="conn-dot"></span><span class="conn-text"></span>
         </span>
       </h2>
-      <p class="hint"><strong>Option A — Connect with Square (recommended):</strong>
-        create one Square application (developer dashboard → Credentials), set its
-        OAuth Redirect URL to <code>https://&lt;this-host&gt;/oauth/square/callback</code>,
-        save its OAuth Application ID and Secret below once, then sign in through
-        Square. Tokens are stored encrypted and refreshed automatically.</p>
-      <form id="square-oauth-form">
-        <label>Application ID <input id="square-oauth-client-id" autocomplete="off"></label>
-        <label>Application Secret <input type="password" id="square-oauth-secret" autocomplete="off"></label>
-        <label>Environment
-          <select id="square-oauth-env">
-            <option value="production">Production</option>
-            <option value="sandbox">Sandbox</option>
-          </select>
-        </label>
-        <button type="submit">Save application</button>
-        <button type="button" id="square-oauth-connect">Connect with Square</button>
-      </form>
+      <p class="hint"><strong>Read-only Square access:</strong> this app reads
+        merchant details, locations, and payments. It cannot create or change
+        Square payments, refunds, or webhook subscriptions.</p>
+      <div class="square-connection-summary" id="square-connection-summary" role="status" tabindex="-1">
+        <strong id="square-active-connection">Checking saved Square connection…</strong>
+        <p id="square-active-detail"></p>
+      </div>
+      <h3>Option A — Sign in with Square (recommended)</h3>
+      <p class="hint">Complete both steps below. Square sign-in requests only
+        merchant and payment read permissions and renews access automatically.</p>
+      <div class="square-oauth-step">
+        <h4>1. Save application credentials</h4>
+        <p class="hint">In the Square Developer Console, open your application
+          and set its OAuth Redirect URL to <code id="square-oauth-redirect-url"></code>.</p>
+        <p id="square-oauth-saved-status" class="hint" role="status">Loading saved application details…</p>
+        <form id="square-oauth-form">
+          <label>Application ID <input id="square-oauth-client-id" autocomplete="off" minlength="8" maxlength="128" required></label>
+          <label>Application secret <input type="password" id="square-oauth-secret" autocomplete="new-password" minlength="8" maxlength="256" aria-describedby="square-oauth-secret-hint" required></label>
+          <p id="square-oauth-secret-hint" class="hint">Enter the application secret from Square.</p>
+          <label>Application environment
+            <select id="square-oauth-env">
+              <option value="production">Production — live transactions</option>
+              <option value="sandbox">Sandbox — test transactions</option>
+            </select>
+          </label>
+          <button type="submit" id="square-oauth-save" disabled>Save credentials</button>
+          <p id="square-oauth-save-result" class="square-oauth-feedback" role="status"></p>
+        </form>
+      </div>
+      <div class="square-oauth-step">
+        <h4>2. Authorize Square access</h4>
+        <p id="square-oauth-next-step" role="status">Loading connection status…</p>
+        <p id="square-oauth-signin-result" class="square-oauth-feedback" role="status"></p>
+        <button type="button" id="square-oauth-connect" disabled>Connect with Square</button>
+      </div>
       <div id="square-oauth-switch-warning" class="destructive-warning" role="alert" hidden>
-        <strong>Different Square account authorized.</strong>
+        <strong>Different Square account or environment authorized.</strong>
         <p>Confirming permanently erases the previous account's local transactions, thumbnails, observed POS devices, camera mappings, sync history, and saved Square webhook credentials.</p>
         <button type="button" id="square-oauth-switch-confirm">Switch account and erase old data</button>
         <button type="button" id="square-oauth-switch-cancel">Keep current account</button>
       </div>
       <p class="hint"><strong>Option B — paste an access token manually:</strong></p>
+      <p class="hint">Use a token with only <code>MERCHANT_PROFILE_READ</code>
+        and <code>PAYMENTS_READ</code> to restrict access in Square too.
+        Personal access tokens have broader permissions; the app still blocks
+        Square writes.</p>
       <form id="square-form">
         <label>Access token <input type="password" id="square-token" autocomplete="off" required></label>
-        <label>Environment
+        <label>Access token environment
           <select id="square-env">
             <option value="production">Production</option>
             <option value="sandbox">Sandbox</option>
@@ -251,15 +280,14 @@
         </label>
         <label>Webhook signature key (optional) <input type="password" id="square-webhook-key" autocomplete="off"></label>
         <label>Webhook notification URL (optional) <input id="square-webhook-url" placeholder="https://example.com/webhooks/square"></label>
-        <button type="button" id="square-register-webhook">Register webhook automatically</button>
-        <p class="hint">Automatic registration needs a token allowed to manage webhook subscriptions (usually the application's personal access token from the Square developer dashboard).</p>
-        <p class="hint">Enter the public notification URL above, press this button,
-          and the subscription and signature key are set up for you — no
-          developer-dashboard steps needed.</p>
+        <p class="hint">For instant updates, configure <code>payment.created</code>
+          and <code>payment.updated</code> in the Square Developer Console, then
+          paste the signature key and notification URL here. These settings
+          are saved locally. Polling also works without a webhook.</p>
         <label class="check"><input type="checkbox" id="square-clear-webhook"> Remove saved webhook configuration</label>
         <p class="hint">Leaving the webhook fields blank keeps any saved webhook configuration.</p>
         <div id="square-account-switch-warning" class="destructive-warning" role="alert" hidden>
-          <strong>Different Square account detected.</strong>
+          <strong>Different Square account or environment detected.</strong>
           <p>Switching permanently erases the previous account's local transactions, thumbnails, observed POS devices, camera mappings, sync history, and saved Square webhook credentials.</p>
           <label class="check"><input type="checkbox" id="square-confirm-account-switch"> I understand. Switch accounts and erase the previous account's local data.</label>
         </div>
@@ -356,23 +384,26 @@
     <p id="message" role="status"></p>
   </main>
 
-  <script src="/bootstrap-form.js"></script>
-  <script src="/boot-recovery.js"></script>
-  <script src="/protect-console-switch.js"></script>
-  <script src="/format.js"></script>
-  <script src="/square-form.js"></script>
-  <script src="/deep-link-form.js"></script>
-  <script src="/protect-alarm.js"></script>
-  <script src="/protect-motion.js"></script>
-  <script src="/view-focus.js"></script>
-  <script src="/settings-loader.js"></script>
-  <script src="/nav-view.js"></script>
-  <script src="/transaction-filters.js"></script>
-  <script src="/transaction-note.js"></script>
-  <script src="/webhook-delivery.js"></script>
-  <script src="/roles.js"></script>
-  <script src="/user-management.js"></script>
-  <script src="/login-audit.js"></script>
-  <script src="/app.js"></script>
+  <!-- The query key bypasses legacy unversioned caches. The server now requires
+       revalidation on every load, including for these versioned asset URLs. -->
+  <script src="/startup.js?v=2"></script>
+  <script src="/bootstrap-form.js?v=2"></script>
+  <script src="/boot-recovery.js?v=2"></script>
+  <script src="/protect-console-switch.js?v=2"></script>
+  <script src="/format.js?v=2"></script>
+  <script src="/square-form.js?v=2"></script>
+  <script src="/deep-link-form.js?v=2"></script>
+  <script src="/protect-alarm.js?v=2"></script>
+  <script src="/protect-motion.js?v=2"></script>
+  <script src="/view-focus.js?v=2"></script>
+  <script src="/settings-loader.js?v=2"></script>
+  <script src="/nav-view.js?v=2"></script>
+  <script src="/transaction-filters.js?v=2"></script>
+  <script src="/transaction-note.js?v=2"></script>
+  <script src="/webhook-delivery.js?v=2"></script>
+  <script src="/roles.js?v=2"></script>
+  <script src="/user-management.js?v=2"></script>
+  <script src="/login-audit.js?v=2"></script>
+  <script src="/app.js?v=2"></script>
 </body>
 </html>

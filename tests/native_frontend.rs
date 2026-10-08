@@ -372,6 +372,61 @@ return {
 }
 
 #[test]
+fn square_oauth_form_distinguishes_saved_credentials_from_the_active_connection() {
+    let result = node_eval(
+        "square-form.js",
+        r#"
+const saved={configured:true,client_id:"test-production-app",secret_saved:true,environment:"production",active_environment:"sandbox",active_authentication:"access_token",pending_environment:null};
+return {
+  saved:m.squareOAuthView(saved),
+  dirty:m.squareOAuthView(saved,true),
+  empty:m.squareOAuthView({...saved,configured:false,active_environment:null}),
+  connected:m.squareOAuthView({...saved,active_environment:"production",active_authentication:"oauth"}),
+  pending:m.squareOAuthView({...saved,pending_environment:"production"}),
+  keepSecret:[m.squareOAuthCanKeepSecret(saved,"test-production-app","production"),m.squareOAuthCanKeepSecret(saved,"test-other-app","production"),m.squareOAuthCanKeepSecret(saved,"test-production-app","sandbox")],
+  expired:m.squareOAuthResultFeedback("?square_oauth=invalid_state"),
+};"#,
+    );
+    assert_eq!(result["saved"]["activeTitle"], "Active connection: Sandbox");
+    assert!(
+        result["saved"]["nextStep"]
+            .as_str()
+            .unwrap()
+            .contains("Production application credentials are saved")
+    );
+    assert_eq!(result["saved"]["canConnect"], true);
+    assert_eq!(result["dirty"]["canConnect"], false);
+    assert_eq!(result["empty"]["canConnect"], false);
+    assert_eq!(
+        result["empty"]["activeTitle"],
+        "No active Square connection"
+    );
+    assert_eq!(
+        result["connected"]["activeTitle"],
+        "Active connection: Production"
+    );
+    assert_eq!(
+        result["connected"]["connectLabel"],
+        "Reconnect Production Square"
+    );
+    assert_eq!(result["pending"]["canConnect"], false);
+    assert!(
+        result["pending"]["nextStep"]
+            .as_str()
+            .unwrap()
+            .contains("confirmation")
+    );
+    assert_eq!(result["keepSecret"], json!([true, false, false]));
+    assert_eq!(result["expired"]["kind"], "error");
+    assert!(
+        result["expired"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("existing connection is unchanged")
+    );
+}
+
+#[test]
 fn square_form_and_transaction_filters_clear_secrets_and_keep_queries_in_json() {
     let square = node_eval(
         "square-form.js",
@@ -490,9 +545,69 @@ fn webhook_delivery_copy_handles_milliseconds_seconds_minutes_and_clock_skew() {
 }
 
 #[test]
+fn startup_recovery_survives_missing_scripts_and_stale_entrypoint_errors() {
+    let script = serde_json::to_string(&source("app/static/startup.js")).unwrap();
+    let program = format!(
+        r#"
+const assert=require('node:assert/strict'), vm=require('node:vm');
+function createPage() {{
+  const elements={{
+    'view-loading':{{hidden:false}}, 'startup-title':{{textContent:'Loading application…'}},
+    'startup-detail':{{textContent:''}}, 'startup-reload':{{addEventListener(){{}}}},
+  }};
+  const listeners={{}};
+  let timer, timerCleared=false;
+  class ErrorEvent {{}}
+  class HTMLScriptElement {{}}
+  const context=vm.createContext({{
+    document:{{getElementById:id=>elements[id] || null}}, ErrorEvent, HTMLScriptElement,
+    window:{{
+      addEventListener:(name,handler)=>{{listeners[name]=handler;}},
+      setTimeout:handler=>{{timer=handler;return 1;}},
+      clearTimeout:()=>{{timerCleared=true;}},
+    }},
+  }});
+  vm.runInContext({script},context);
+  return {{elements,listeners,context,ErrorEvent,HTMLScriptElement,
+    expire:()=>timer(),timerCleared:()=>timerCleared}};
+}}
+const stale=createPage();
+// An older cached app tries to bind a button removed from the current HTML.
+assert.throws(()=>vm.runInContext('document.getElementById("removed-button").addEventListener("click",()=>{{}})',stale.context));
+stale.listeners.error(new stale.ErrorEvent());
+assert.equal(stale.elements['view-loading'].hidden,false);
+assert.match(stale.elements['startup-title'].textContent,/Could not finish loading/);
+assert.match(stale.elements['startup-detail'].textContent,/Reload/);
+const missing=createPage();
+missing.listeners.error({{target:new missing.HTMLScriptElement()}});
+assert.match(missing.elements['startup-title'].textContent,/Could not finish loading/);
+const slow=createPage();slow.expire();
+assert.match(slow.elements['startup-title'].textContent,/Could not finish loading/);
+const ready=createPage();ready.listeners['squareprotect:ready']();
+assert.equal(ready.elements['view-loading'].hidden,true);
+assert.equal(ready.timerCleared(),true);
+ready.listeners.unhandledrejection();
+assert.equal(ready.elements['view-loading'].hidden,true);
+process.stdout.write('Startup recovery scenarios passed.');
+"#
+    );
+    let output = Command::new("node")
+        .arg("-e")
+        .arg(program)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn helper_scripts_load_before_the_application_entrypoint() {
     let html = source("app/static/index.html");
     for helper in [
+        "/startup.js",
         "/bootstrap-form.js",
         "/boot-recovery.js",
         "/protect-console-switch.js",
